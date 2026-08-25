@@ -1,0 +1,33 @@
+# Minimal setup: GitHub CLI only
+#
+# Start the daemon:
+#   GH_TOKEN="ghp_xxxx" airlock daemon start
+#
+# Use it:
+#   airlock exec -- gh repo list
+#   airlock exec -- gh pr create --title "fix: typo" --body "Fixed a typo"
+#   airlock exec -- gh issue list --label bug
+
+# The sandbox root (the directory containing this file) is always read-write,
+# and a baseline of system paths (/usr/lib, /etc, /dev/{null,random,urandom},
+# ...) is always readable. Use [filesystem] only for paths beyond that.
+[filesystem]
+write = ["/tmp"]
+
+# `from` is optional — it defaults to the label, so [secrets.GH_TOKEN] reads
+# the GH_TOKEN env var.
+[secrets.GH_TOKEN]
+source = "env"
+
+[tools.gh]
+description = "GitHub CLI"
+timeout = 60
+
+# `{sandbox_root}` expands to the canonicalized directory containing this
+# file, so each checkout gets its own gh config under
+# `<project>/.config/gh` instead of sharing `~/.config/gh`. Drop the env
+# line (and add `extra_read = ["~/.config/gh"]`) to use your global gh
+# auth instead.
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+GH_CONFIG_DIR = "{sandbox_root}/.config/gh"

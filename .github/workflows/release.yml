@@ -1,0 +1,121 @@
+name: Release
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # ── Determine the semantic version tag ──────────────────────────────────────
+  version:
+    name: Version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.semver.outputs.version }}
+      tag: v${{ steps.semver.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Determine semantic version
+        id: semver
+        uses: PaulHatch/semantic-version@v6.0.2
+        with:
+          tag_prefix: "v"
+          major_pattern: "BREAKING CHANGE"
+          minor_pattern: "feat"
+          version_format: "${major}.${minor}.${patch}"
+          bump_each_commit: false
+
+      - name: Print version
+        run: echo "Version ${{ steps.semver.outputs.version }}"
+
+  # ── Build matrix: Linux amd64 + macOS arm64 ────────────────────────────────
+  build:
+    name: Build (${{ matrix.target }})
+    needs: version
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+            artifact_name: airlock-linux-amd64
+          - os: macos-latest
+            target: aarch64-apple-darwin
+            artifact_name: airlock-darwin-arm64
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev
+
+      - name: Build release binary
+        run: cargo build --release --target ${{ matrix.target }}
+
+      - name: Run tests
+        run: cargo test --release --target ${{ matrix.target }}
+
+      - name: Package artifact
+        run: |
+          mkdir -p dist
+          cp target/${{ matrix.target }}/release/airlock dist/airlock
+          cd dist
+          tar czf ${{ matrix.artifact_name }}.tar.gz airlock
+          shasum -a 256 ${{ matrix.artifact_name }}.tar.gz > ${{ matrix.artifact_name }}.tar.gz.sha256
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact_name }}
+          path: dist/${{ matrix.artifact_name }}.tar.gz*
+
+  # ── Create or update the GitHub release ─────────────────────────────────────
+  release:
+    name: Release
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: List artifacts
+        run: ls -lR artifacts/
+
+      - name: Create or update release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          tag="${{ needs.version.outputs.tag }}"
+          # Delete existing release for this tag if it exists, so we
+          # always publish the latest main commit under the current version.
+          gh release delete "$tag" --yes 2>/dev/null || true
+          git tag -f "$tag"
+          git push origin "$tag" --force
+
+          gh release create "$tag" \
+            --title "Airlock $tag" \
+            --generate-notes \
+            --latest \
+            artifacts/*

@@ -1,0 +1,101 @@
+# GCP with an impersonated, read-only service account
+#
+# You are logged into gcloud with broad permissions. The agent's tools should
+# act as a read-only service account instead — without a long-lived key for
+# that account ever existing. The daemon mints a short-lived access token by
+# impersonating the SA with your own session, re-mints it in the background,
+# and injects it into gcloud/kubectl running inside the sandbox. Neither your
+# login nor the minted token is visible to the agent.
+#
+# One-time setup, as yourself:
+#
+#   gcloud iam service-accounts create agent-readonly --project my-project
+#
+#   # What the agent's tools may do: read. Narrow further if you can
+#   # (roles/container.viewer for GKE only, or a custom role).
+#   gcloud projects add-iam-policy-binding my-project \
+#     --member=serviceAccount:agent-readonly@my-project.iam.gserviceaccount.com \
+#     --role=roles/viewer
+#
+#   # Who may mint tokens for it: you.
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     agent-readonly@my-project.iam.gserviceaccount.com \
+#     --member=user:you@example.com \
+#     --role=roles/iam.serviceAccountTokenCreator
+#
+# Start the daemon — nothing secret in the environment; the token is minted:
+#
+#   airlock daemon start
+#
+# Once, to write a kubeconfig under the sandbox root (the SA needs
+# container.clusters.get, which roles/viewer includes):
+#
+#   airlock exec -- gcloud container clusters get-credentials my-cluster --region europe-north1
+#
+# Use it:
+#
+#   airlock exec -- gcloud container clusters list
+#   airlock exec -- kubectl get pods -A
+#   airlock exec -- kubectl rollout status deployment/my-app   # read: allowed by IAM
+#   airlock exec -- kubectl delete deployment my-app           # write: refused by IAM, not by Airlock
+#
+# If your gcloud session expires, the next re-mint fails, the secret goes
+# stale, and `airlock exec` calls that need it return an error instead of
+# running with a dead token. `gcloud auth login` as yourself; the daemon
+# recovers on its next retry.
+
+timeout = 120
+
+[filesystem]
+write = ["/tmp"]
+
+# ─── Minted secret ──────────────────────────────────────────────────────────
+#
+# Runs at daemon start and then every `refresh` seconds, on the trusted side
+# with the daemon's environment: it can read ~/.config/gcloud (your login),
+# which the sandboxed tools below cannot. Stdout — the access token — is the
+# only thing that enters the secret store.
+[secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+source = "command"
+command = [
+  "gcloud", "auth", "print-access-token",
+  "--impersonate-service-account=agent-readonly@my-project.iam.gserviceaccount.com",
+]
+# Pin which of your accounts does the impersonating and which project is
+# billed for the API call. These apply to the minting command only.
+env = { CLOUDSDK_CORE_ACCOUNT = "you@example.com", CLOUDSDK_BILLING_QUOTA_PROJECT = "my-project" }
+timeout = 30
+# Access tokens live 1 h. Re-mint every 50 min for a 10 min safety margin;
+# on failure retry with backoff capped at 10 min.
+refresh = 3000
+refresh_max_backoff = 600
+
+# ─── Tools ──────────────────────────────────────────────────────────────────
+#
+# CLOUDSDK_CONFIG points at a directory under the sandbox root, so the
+# sandboxed gcloud keeps its own state and never reads ~/.config/gcloud.
+# The sandbox root is always read-write; no extra_read/extra_write needed.
+[tools.gcloud]
+description = "Google Cloud CLI — read-only impersonated SA token"
+timeout = 120
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+CLOUDSDK_CORE_PROJECT = "my-project"
+CLOUDSDK_COMPUTE_REGION = "europe-north1"
+CLOUDSDK_CORE_DISABLE_PROMPTS = "1"
+KUBECONFIG = "{sandbox_root}/.config/kubeconfig"
+
+# kubectl has no secret of its own. Against GKE it authenticates through
+# gke-gcloud-auth-plugin, which resolves credentials exactly like gcloud does
+# — so it needs the same env to pick up the same scoped token.
+[tools.kubectl]
+description = "Kubernetes CLI — same identity as gcloud"
+timeout = 120
+
+[tools.kubectl.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+CLOUDSDK_CORE_DISABLE_PROMPTS = "1"
+KUBECONFIG = "{sandbox_root}/.config/kubeconfig"

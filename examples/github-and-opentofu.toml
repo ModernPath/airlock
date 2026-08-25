@@ -1,0 +1,52 @@
+# GitHub CLI + OpenTofu with Cloudflare DNS provider
+#
+# Start the daemon:
+#   GH_TOKEN="ghp_xxxx" CLOUDFLARE_API_TOKEN="cf-xxxx" airlock daemon start
+#
+# Or pull CLOUDFLARE_API_TOKEN from 1Password via the `command` source
+# (see the commented-out block below).
+#
+# Use it:
+#   airlock exec -- gh pr list
+#   airlock exec -- tofu plan
+#   airlock exec -- tofu apply -auto-approve
+
+timeout = 120
+
+# The sandbox root (the directory containing this file) is always read-write,
+# and a baseline of system paths (/usr/lib, /etc, /dev/{null,random,urandom},
+# ...) is always readable. Use [filesystem] only for paths beyond that.
+[filesystem]
+write = ["/tmp"]
+
+[secrets.GH_TOKEN]
+source = "env"
+
+[secrets.CLOUDFLARE_API_TOKEN]
+source = "env"
+
+# Example `command` source — swap the env-sourced CLOUDFLARE_API_TOKEN above
+# for this to fetch the value directly from 1Password:
+#
+# [secrets.CLOUDFLARE_API_TOKEN]
+# source  = "command"
+# command = ["op", "read", "op://Infrastructure/Cloudflare/api_token"]
+# timeout = 10
+
+[tools.gh]
+description = "GitHub CLI"
+extra_read = ["~/.config/gh"]
+timeout = 60
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+
+[tools.tofu]
+description = "OpenTofu"
+extra_read = ["~/.terraform.d"]
+extra_write = [".terraform", "terraform.tfstate"]
+timeout = 300
+
+[tools.tofu.env]
+CLOUDFLARE_API_TOKEN = { secret = "CLOUDFLARE_API_TOKEN" }
+TF_INPUT = "0"

@@ -1,0 +1,28 @@
+# Kubernetes cluster management
+#
+# Start the daemon:
+#   KUBECONFIG_TOKEN="xxxx" airlock daemon start
+#
+# Use it:
+#   airlock exec -- kubectl get pods
+#   airlock exec -- kubectl describe deployment my-app
+#   airlock exec -- kubectl logs deployment/my-app --tail=50
+
+timeout = 120
+
+# The sandbox root (the directory containing this file) is always read-write,
+# and a baseline of system paths (/usr/lib, /etc, /dev/{null,random,urandom},
+# ...) is always readable. Use [filesystem] only for paths beyond that.
+[filesystem]
+write = ["/tmp"]
+
+[secrets.KUBECONFIG_TOKEN]
+source = "env"
+
+[tools.kubectl]
+description = "Kubernetes CLI"
+extra_read = ["~/.kube"]
+timeout = 120
+
+[tools.kubectl.env]
+KUBECONFIG_TOKEN = { secret = "KUBECONFIG_TOKEN" }

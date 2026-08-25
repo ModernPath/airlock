@@ -1,0 +1,125 @@
+# Multi-cloud setup: AWS CLI + Google Cloud CLI + GitHub CLI + kubectl
+#
+# Start the daemon:
+#   GH_TOKEN="ghp_xxxx" \
+#   AWS_ACCESS_KEY_ID="AKIA..." \
+#   AWS_SECRET_ACCESS_KEY="wJal..." \
+#     airlock daemon start
+#
+# (`gcloud` needs nothing in the environment: the daemon mints a token for a
+# read-only service account at start — see [secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+# below and examples/gcp-impersonation.toml for the full walkthrough.)
+#
+# Use it:
+#   airlock exec -- gh repo list
+#   airlock exec -- aws s3 ls
+#   airlock exec -- gcloud compute instances list
+#   airlock exec -- gcloud container clusters get-credentials my-cluster --region us-central1
+#   airlock exec -- kubectl get pods
+
+timeout = 120
+
+# The sandbox root (the directory containing this file) is always read-write,
+# and a baseline of system paths (/usr/lib, /etc, /dev/{null,random,urandom},
+# ...) is always readable. Use [filesystem] only for paths beyond that.
+[filesystem]
+write = ["/tmp"]
+
+[secrets.GH_TOKEN]
+source = "env"
+
+# AWS: static keys for a least-privilege IAM user. `aws sts assume-role`
+# would be the minted equivalent, but it returns three coupled values (key
+# id, secret, session token) and a `command` source yields one — see
+# TODO.md "Multi-value command sources". Keep the IAM policy narrow.
+[secrets.AWS_ACCESS_KEY_ID]
+source = "env"
+
+[secrets.AWS_SECRET_ACCESS_KEY]
+source = "env"
+
+# `command` source — run at daemon startup, stdout becomes the secret value.
+# `refresh` re-runs the command in the background every N seconds so the
+# token stays fresh. GCP access tokens default to a 1-hour TTL; refreshing
+# every 50 minutes keeps a 10-minute safety margin. If the refresh ever
+# fails (e.g. the user's gcloud session expired), the daemon retries with
+# exponential backoff up to `refresh_max_backoff` and `airlock exec`
+# requests that need this secret return an error rather than running the
+# tool with a stale token.
+#
+# The token is minted *for a read-only service account* by impersonating it
+# with your own gcloud login — so the tools below never act as you, and no
+# long-lived key for the SA has to exist. Your user needs
+# roles/iam.serviceAccountTokenCreator on the SA; the SA needs only the roles
+# the agent's tools should have (roles/viewer, say). Full walkthrough in
+# examples/gcp-impersonation.toml.
+#
+# `env` sets/overrides vars in the minting command's environment. It runs on
+# the trusted side and reads your real credentials under `~/.config/gcloud`
+# (not the project-local dir the sandboxed tools use). Values are literal —
+# airlock does not run a shell, so `~` and `$HOME` are not expanded; write
+# the absolute path.
+[secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+source = "command"
+command = [
+  "gcloud", "auth", "print-access-token",
+  "--impersonate-service-account=agent-readonly@my-project.iam.gserviceaccount.com",
+]
+env = { CLOUDSDK_CONFIG = "/Users/you/.config/gcloud", CLOUDSDK_CORE_ACCOUNT = "you@example.com" }
+timeout = 30
+refresh = 3000
+refresh_max_backoff = 600
+
+# Per-tool config directories live under the sandbox root ({sandbox_root}
+# expands at config-load time to the canonicalized directory containing this
+# file). Each checkout therefore keeps its own isolated gh / aws / gcloud
+# state — a second clone of the repo gets its own auth session, and nothing
+# under ~/.config leaks in. The sandbox root is always read-write, so each
+# tool can populate its config dir without extra_read/extra_write entries.
+
+# GitHub CLI
+[tools.gh]
+description = "GitHub CLI"
+timeout = 60
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
+
+# AWS CLI
+[tools.aws]
+description = "AWS CLI"
+timeout = 120
+
+[tools.aws.env]
+AWS_ACCESS_KEY_ID = { secret = "AWS_ACCESS_KEY_ID" }
+AWS_SECRET_ACCESS_KEY = { secret = "AWS_SECRET_ACCESS_KEY" }
+AWS_CONFIG_FILE = "{sandbox_root}/.aws/config"
+AWS_SHARED_CREDENTIALS_FILE = "{sandbox_root}/.aws/credentials"
+AWS_PAGER = ""
+
+# Google Cloud CLI
+[tools.gcloud]
+description = "Google Cloud CLI"
+timeout = 120
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+# `gcloud container clusters get-credentials` writes kubeconfig here,
+# and kubectl below reads from the same path.
+KUBECONFIG = "{sandbox_root}/.kube/config"
+
+# kubectl — no secret of its own. Auth is whatever gcloud / aws / etc. wrote
+# into the kubeconfig under the sandbox root. For GKE that kubeconfig calls
+# gke-gcloud-auth-plugin, which resolves credentials the way gcloud does — so
+# it needs the same env to pick up the same scoped token. Running under
+# airlock gives it the same filesystem/network sandbox as the other tools.
+[tools.kubectl]
+description = "Kubernetes CLI"
+timeout = 120
+
+[tools.kubectl.env]
+KUBECONFIG = "{sandbox_root}/.kube/config"
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
