@@ -55,6 +55,26 @@ Airlock is one layer of a defense-in-depth stack:
 3. **Airlock** — credential isolation at runtime: secrets in memory, injected per tool, output redacted.
 4. **Agent harness sandbox** — `airlock run`, Claude Code's `--sandbox`, Docker, nsjail, bubblewrap. Without it, the agent could read the daemon's memory or connect to the socket directly.
 
+## How Airlock compares
+
+Most tools in this space are **HTTP proxies**: the agent sends a placeholder token, the proxy swaps in the real one on the wire. That works for API calls but can't broker a credential a CLI reads from its environment (`gh`, `gcloud`, `kubectl`, `tofu`, `git` signing). Airlock works at the **process layer** instead: it spawns the tool itself, sandboxed, with the secret injected, and redacts the output.
+
+| | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox MCP](https://fnox.jdx.dev/guide/mcp.html) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
+|---|---|---|---|---|---|
+| Model | Local CLI exec broker | Local CLI exec broker (Go) | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
+| Brokers local CLIs (env-var creds) | ✅ | ✅ | ✅ | ❌ | ❌ (network only) |
+| Brokers HTTP API calls | via the CLI | via the CLI, or MITM proxy mode | via the CLI | ✅ | ✅ |
+| OS sandbox for the tool | ✅ Seatbelt / Landlock | ❌ (tool runs with daemon privileges) | ❌ | ❌ | ✅ Seatbelt / Landlock |
+| Redacts tool stdout/stderr (incl. base64/hex/URL-encoded) | ✅ | user-supplied regex only | raw value only (docs: encoded forms leak) | ❌ | ❌ |
+| Per-tool allowlist | ✅ | ✅ + blocked-arg patterns | ❌ (global secret allowlist) | egress filter | policy-as-code |
+| Scoped / short-lived creds | mint locally (`gcloud`, etc.) | GitHub App tokens | ❌ | ❌ | ❌ |
+| Runs offline, no account | ✅ single binary | ✅ | ✅ | ✅ | ✅ |
+| License | Open source | MIT | MIT | Open source | Open source |
+
+[claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative — same daemon/socket/exec shape — but leaves sandboxing to an external tool and redacts only what you write regexes for. Airlock complements the proxy tools rather than replacing them: use a proxy for pure-API agents, Airlock for the tools the agent *runs*.
+
+Commercial identity gateways such as [Aembit](https://aembit.io/) and [1Password Unified Access](https://1password.com/blog/introducing-1password-unified-access) solve the same problem as a central, cloud-hosted service that vends short-lived credentials to workloads; hosted integration layers like [Arcade](https://www.arcade.dev/), [Composio](https://composio.dev/) and [Nango](https://nango.dev/) do it for SaaS APIs via OAuth. Neither brokers local CLI tools. Fuller notes in [COMPETITORS.md](COMPETITORS.md).
+
 ## Quick start
 
 ```bash
