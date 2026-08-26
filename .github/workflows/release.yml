@@ -3,6 +3,9 @@ name: Release
 on:
   push:
     branches: [main]
+  # Pushes only build and test the release artifacts; the tag and GitHub
+  # release are created when this workflow is dispatched manually on main.
+  workflow_dispatch:
 
 permissions:
   contents: write
@@ -90,6 +93,7 @@ jobs:
   release:
     name: Release
     needs: [version, build]
+    if: github.event_name == 'workflow_dispatch' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
