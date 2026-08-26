@@ -298,18 +298,20 @@ Profiles bundle sandbox rules for a known agent:
 
 Airlock splits your machine into three zones with different levels of trust:
 
-```
-┌─ your session (no sandbox) ─────────────────────────────────────────┐
-│  airlock daemon — runs as you, outside any sandbox                  │
-│  holds secrets in memory · uses your real logins to mint tokens     │
-│                                                                     │
-│   ┌─ agent sandbox ───────────┐    ┌─ tool sandbox (per exec) ───┐  │
-│   │  claude / codex / …       │    │  gh · gcloud · kubectl · …  │  │
-│   │  sees: project files,     │───▶│  sees: project files, its   │  │
-│   │  redacted tool output     │    │  own config, and only the   │  │
-│   │  never sees: secrets      │    │  secret it was declared for │  │
-│   └───────────────────────────┘    └─────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
+```mermaid
+flowchart LR
+    subgraph session["your session (no sandbox)"]
+        daemon["airlock daemon<br/>runs as you, outside any sandbox<br/>holds secrets in memory · uses your real logins to mint tokens"]
+        subgraph agent_sb["agent sandbox"]
+            agent["claude / codex / …<br/>sees: project files, redacted tool output<br/>never sees: secrets"]
+        end
+        subgraph tool_sb["tool sandbox (per exec)"]
+            tool["gh · gcloud · kubectl · …<br/>sees: project files, its own config,<br/>and only the secret it was declared for"]
+        end
+    end
+    agent -- "airlock exec" --> daemon
+    daemon -- "spawns with secret injected" --> tool
+    tool -. "redacted stdout/stderr" .-> agent
 ```
 
 - **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket.
