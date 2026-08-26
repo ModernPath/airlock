@@ -6,6 +6,23 @@ An AI coding agent needs `gh`, `tofu`, `gcloud`, `kubectl` to do real work, and 
 
 Airlock brokers credentials for the tools your agent *runs*, not just the APIs it *calls*. The CLI authenticates exactly as it always has — the agent simply never holds the key.
 
+## Contents
+
+- [What you get](#what-you-get)
+- [How it works](#how-it-works)
+- [Where Airlock fits](#where-airlock-fits)
+- [Security model](#security-model)
+- [Quick start](#quick-start)
+- [Supplying secrets](#supplying-secrets)
+- [Minting scoped credentials](#minting-scoped-credentials)
+- [Configuration](#configuration)
+- [Command reference](#command-reference)
+- [Troubleshooting](#troubleshooting)
+- [Building](#building)
+- [Further reading](#further-reading)
+- [How Airlock compares](#how-airlock-compares)
+- [License](#license)
+
 ## What you get
 
 - **Tool secrets never reach the agent.** They exist in the daemon's memory (zeroized on drop) and in the tool process's environment — nowhere else. Not in the agent's env, not in its output.
@@ -55,25 +72,33 @@ Airlock is one layer of a defense-in-depth stack:
 3. **Airlock** — credential isolation at runtime: secrets in memory, injected per tool, output redacted.
 4. **Agent harness sandbox** — `airlock run`, Claude Code's `--sandbox`, Docker, nsjail, bubblewrap. Without it, the agent could read the daemon's memory or connect to the socket directly.
 
-## How Airlock compares
+## Security model
 
-Most tools in this space are **HTTP proxies**: the agent sends a placeholder token, the proxy swaps in the real one on the wire. That works for API calls but can't broker a credential a CLI reads from its environment (`gh`, `gcloud`, `kubectl`, `tofu`, `git` signing). Airlock works at the **process layer** instead: it spawns the tool itself, sandboxed, with the secret injected, and redacts the output.
+Airlock splits your machine into three zones with different levels of trust:
 
-| | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox MCP](https://fnox.jdx.dev/guide/mcp.html) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
-|---|---|---|---|---|---|
-| Model | Local CLI exec broker | Local CLI exec broker | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
-| Brokers local CLIs (env-var creds) | ✅ | ✅ | ✅ | ❌ | ❌ (network only) |
-| Brokers HTTP API calls | via the CLI | via the CLI, or MITM proxy mode | via the CLI | ✅ | ✅ |
-| OS sandbox for the tool | ✅ Seatbelt / Landlock | ❌ (tool runs with daemon privileges) | ❌ | ❌ | ✅ Seatbelt / Landlock |
-| Redacts tool stdout/stderr (incl. base64/hex/URL-encoded) | ✅ | user-supplied regex only | raw value only (docs: encoded forms leak) | ❌ | ❌ |
-| Per-tool allowlist | ✅ | ✅ + blocked-arg patterns | ❌ (global secret allowlist) | egress filter | policy-as-code |
-| Scoped / short-lived creds | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Runs offline, no account | ✅ | ✅ | ✅ | ✅ | ✅ |
-| License | Open source | MIT | MIT | Open source | Open source |
+```
+┌─ your session (no sandbox) ─────────────────────────────────────────┐
+│  airlock daemon — runs as you, outside any sandbox                  │
+│  holds secrets in memory · uses your real logins to mint tokens     │
+│                                                                     │
+│   ┌─ agent sandbox ───────────┐    ┌─ tool sandbox (per exec) ───┐  │
+│   │  claude / codex / …       │    │  gh · gcloud · kubectl · …  │  │
+│   │  sees: project files,     │───▶│  sees: project files, its   │  │
+│   │  redacted tool output     │    │  own config, and only the   │  │
+│   │  never sees: secrets      │    │  secret it was declared for │  │
+│   └───────────────────────────┘    └─────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-[claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative — same daemon/socket/exec shape — but leaves sandboxing to an external tool and redacts only what you write regexes for. Airlock complements the proxy tools rather than replacing them: use a proxy for pure-API agents, Airlock for the tools the agent *runs*.
+- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket.
+- **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's own `--sandbox` or a container works too.
+- **Each tool gets its own sandbox, shaped for that tool.** This is the part most setups skip. `gh` sees the repo and its own config dir but not `~/.config/gcloud`; `gcloud` gets the reverse. A compromised or misbehaving tool can expose at most the one secret it was handed — and even that is redacted before the agent reads it.
 
-Commercial identity gateways such as [Aembit](https://aembit.io/) and [1Password Unified Access](https://1password.com/blog/introducing-1password-unified-access) solve the same problem as a central, cloud-hosted service that vends short-lived credentials to workloads; hosted integration layers like [Arcade](https://www.arcade.dev/), [Composio](https://composio.dev/) and [Nango](https://nango.dev/) do it for SaaS APIs via OAuth. Neither brokers local CLI tools.
+Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool usually needs one credential plus its own config files. Even the config files can be kept out of your real home directory — point `CLOUDSDK_CONFIG` or `KUBECONFIG` at a project-local path (as in [Minting scoped credentials](#minting-scoped-credentials)) and `gcloud` or `kubectl` runs with only the minted token, never your privileged global login.
+
+Under the hood, the daemon clears secret env vars from its own process after reading them, keeps values in memory that is zeroed on drop, disables core dumps, hands each tool a minimal environment with a timeout, and refuses to start if the OS sandbox is unavailable rather than run without it. Redaction is streaming and covers raw, base64, URL-encoded, and hex forms.
+
+Known limits: redaction is best-effort (a tool can transform a secret in ways the redactor doesn't recognize), tools have unrestricted network access, and a local root user can read daemon memory. See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 
 ## Quick start
 
@@ -294,34 +319,6 @@ Profiles bundle sandbox rules for a known agent:
 - **`claude`** — read/write to `~/.claude/`, `~/.claude.json`, `~/.local/share/claude/`. The macOS keychain is unreachable, so Claude Code stores its OAuth token in `~/.claude/.credentials.json` (mode `0600`). Also disables Claude Code's own `sandbox-exec` wrapper, which cannot nest inside Airlock's profile.
 - **`claude-relaxed`** — `claude` plus keychain access, clipboard, `open <url>`, and read access to shell dotfiles. Each widens the data-leak surface; see [SECURITY.md](SECURITY.md#built-in-agent-profiles).
 
-## Security model
-
-Airlock splits your machine into three zones with different levels of trust:
-
-```
-┌─ your session (no sandbox) ─────────────────────────────────────────┐
-│  airlock daemon — runs as you, outside any sandbox                  │
-│  holds secrets in memory · uses your real logins to mint tokens     │
-│                                                                     │
-│   ┌─ agent sandbox ───────────┐    ┌─ tool sandbox (per exec) ───┐  │
-│   │  claude / codex / …       │    │  gh · gcloud · kubectl · …  │  │
-│   │  sees: project files,     │───▶│  sees: project files, its   │  │
-│   │  redacted tool output     │    │  own config, and only the   │  │
-│   │  never sees: secrets      │    │  secret it was declared for │  │
-│   └───────────────────────────┘    └─────────────────────────────┘  │
-└─────────────────────────────────────────────────────────────────────┘
-```
-
-- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket.
-- **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's own `--sandbox` or a container works too.
-- **Each tool gets its own sandbox, shaped for that tool.** This is the part most setups skip. `gh` sees the repo and its own config dir but not `~/.config/gcloud`; `gcloud` gets the reverse. A compromised or misbehaving tool can expose at most the one secret it was handed — and even that is redacted before the agent reads it.
-
-Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool usually needs one credential plus its own config files. Even the config files can be kept out of your real home directory — point `CLOUDSDK_CONFIG` or `KUBECONFIG` at a project-local path (as in [Minting scoped credentials](#minting-scoped-credentials)) and `gcloud` or `kubectl` runs with only the minted token, never your privileged global login.
-
-Under the hood, the daemon clears secret env vars from its own process after reading them, keeps values in memory that is zeroed on drop, disables core dumps, hands each tool a minimal environment with a timeout, and refuses to start if the OS sandbox is unavailable rather than run without it. Redaction is streaming and covers raw, base64, URL-encoded, and hex forms.
-
-Known limits: redaction is best-effort (a tool can transform a secret in ways the redactor doesn't recognize), tools have unrestricted network access, and a local root user can read daemon memory. See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
-
 ## Troubleshooting
 
 If a sandboxed tool or agent misbehaves — "Operation not permitted", garbled interactive output, TLS failing silently — the cause is usually a sandbox rule that's too narrow. On macOS, Seatbelt logs every denial:
@@ -346,6 +343,26 @@ Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](ht
 - [SKILL.md](SKILL.md) — the agent-facing guide: what to run, what to expect, what not to try.
 - [ARCHITECTURE.md](ARCHITECTURE.md) — daemon/client split, fork sequence, wire protocol, redaction pipeline.
 - [SECURITY.md](SECURITY.md) — threat model, trust boundaries, tool selection rules.
+
+## How Airlock compares
+
+Most tools in this space are **HTTP proxies**: the agent sends a placeholder token, the proxy swaps in the real one on the wire. That works for API calls but can't broker a credential a CLI reads from its environment (`gh`, `gcloud`, `kubectl`, `tofu`, `git` signing). Airlock works at the **process layer** instead: it spawns the tool itself, sandboxed, with the secret injected, and redacts the output.
+
+| | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox MCP](https://fnox.jdx.dev/guide/mcp.html) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
+|---|---|---|---|---|---|
+| Model | Local CLI exec broker | Local CLI exec broker | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
+| Brokers local CLIs (env-var creds) | ✅ | ✅ | ✅ | ❌ | ❌ (network only) |
+| Brokers HTTP API calls | via the CLI | via the CLI, or MITM proxy mode | via the CLI | ✅ | ✅ |
+| OS sandbox for the tool | ✅ Seatbelt / Landlock | ❌ (tool runs with daemon privileges) | ❌ | ❌ | ✅ Seatbelt / Landlock |
+| Redacts tool stdout/stderr (incl. base64/hex/URL-encoded) | ✅ | user-supplied regex only | raw value only (docs: encoded forms leak) | ❌ | ❌ |
+| Per-tool allowlist | ✅ | ✅ + blocked-arg patterns | ❌ (global secret allowlist) | egress filter | policy-as-code |
+| Scoped / short-lived creds | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Runs offline, no account | ✅ | ✅ | ✅ | ✅ | ✅ |
+| License | Open source | MIT | MIT | Open source | Open source |
+
+[claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative — same daemon/socket/exec shape — but leaves sandboxing to an external tool and redacts only what you write regexes for. Airlock complements the proxy tools rather than replacing them: use a proxy for pure-API agents, Airlock for the tools the agent *runs*.
+
+Commercial identity gateways such as [Aembit](https://aembit.io/) and [1Password Unified Access](https://1password.com/blog/introducing-1password-unified-access) solve the same problem as a central, cloud-hosted service that vends short-lived credentials to workloads; hosted integration layers like [Arcade](https://www.arcade.dev/), [Composio](https://composio.dev/) and [Nango](https://nango.dev/) do it for SaaS APIs via OAuth. Neither brokers local CLI tools.
 
 ## License
 
