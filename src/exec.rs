@@ -988,19 +988,23 @@ mod tests {
 
     // ── pre_exec failure propagation (Linux only) ─────────────────────────────
 
-    /// On Linux, constructing a `SandboxProfile` with an already-closed fd and
-    /// attempting `spawn()` returns an error because `landlock_restrict_self`
-    /// fails in the `pre_exec` closure. No child process survives.
+    /// On Linux, constructing a `SandboxProfile` with an fd that is not a
+    /// Landlock ruleset and attempting `spawn()` returns an error because
+    /// `landlock_restrict_self` fails (`EBADFD`) in the `pre_exec` closure.
+    /// No child process survives.
     #[cfg(target_os = "linux")]
     #[tokio::test]
     async fn pre_exec_failure_with_invalid_fd_returns_error() {
         use crate::sandbox::SandboxProfile;
 
-        // Get a valid fd by opening /dev/null, then close it to make it invalid.
+        // Keep the fd open for the duration of the test. Closing it to make
+        // it "invalid" is a race: other test threads (including the Landlock
+        // tests) open fds concurrently and can be handed the same number, so
+        // the child could apply a stranger's real ruleset and exec normally.
+        // An open /dev/null fd is deterministically rejected by Landlock.
         let devnull = std::ffi::CString::new("/dev/null").unwrap();
         let fd = unsafe { libc::open(devnull.as_ptr(), libc::O_RDONLY) };
         assert!(fd > 0, "open /dev/null should succeed, got {fd}");
-        unsafe { libc::close(fd) };
 
         let profile = SandboxProfile::new_for_test(fd);
 
@@ -1028,6 +1032,7 @@ mod tests {
         // No child process should be alive — spawn returned Err, so no PID
         // was returned. The pre_exec closure's error caused the child to
         // exit before exec.
+        unsafe { libc::close(fd) };
     }
 
     // ── Landlock fd cleanup after spawn (Linux only) ──────────────────────────
