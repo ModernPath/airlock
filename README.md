@@ -61,14 +61,14 @@ Most tools in this space are **HTTP proxies**: the agent sends a placeholder tok
 
 | | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox MCP](https://fnox.jdx.dev/guide/mcp.html) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
 |---|---|---|---|---|---|
-| Model | Local CLI exec broker | Local CLI exec broker (Go) | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
+| Model | Local CLI exec broker | Local CLI exec broker | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
 | Brokers local CLIs (env-var creds) | ✅ | ✅ | ✅ | ❌ | ❌ (network only) |
 | Brokers HTTP API calls | via the CLI | via the CLI, or MITM proxy mode | via the CLI | ✅ | ✅ |
 | OS sandbox for the tool | ✅ Seatbelt / Landlock | ❌ (tool runs with daemon privileges) | ❌ | ❌ | ✅ Seatbelt / Landlock |
 | Redacts tool stdout/stderr (incl. base64/hex/URL-encoded) | ✅ | user-supplied regex only | raw value only (docs: encoded forms leak) | ❌ | ❌ |
 | Per-tool allowlist | ✅ | ✅ + blocked-arg patterns | ❌ (global secret allowlist) | egress filter | policy-as-code |
-| Scoped / short-lived creds | mint locally (`gcloud`, etc.) | GitHub App tokens | ❌ | ❌ | ❌ |
-| Runs offline, no account | ✅ single binary | ✅ | ✅ | ✅ | ✅ |
+| Scoped / short-lived creds | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Runs offline, no account | ✅ | ✅ | ✅ | ✅ | ✅ |
 | License | Open source | MIT | MIT | Open source | Open source |
 
 [claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative — same daemon/socket/exec shape — but leaves sandboxing to an external tool and redacts only what you write regexes for. Airlock complements the proxy tools rather than replacing them: use a proxy for pure-API agents, Airlock for the tools the agent *runs*.
