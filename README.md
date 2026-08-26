@@ -296,16 +296,31 @@ Profiles bundle sandbox rules for a known agent:
 
 ## Security model
 
-The daemon is the trust boundary; the client (`airlock exec`) is unprivileged and never sees raw values. The Unix socket is the boundary's edge — created `0700` and verified after bind; the daemon refuses to start if the filesystem didn't honor it.
+Airlock splits your machine into three zones with different levels of trust:
 
-- Secret env vars are cleared from the daemon's process immediately after reading; values live in a `Secret<T>` that zeroes on drop and refuses to `Debug`-print.
-- No core dumps (`RLIMIT_CORE = 0`); on Linux, `PR_SET_DUMPABLE = 0` also blocks same-UID `ptrace`.
-- Tools get a minimal environment: declared `env` plus `PATH`, `HOME`, `TERM`, `USER`, `TZ`, and `LANG`/`LC_*`. Nothing else leaks through.
-- Output is redacted across four encodings by a streaming Aho-Corasick automaton that handles matches spanning chunk boundaries.
-- Each tool runs in its own process group with timeout enforcement (SIGTERM, 5 s, SIGKILL) and cleanup on client disconnect.
-- Sandboxing is a hard requirement: Landlock unavailable → the daemon refuses to start rather than degrade.
+```
+┌─ your session (no sandbox) ─────────────────────────────────────────┐
+│  airlock daemon — runs as you, outside any sandbox                  │
+│  holds secrets in memory · uses your real logins to mint tokens     │
+│                                                                     │
+│   ┌─ agent sandbox ───────────┐    ┌─ tool sandbox (per exec) ───┐  │
+│   │  claude / codex / …       │    │  gh · gcloud · kubectl · …  │  │
+│   │  sees: project files,     │───▶│  sees: project files, its   │  │
+│   │  redacted tool output     │    │  own config, and only the   │  │
+│   │  never sees: secrets      │    │  secret it was declared for │  │
+│   └───────────────────────────┘    └─────────────────────────────┘  │
+└─────────────────────────────────────────────────────────────────────┘
+```
 
-Known limits: redaction is best-effort (a shell could reverse a string), tools have unrestricted network access, and a local root user can read daemon memory. See [SECURITY.md](SECURITY.md) for the full analysis and mitigations.
+- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket, and all it can say there is "run tool X".
+- **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's `--sandbox` or a container works too.
+- **Each tool gets its own sandbox, shaped for that tool.** This is the part most setups skip. `gh` sees the repo and its own config dir but not `~/.config/gcloud`; `gcloud` gets the reverse. A compromised or misbehaving tool can expose at most the one secret it was handed — and even that is redacted before the agent reads it.
+
+Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool needs one credential and almost nothing else. Giving both the same sandbox forces you to grant the union.
+
+Under the hood, the daemon clears secret env vars from its own process after reading them, keeps values in memory that is zeroed on drop, disables core dumps, hands each tool a minimal environment with a timeout, and refuses to start if the OS sandbox is unavailable rather than run without it. Redaction is streaming and covers raw, base64, URL-encoded, and hex forms.
+
+Known limits: redaction is best-effort (a tool can transform a secret in ways the redactor doesn't recognize), tools have unrestricted network access, and a local root user can read daemon memory. See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
 
 ## Troubleshooting
 
