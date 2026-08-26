@@ -312,11 +312,11 @@ Airlock splits your machine into three zones with different levels of trust:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket, and all it can say there is "run tool X".
-- **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's `--sandbox` or a container works too.
+- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket.
+- **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's own `--sandbox` or a container works too.
 - **Each tool gets its own sandbox, shaped for that tool.** This is the part most setups skip. `gh` sees the repo and its own config dir but not `~/.config/gcloud`; `gcloud` gets the reverse. A compromised or misbehaving tool can expose at most the one secret it was handed — and even that is redacted before the agent reads it.
 
-Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool needs one credential plus its own config files, and nothing else. Even the config files can be kept out of your real home directory — point `CLOUDSDK_CONFIG` or `KUBECONFIG` at a project-local path (as in [Minting scoped credentials](#minting-scoped-credentials)) and `gcloud` or `kubectl` runs with only the minted token, never your privileged global login. Giving agent and tools the same sandbox would force you to grant the union.
+Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool usually needs one credential plus its own config files. Even the config files can be kept out of your real home directory — point `CLOUDSDK_CONFIG` or `KUBECONFIG` at a project-local path (as in [Minting scoped credentials](#minting-scoped-credentials)) and `gcloud` or `kubectl` runs with only the minted token, never your privileged global login.
 
 Under the hood, the daemon clears secret env vars from its own process after reading them, keeps values in memory that is zeroed on drop, disables core dumps, hands each tool a minimal environment with a timeout, and refuses to start if the OS sandbox is unavailable rather than run without it. Redaction is streaming and covers raw, base64, URL-encoded, and hex forms.
 
