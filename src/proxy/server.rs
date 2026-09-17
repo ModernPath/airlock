@@ -37,6 +37,7 @@ use tokio::net::{TcpListener, TcpStream};
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 use tokio_rustls::{TlsAcceptor, TlsConnector};
+use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::Zeroize;
 
 use crate::daemon::RingBuffer;
@@ -111,16 +112,22 @@ type ProxyBody = BoxBody<Bytes, hyper::Error>;
 
 /// A live proxy listener bound for the lifetime of one child process.
 ///
-/// Dropping the session aborts the serve task, which closes the listener and
-/// every tunnel under it. Holding it in a local of the exec handler therefore
-/// ties the proxy's lifetime to the child's on *every* exit path — normal
-/// exit, timeout, kill, client disconnect — without each of them having to
-/// remember to tear it down.
+/// Dropping the session closes the listener and every connection and tunnel
+/// under it. Holding it in a local of the exec handler therefore ties the
+/// proxy's lifetime to the child's on *every* exit path — normal exit,
+/// timeout, kill, client disconnect — without each of them having to remember
+/// to tear it down.
+///
+/// Aborting the accept task alone would not do that: connections and tunnels
+/// run as tasks of their own, and a process that escaped the child's process
+/// group could keep a tunnel — and the credential it attaches — alive after
+/// the exec had ended. The token reaches all of them.
 pub struct ProxySession {
     port: u16,
     proxy_url: String,
     ca_path: PathBuf,
     task: JoinHandle<()>,
+    _shutdown: DropGuard,
 }
 
 impl Drop for ProxySession {
@@ -166,6 +173,7 @@ impl ProxySession {
         let port = listener.local_addr()?.port();
         let listener = TcpListener::from_std(listener)?;
 
+        let shutdown = CancellationToken::new();
         let token = random_token();
         let proxy_url = format!("http://{PROXY_USER}:{token}@{}:{port}", Ipv4Addr::LOCALHOST);
 
@@ -178,6 +186,7 @@ impl ProxySession {
             expected_auth: basic_auth_header(&token),
             upstream,
             tunnels: Arc::new(Semaphore::new(MAX_CONCURRENT_TUNNELS)),
+            shutdown: shutdown.clone(),
         });
 
         Ok(ProxySession {
@@ -185,6 +194,7 @@ impl ProxySession {
             proxy_url,
             ca_path,
             task: tokio::spawn(accept_loop(listener, ctx)),
+            _shutdown: shutdown.drop_guard(),
         })
     }
 
@@ -237,6 +247,8 @@ struct ProxyContext {
     expected_auth: String,
     upstream: Upstream,
     tunnels: Arc<Semaphore>,
+    /// Cancelled when the owning [`ProxySession`] is dropped.
+    shutdown: CancellationToken,
 }
 
 impl ProxyContext {
@@ -269,11 +281,15 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyContext>) {
         // One task per connection. A panic anywhere in the request path is
         // caught by tokio at the task boundary and cannot reach the daemon.
         tokio::spawn(async move {
+            let shutdown = ctx.shutdown.clone();
             let service = service_fn(move |req| handle_proxy_request(req, Arc::clone(&ctx)));
-            let _ = http1_builder()
+            let serve = http1_builder()
                 .serve_connection(TokioIo::new(stream), service)
-                .with_upgrades()
-                .await;
+                .with_upgrades();
+            tokio::select! {
+                _ = shutdown.cancelled() => {}
+                _ = serve => {}
+            }
         });
     }
 }
@@ -354,12 +370,19 @@ async fn handle_proxy_request(
 
     let tunnel_ctx = Arc::clone(&ctx);
     tokio::spawn(async move {
-        match hyper::upgrade::on(req).await {
-            Ok(upgraded) => run_tunnel(upgraded, host, tunnel_ctx).await,
-            Err(e) => tunnel_ctx.ring_buffer.log(format!(
-                "proxy [{}] CONNECT upgrade failed: {e}",
-                tunnel_ctx.tool
-            )),
+        let shutdown = tunnel_ctx.shutdown.clone();
+        let tunnel = async {
+            match hyper::upgrade::on(req).await {
+                Ok(upgraded) => run_tunnel(upgraded, host, Arc::clone(&tunnel_ctx)).await,
+                Err(e) => tunnel_ctx.ring_buffer.log(format!(
+                    "proxy [{}] CONNECT upgrade failed: {e}",
+                    tunnel_ctx.tool
+                )),
+            }
+        };
+        tokio::select! {
+            _ = shutdown.cancelled() => {}
+            _ = tunnel => {}
         }
     });
 
@@ -646,9 +669,15 @@ fn host_matches_authority(host: &str, authority: &str) -> bool {
 /// Split a CONNECT authority into host and port. A CONNECT target always
 /// carries an explicit port, and only DNS names are routable, so an IP literal
 /// simply fails to match any route later.
+///
+/// The host is reduced to one canonical spelling — lowercase, no root dot —
+/// because it goes on to name the leaf certificate and key the leaf cache, and
+/// `Example.com.` must not be a different certificate from `example.com`.
 fn split_authority(authority: &hyper::http::uri::Authority) -> Option<(String, u16)> {
     let port = authority.port_u16()?;
-    Some((authority.host().to_ascii_lowercase(), port))
+    let host = authority.host().to_ascii_lowercase();
+    let host = host.strip_suffix('.').unwrap_or(&host).to_string();
+    Some((host, port))
 }
 
 // ─── Proxy authentication ─────────────────────────────────────────────────────
@@ -882,6 +911,7 @@ fn is_globally_routable_v6(ip: Ipv6Addr) -> bool {
     !(ip.is_unspecified()
         || ip.is_loopback()
         || ip.is_multicast()
+        || segments[..6] == [0; 6]            // ::/96 deprecated IPv4-compatible
         || (segments[0] & 0xfe00) == 0xfc00   // fc00::/7 unique local
         || (segments[0] & 0xffc0) == 0xfe80   // fe80::/10 link local
         || (segments[0] == 0x2001 && segments[1] == 0x0db8)  // 2001:db8::/32 docs
