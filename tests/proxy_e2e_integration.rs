@@ -189,3 +189,47 @@ fn going_around_the_proxy_is_stopped_by_the_sandbox() {
 
     daemon.shutdown();
 }
+
+#[test]
+fn a_direct_tcp_connect_is_denied_not_timed_out() {
+    if !curl_available() {
+        return;
+    }
+
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &proxy_config());
+    let _guard = EnvGuard::new(&[
+        ("HOME", tmp.path().to_str().unwrap()),
+        ("TEST_E2E_SECRET", "e2e-secret-value"),
+    ]);
+    let daemon = start_daemon(tmp.path());
+    let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+
+    // An IP literal takes DNS out of the picture, which matters on Linux:
+    // Landlock does not cover UDP, so a name lookup there proves nothing about
+    // the TCP rule. 192.0.2.1 (TEST-NET-1) is unroutable, so without the
+    // sandbox this connect would hang until `--max-time` and exit 28. A
+    // sandbox denial fails the connect() itself: exit 7, immediately.
+    let result = exec_tool(
+        &daemon.socket_path,
+        "curl",
+        &[
+            "-sS",
+            "--max-time",
+            "10",
+            "--noproxy",
+            "*",
+            "https://192.0.2.1/",
+        ],
+        cwd.to_str().unwrap(),
+    );
+
+    assert_eq!(
+        result.exit_code,
+        Some(7),
+        "connect() must be refused by the sandbox, not time out; stderr: {}",
+        result.stderr
+    );
+
+    daemon.shutdown();
+}
