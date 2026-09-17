@@ -11,6 +11,9 @@
 //! request a route's rules do not permit is refused, and a path the matcher
 //! cannot reason about unambiguously is refused rather than guessed at.
 
+pub mod ca;
+pub mod server;
+
 use thiserror::Error;
 
 /// Headers a route may not inject: they frame the request or address the
