@@ -303,6 +303,8 @@ airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locati
 
 What the daemon does for that invocation: binds a proxy on an ephemeral loopback port, points the tool at it with `HTTPS_PROXY` and `CURL_CA_BUNDLE`, pins the tool's egress to that one port with Seatbelt (macOS) or Landlock (Linux), and tears the whole thing down when the child exits. Per request it checks the host against the route table, the method and path against the rules, attaches the credential, and forwards over a verified TLS connection to a host it has confirmed is publicly routable. Unlisted hosts are simply unreachable — deny by default.
 
+The response is redacted on the way back — header values and body both — so an API that echoes the credential cannot hand it to the agent even via `curl -o file`. Compressed and partial responses are refused rather than forwarded unread: see [SECURITY.md](SECURITY.md#response-redaction).
+
 Caveats worth knowing up front: HTTP/1.1 only (no gRPC or HTTP/2-only endpoints), certificate-pinned clients break under interception, and the agent gets the credential's full API authority on the routed hosts — scope the service account narrowly. Full threat model and residual risks: [SECURITY.md](SECURITY.md#proxy-tools); design rationale: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 ### `[agent]` — for `airlock run`

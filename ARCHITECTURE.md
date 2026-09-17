@@ -105,7 +105,7 @@ The daemon's shared state is wrapped in `Arc` for concurrent access across conne
 |-----------|------|---------|
 | Config | `Arc<Config>` | Parsed `airlock.toml` (immutable after startup) |
 | Secrets | `SecretStore` = `Arc<HashMap<String, RwLock<SecretSlot>>>` | Per-label slot holding `Arc<Secret<String>>` plus refresh health; the map is fixed at startup, slot contents swap on refresh |
-| Redactor | `Arc<Redactor>` | Aho-Corasick automaton for output redaction |
+| Redactor | `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. A connection snapshots it for the child's stdout/stderr; a proxy session carries the handle itself and snapshots per response |
 | Ring buffer | `Arc<Mutex<RingBuffer>>` | Last 1000 log entries (`VecDeque<LogEntry>`) |
 | Child registry | `Arc<Mutex<HashSet<u32>>>` | PIDs of currently running children |
 
@@ -189,15 +189,29 @@ child (curl)                     daemon                         upstream
     │                              │   inject header + hop-by-hop   │
     │                              │ secret store lookup (Stale→502)│
     │                              │ attach prefix+secret+suffix    │
+    │                              │ force Accept-Encoding:identity,│
+    │                              │   strip Range / If-Range       │
     │                              │ resolve host, refuse non-      │
     │                              │   routable addrs, dial that    │
     │                              │   exact SocketAddr             │
     │                              ├───── TLS ≥1.2, public roots ──►│
-    │◄─────────────────────────────┤◄────── response streamed ──────┤
+    │                              │◄──────── response head ────────┤
+    │                              │ content-encoded / odd framing /│
+    │                              │   206?  → 502, body unread     │
+    │                              │ redact every header value      │
+    │                              │ drop Content-Length unless the │
+    │                              │   response is bodiless         │
+    │◄──── redacted, chunked ──────┤◄──── body frames streamed ─────┤
     │                              │ audit: method, host, path,     │
-    │                              │   decision, status (no query,  │
-    │                              │   no header values)            │
+    │                              │   decision, status, redaction  │
+    │                              │   counts (no query, no header  │
+    │                              │   values, no matched bytes)    │
 ```
+
+The response never reaches the tool unexamined. Header values and body both go
+through the redactor, so what `curl -o` writes into the sandbox was already
+redacted — see [SECURITY.md](SECURITY.md#response-redaction) for what that
+covers and what fails closed.
 
 Meanwhile the sandbox holds the other end: the profile permits a TCP connect to
 that port and nothing else — no DNS, no other destination — so a tool that
@@ -227,6 +241,21 @@ select! loop → NDJSON → Unix socket → client
 ```
 
 This design keeps the automaton's streaming state machine on a dedicated blocking thread (via `spawn_blocking`) while the daemon's main loop remains fully async.
+
+The proxy's response path does not use this bridge. It already holds the bytes
+as owned frames handed to it by hyper, so it drives a `StreamRedactor` — an
+incremental redactor that keeps between chunks only the bytes a pattern could
+still be starting in, and whose output for any chunking is what `redact_bytes`
+makes of the whole input — directly from `poll_frame`. No thread and no channel
+per response: hyper's polling is the backpressure, and dropping the response
+stops the upstream read.
+
+Both paths take their redactor from the same `Arc<RwLock<Arc<Redactor>>>`. A
+connection snapshots it once for the child's stdout and stderr, which are
+framed against the secrets the child was spawned with. A proxy response
+snapshots it per response, because the proxy injects whatever the store holds
+at that moment and a token refreshed mid-exec must be redacted on the way
+back.
 
 ## Wire protocol
 
