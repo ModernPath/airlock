@@ -21,12 +21,14 @@ use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::pin::Pin;
+use std::sync::{Arc, RwLock};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use bytes::Bytes;
 use http_body_util::{BodyExt, Full, combinators::BoxBody};
-use hyper::body::Incoming;
+use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
 use hyper::{Method, Request, Response, StatusCode};
@@ -41,6 +43,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::Zeroize;
 
 use crate::daemon::RingBuffer;
+use crate::redact::{Redactor, StreamRedactor};
 use crate::secrets::{Health, SecretStore};
 
 use super::ca::ProxyCa;
@@ -138,12 +141,14 @@ impl Drop for ProxySession {
 
 impl ProxySession {
     /// Bind a listener and start serving `policy` on it.
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         tool: String,
         policy: ProxyPolicy,
         ca: Arc<ProxyCa>,
         ca_path: PathBuf,
         secrets: SecretStore,
+        redactor: Arc<RwLock<Arc<Redactor>>>,
         ring_buffer: RingBuffer,
     ) -> std::io::Result<Self> {
         Self::start_with_upstream(
@@ -152,17 +157,20 @@ impl ProxySession {
             ca,
             ca_path,
             secrets,
+            redactor,
             ring_buffer,
             Upstream::public(),
         )
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn start_with_upstream(
         tool: String,
         policy: ProxyPolicy,
         ca: Arc<ProxyCa>,
         ca_path: PathBuf,
         secrets: SecretStore,
+        redactor: Arc<RwLock<Arc<Redactor>>>,
         ring_buffer: RingBuffer,
         upstream: Upstream,
     ) -> std::io::Result<Self> {
@@ -182,6 +190,7 @@ impl ProxySession {
             policy,
             ca,
             secrets,
+            redactor,
             ring_buffer,
             expected_auth: basic_auth_header(&token),
             upstream,
@@ -242,6 +251,11 @@ struct ProxyContext {
     policy: ProxyPolicy,
     ca: Arc<ProxyCa>,
     secrets: SecretStore,
+    /// The daemon's live redactor, not a snapshot of it. A tool runs for
+    /// minutes and a refreshed token is injected from the *next* request on,
+    /// so a redactor snapshotted when the session started would not know the
+    /// value the proxy is now attaching.
+    redactor: Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: RingBuffer,
     /// The full `Proxy-Authorization` value this exec accepts.
     expected_auth: String,
@@ -259,6 +273,13 @@ impl ProxyContext {
             "proxy [{}] {method} {host}{path} -> {decision}",
             self.tool
         ));
+    }
+
+    /// The redactor to apply to one response, taken when that response's
+    /// headers arrive. The two generations a refresh leaves behind cover a
+    /// swap that lands between this snapshot and the end of the body.
+    fn redactor(&self) -> Arc<Redactor> {
+        Arc::clone(&self.redactor.read().unwrap_or_else(|e| e.into_inner()))
     }
 }
 
@@ -539,6 +560,7 @@ async fn handle_tunneled_request(
     }
 
     strip_forbidden_headers(&mut parts.headers, route.inject.as_ref());
+    demand_a_plain_full_response(&mut parts.headers);
 
     if let Some(inject) = &route.inject {
         match self::inject_credential(&ctx.secrets, inject, &mut parts.headers) {
@@ -556,15 +578,7 @@ async fn handle_tunneled_request(
         .send(&host, Request::from_parts(parts, body))
         .await
     {
-        Ok(response) => {
-            ctx.audit(
-                &method,
-                &host,
-                &path,
-                &format!("allowed ({})", response.status().as_u16()),
-            );
-            Ok(response.map(|body| body.boxed()))
-        }
+        Ok(response) => Ok(forward_response(response, method, host, path, &ctx)),
         Err(e) => {
             ctx.audit(&method, &host, &path, &format!("upstream error: {e}"));
             Ok(refuse(
@@ -575,7 +589,253 @@ async fn handle_tunneled_request(
     }
 }
 
+// ─── Response handling ────────────────────────────────────────────────────────
+
+/// Hand one upstream response back to the tool, redacted.
+///
+/// Every header value and every body byte goes through the same automaton the
+/// tool's stdout goes through, so the plaintext secret never exists inside the
+/// sandbox at all — not in a `-o` file, not in `--dump-header` output, not in
+/// a trace. Redaction on the way out is not optional here any more than it is
+/// on stdout, so there is no configuration that turns it off.
+fn forward_response(
+    response: Response<Incoming>,
+    method: Method,
+    host: String,
+    path: String,
+    ctx: &Arc<ProxyContext>,
+) -> Response<ProxyBody> {
+    let (mut parts, body) = response.into_parts();
+
+    if let Err(reason) = vet_response(&parts) {
+        // `body` is dropped unread. An opaque body is exactly the case where
+        // forwarding would put bytes the redactor cannot see into the tool's
+        // hands, so the response is refused rather than passed through.
+        ctx.audit(&method, &host, &path, reason);
+        return refuse(StatusCode::BAD_GATEWAY, reason);
+    }
+
+    for name in HOP_BY_HOP_HEADERS {
+        parts.headers.remove(name);
+    }
+    let redactor = ctx.redactor();
+    let header_redactions = redact_header_values(&mut parts.headers, &redactor);
+
+    let bodiless = carries_no_body(&method, parts.status);
+    if !bodiless {
+        // A placeholder is not the length of the secret it replaces, and the
+        // body has not been read yet, so an upstream `Content-Length` is
+        // unknowable here and wrong the moment anything matches. Dropping it
+        // leaves hyper to frame the response as chunked, which is always
+        // available on HTTP/1.1. On a bodiless response the length describes
+        // the representation rather than bytes on the wire, so it is kept.
+        parts.headers.remove(header::CONTENT_LENGTH);
+    }
+
+    let mut decision = format!("allowed ({})", parts.status.as_u16());
+    if header_redactions > 0 {
+        decision.push_str(&format!(
+            " with {header_redactions} header value(s) redacted"
+        ));
+    }
+    ctx.audit(&method, &host, &path, &decision);
+
+    let body: ProxyBody = if bodiless {
+        empty_body()
+    } else {
+        RedactedBody {
+            inner: body,
+            stream: StreamRedactor::new(redactor),
+            ended: false,
+            audit: ResponseAudit {
+                ctx: Arc::clone(ctx),
+                method,
+                host,
+                path,
+            },
+        }
+        .boxed()
+    };
+    Response::from_parts(parts, body)
+}
+
+/// Whether an upstream response may be forwarded at all.
+///
+/// The redactor reads bytes, not formats. Anything that leaves the body as
+/// something other than its plain, whole representation — a compressed
+/// `Content-Encoding`, a transfer coding hyper has not already undone, or a
+/// byte range that could begin in the middle of a secret — fails closed
+/// instead of reaching the tool unexamined. Airlock does not decompress: a
+/// decoder in the response path would be a second parser of attacker-supplied
+/// bytes for no security gain, since the request already demands `identity`.
+fn vet_response(parts: &hyper::http::response::Parts) -> Result<(), &'static str> {
+    if let Some(encoding) = parts.headers.get(header::CONTENT_ENCODING)
+        && !encoding.as_bytes().eq_ignore_ascii_case(b"identity")
+    {
+        return Err("denied: upstream response is content-encoded and cannot be redacted");
+    }
+    for coding in parts.headers.get_all(header::TRANSFER_ENCODING) {
+        if !coding.as_bytes().eq_ignore_ascii_case(b"chunked") {
+            return Err("denied: upstream response uses a transfer coding that cannot be redacted");
+        }
+    }
+    if parts.status == StatusCode::PARTIAL_CONTENT
+        || parts.headers.contains_key(header::CONTENT_RANGE)
+    {
+        return Err("denied: upstream response is a byte range, which may split a secret");
+    }
+    Ok(())
+}
+
+/// Replace every secret occurrence in every response header value.
+///
+/// All values, not a chosen subset: a `Location` carrying the token in a
+/// query string, a `Set-Cookie` minted from it, and a debug header some API
+/// adds are the same problem, and the set of header names an upstream may use
+/// is not knowable in advance.
+fn redact_header_values(headers: &mut HeaderMap, redactor: &Redactor) -> usize {
+    let mut redactions = 0;
+    let mut clean = HeaderMap::with_capacity(headers.len());
+    for (name, value) in headers.iter() {
+        let redacted = redactor.redact_bytes(value.as_bytes());
+        if redacted == value.as_bytes() {
+            clean.append(name.clone(), value.clone());
+            continue;
+        }
+        redactions += 1;
+        // A redacted value that will not rebuild is dropped. The one outcome
+        // that must not happen is the original going out instead.
+        if let Ok(value) = HeaderValue::from_bytes(&redacted) {
+            clean.append(name.clone(), value);
+        }
+    }
+    *headers = clean;
+    redactions
+}
+
+/// Whether the response has no body on the wire, in which case there is
+/// nothing to redact and a `Content-Length` describes the representation the
+/// request asked about rather than bytes being sent.
+fn carries_no_body(method: &Method, status: StatusCode) -> bool {
+    *method == Method::HEAD
+        || status.is_informational()
+        || status == StatusCode::NO_CONTENT
+        || status == StatusCode::NOT_MODIFIED
+}
+
+/// The upstream body, redacted frame by frame on its way to the tool.
+///
+/// Nothing is buffered beyond the partial match at the end of a frame, so a
+/// multi-gigabyte download costs what a small one costs, and no thread or task
+/// sits behind it: the tool's own read rate drives the polls, the polls drive
+/// the upstream reads, and a slow tool slows the upstream instead of filling
+/// the daemon's memory. Dropping it — a disconnected tool, a cancelled
+/// session — drops the upstream body with it.
+struct RedactedBody {
+    inner: Incoming,
+    stream: StreamRedactor,
+    ended: bool,
+    audit: ResponseAudit,
+}
+
+/// What the body needs to report its own redaction count once it ends. The
+/// count only — never a matched byte.
+struct ResponseAudit {
+    ctx: Arc<ProxyContext>,
+    method: Method,
+    host: String,
+    path: String,
+}
+
+impl Body for RedactedBody {
+    type Data = Bytes;
+    type Error = hyper::Error;
+
+    fn poll_frame(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+    ) -> Poll<Option<Result<Frame<Bytes>, hyper::Error>>> {
+        let this = self.get_mut();
+        loop {
+            if this.ended {
+                return Poll::Ready(None);
+            }
+            match Pin::new(&mut this.inner).poll_frame(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Err(e))) => {
+                    this.ended = true;
+                    return Poll::Ready(Some(Err(e)));
+                }
+                Poll::Ready(Some(Ok(frame))) => {
+                    // Trailers are dropped rather than forwarded: they arrive
+                    // after the tool has already been handed the body, and no
+                    // request reaches the upstream asking for them.
+                    let Ok(data) = frame.into_data() else {
+                        continue;
+                    };
+                    let redacted = this.stream.push(&data);
+                    // A frame that was entirely held back as a possible
+                    // partial match yields nothing yet; poll again rather
+                    // than emit an empty frame.
+                    if redacted.is_empty() {
+                        continue;
+                    }
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(redacted)))));
+                }
+                Poll::Ready(None) => {
+                    this.ended = true;
+                    let tail = this.stream.finish();
+                    if tail.is_empty() {
+                        return Poll::Ready(None);
+                    }
+                    return Poll::Ready(Some(Ok(Frame::data(Bytes::from(tail)))));
+                }
+            }
+        }
+    }
+}
+
+impl Drop for RedactedBody {
+    /// The second audit line for a request, written when the body ends.
+    ///
+    /// It belongs here rather than at end-of-stream so that a body the tool
+    /// abandoned half-way still reports what it had replaced. The first line
+    /// went out when the headers arrived and is not held back for this.
+    fn drop(&mut self) {
+        let redactions = self.stream.redactions();
+        if redactions == 0 {
+            return;
+        }
+        self.audit.ctx.audit(
+            &self.audit.method,
+            &self.audit.host,
+            &self.audit.path,
+            &format!("response body: {redactions} secret occurrence(s) redacted"),
+        );
+    }
+}
+
 // ─── Header handling ──────────────────────────────────────────────────────────
+
+/// Constrain the upstream request so that its response is something the
+/// redactor can read.
+///
+/// `Accept-Encoding: identity` replaces whatever the tool asked for: a gzip,
+/// br or zstd body is opaque to a byte-pattern scanner, and an upstream that
+/// compresses anyway is refused rather than forwarded. `Range` and `If-Range`
+/// go because a range may begin in the middle of a secret — the pattern would
+/// be split across two responses the proxy never sees together, and the tool
+/// would reassemble the plaintext in a file. Stripping them makes the
+/// upstream send the whole representation, which is the form redaction is
+/// sound on.
+fn demand_a_plain_full_response(headers: &mut HeaderMap) {
+    headers.insert(
+        header::ACCEPT_ENCODING,
+        HeaderValue::from_static("identity"),
+    );
+    headers.remove(header::RANGE);
+    headers.remove(header::IF_RANGE);
+}
 
 /// Remove hop-by-hop headers and every client-supplied copy of the header this
 /// route injects.
