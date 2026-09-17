@@ -803,6 +803,8 @@ fn only_globally_routable_addresses_are_dialled() {
         "::ffff:127.0.0.1",
         "::ffff:10.0.0.1",
         "::ffff:169.254.169.254",
+        "::10.0.0.1",
+        "::7f00:1",
     ];
     for addr in refused {
         assert!(
@@ -961,4 +963,40 @@ async fn dropping_the_session_closes_the_listener() {
             .is_err(),
         "dropping the session must take the proxy port down with it"
     );
+}
+
+#[tokio::test]
+async fn dropping_the_session_closes_open_tunnels() {
+    let h = Harness::default().await;
+    let mut tunnel = h.tunnel(UPSTREAM_HOST).await;
+    let (status, _) = read_body(
+        tunnel
+            .send_request(get("/v1/before", UPSTREAM_HOST, &[]))
+            .await
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop(h);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+
+    assert!(
+        tunnel
+            .send_request(get("/v1/after", UPSTREAM_HOST, &[]))
+            .await
+            .is_err(),
+        "a tunnel must not keep attaching credentials after its exec has ended"
+    );
+}
+
+#[test]
+fn connect_authority_is_canonicalized() {
+    let authority = "Api.Example.COM.:443".parse().unwrap();
+    assert_eq!(
+        split_authority(&authority),
+        Some(("api.example.com".to_string(), 443))
+    );
+    let no_port = "api.example.com".parse().unwrap();
+    assert_eq!(split_authority(&no_port), None);
 }
