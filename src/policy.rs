@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::sandbox::{AgentPolicy, ToolPolicy};
+use crate::sandbox::{AgentPolicy, NetworkAccess, ToolPolicy};
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -127,7 +127,10 @@ pub fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> Result<(), PolicyError> 
 /// All paths in the config are already fully resolved (tilde-expanded and
 /// relative paths resolved against the sandbox root) by the config module.
 ///
-/// `requires_network` is unconditionally set to `true` for all tools.
+/// `network` is [`NetworkAccess::Full`] for an ordinary tool and
+/// [`NetworkAccess::ProxyOnly`] for a proxy tool; the caller supplies the
+/// proxy's bound port because it is only known once the per-exec listener is
+/// up.
 ///
 /// # Errors
 ///
@@ -153,7 +156,7 @@ pub fn build_tool_policy(tool_name: &str, config: &Config) -> Result<ToolPolicy,
     Ok(ToolPolicy {
         read_paths,
         read_write_paths,
-        requires_network: true,
+        network: NetworkAccess::Full,
         binary_path: None,
     })
 }
@@ -375,16 +378,13 @@ mod tests {
     }
 
     #[test]
-    fn requires_network_always_true() {
+    fn ordinary_tool_gets_full_network() {
         let tmp = tempdir().unwrap();
         let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
         let config = make_simple_config(sandbox_root);
 
         let policy = build_tool_policy("mytool", &config).unwrap();
-        assert!(
-            policy.requires_network,
-            "requires_network should always be true"
-        );
+        assert_eq!(policy.network, NetworkAccess::Full);
     }
 
     #[test]
@@ -853,6 +853,6 @@ mod tests {
         );
 
         // Network always enabled.
-        assert!(policy.requires_network);
+        assert_eq!(policy.network, NetworkAccess::Full);
     }
 }
