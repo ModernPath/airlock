@@ -257,6 +257,14 @@ async fn upstream_response(req: Request<Incoming>, seen: Seen) -> Response<Proxy
             );
             response
         }
+        // The credential in the status line's reason phrase.
+        "/reason-leak" => {
+            let mut response = Response::new(text_body("see the status line"));
+            response.extensions_mut().insert(
+                hyper::ext::ReasonPhrase::try_from(format!("OK {secret}").into_bytes()).unwrap(),
+            );
+            response
+        }
         // An upstream that ignores `Accept-Encoding: identity`.
         "/gzip" => {
             let mut response = Response::new(text_body(&format!("not really gzip, but {secret}")));
@@ -1731,4 +1739,23 @@ fn connect_authority_is_canonicalized() {
     );
     let no_port = "api.example.com".parse().unwrap();
     assert_eq!(split_authority(&no_port), None);
+}
+
+#[tokio::test]
+async fn a_secret_in_the_reason_phrase_is_not_forwarded() {
+    let h = Harness::default().await;
+    let mut tunnel = h.tunnel(UPSTREAM_HOST).await;
+    let response = tunnel
+        .send_request(get("/reason-leak", UPSTREAM_HOST, &[]))
+        .await
+        .unwrap();
+
+    assert_eq!(response.status(), StatusCode::OK);
+    assert!(
+        response
+            .extensions()
+            .get::<hyper::ext::ReasonPhrase>()
+            .is_none(),
+        "the upstream's reason phrase is free text the redactor never sees"
+    );
 }

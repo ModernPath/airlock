@@ -615,6 +615,13 @@ fn forward_response(
         return refuse(StatusCode::BAD_GATEWAY, reason);
     }
 
+    // Extensions are how hyper carries the upstream's reason phrase (and its
+    // original header casing) from the client half to the server half, which
+    // would write them back out verbatim. A reason phrase is free text —
+    // `HTTP/1.1 200 <token>` is a legal status line — and it is outside the
+    // header map the redactor is about to walk, so none of it is forwarded.
+    parts.extensions.clear();
+
     for name in HOP_BY_HOP_HEADERS {
         parts.headers.remove(name);
     }

@@ -353,6 +353,7 @@ Everything the upstream sends back is redacted before it reaches the tool, with 
 - **All response header values** — every one of them, including `Location`, `Set-Cookie` and `WWW-Authenticate`. A value that will not rebuild after replacement is dropped rather than forwarded.
 - **The body**, streamed. Nothing is buffered beyond the partial match at the end of a frame, so a multi-gigabyte download costs what a small one costs, and the tool's own read rate is what drives the upstream read. A secret split across two upstream writes is still caught.
 - **Trailers are dropped**, not forwarded.
+- **The upstream's reason phrase is dropped.** `HTTP/1.1 200 <anything>` is a legal status line and sits outside the header map, so the tool sees the status code with the standard phrase, never the upstream's text.
 
 The redactor is taken per response from the daemon's live handle, not snapshotted when the exec started: a tool runs for minutes, the proxy injects whatever the store holds *now*, and the two generations a refresh leaves behind cover a swap that lands mid-response.
 
