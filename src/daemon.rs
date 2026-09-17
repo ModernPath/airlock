@@ -31,6 +31,8 @@ use crate::config::{self, Config, ConfigError};
 use crate::exec;
 use crate::policy;
 use crate::protocol::{ClientMessage, DaemonMessage, LogEntry};
+use crate::proxy::ca::{CaError, ProxyCa};
+use crate::proxy::server::ProxySession;
 use crate::redact::{self, RedactError, Redactor};
 use crate::refresh;
 use crate::sandbox;
@@ -161,6 +163,10 @@ pub enum DaemonError {
     /// Failed to create the tokio runtime.
     #[error("failed to create tokio runtime: {0}")]
     RuntimeCreation(std::io::Error),
+
+    /// The proxy certificate authority could not be created or published.
+    #[error("failed to set up the proxy certificate authority: {0}")]
+    ProxyCa(#[from] CaError),
 }
 
 // ─── Ring buffer logging ──────────────────────────────────────────────────────
@@ -377,7 +383,7 @@ pub fn synchronous_startup(
     };
 
     // 2. Stale state detection and cleanup.
-    check_and_cleanup_stale_state(&config.pid_path, &config.socket_path)?;
+    check_and_cleanup_stale_state(&config.pid_path, &config.socket_path, &config.ca_path)?;
 
     // 3. Secret collection. Wrapped per-slot so refresh tasks can later swap
     //    values in place; every slot starts `Healthy`.
@@ -439,7 +445,11 @@ pub fn synchronous_startup(
 ///   that answers (an embedded `airlock run` daemon, which writes no PID file)
 ///   yields `SocketInUse`; an unresponsive socket is removed as stale.
 /// - If neither exists, proceeds normally.
-fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<(), DaemonError> {
+fn check_and_cleanup_stale_state(
+    pid_path: &Path,
+    socket_path: &Path,
+    ca_path: &Path,
+) -> Result<(), DaemonError> {
     if pid_path.exists() {
         // Read the PID from the file.
         let contents = std::fs::read_to_string(pid_path).map_err(|e| DaemonError::PidFileRead {
@@ -465,6 +475,7 @@ fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<
         // Process is dead (ESRCH) — stale state. Clean up.
         let _ = std::fs::remove_file(pid_path);
         let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(ca_path);
     } else if socket_path.exists() {
         // No PID file, but a socket file is present. It is either a live
         // embedded daemon (an `airlock run` session writes no PID file) or a
@@ -478,6 +489,7 @@ fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<
             });
         }
         let _ = std::fs::remove_file(socket_path);
+        let _ = std::fs::remove_file(ca_path);
     }
 
     Ok(())
@@ -719,6 +731,24 @@ pub(crate) async fn run_embedded(
     let ring_buffer = RingBuffer::new();
     let child_registry = ChildRegistry::new();
 
+    // The proxy CA is generated here and nowhere earlier: key generation is
+    // pure CPU, but it must happen inside the runtime, after daemonization,
+    // so that `synchronous_startup` stays free of anything the fork could
+    // leave in an undefined state. `None` when no tool declares `proxy = true`
+    // — a daemon with no proxy tool holds no CA and writes no certificate.
+    let proxy_ca = match ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
+    {
+        Some(ca) => {
+            ca.write_cert_pem(&config.ca_path)?;
+            ring_buffer.log(format!(
+                "proxy CA published at {}",
+                config.ca_path.display()
+            ));
+            Some(Arc::new(ca))
+        }
+        None => None,
+    };
+
     // Spawn per-secret refresh tasks, identical to async_main.
     let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
         &config,
@@ -734,6 +764,7 @@ pub(crate) async fn run_embedded(
     // Capture paths before moving config into Arc.
     let socket_path = config.socket_path.clone();
     let pid_path = config.pid_path.clone();
+    let ca_path = config.ca_path.clone();
 
     ring_buffer.log("embedded daemon started, accepting connections".to_string());
 
@@ -760,9 +791,10 @@ pub(crate) async fn run_embedded(
                         // Snapshot the redactor at accept time so in-flight
                         // connections are not affected by concurrent refreshes.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        let ca = proxy_ca.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr).await;
+                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, ca).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -793,7 +825,14 @@ pub(crate) async fn run_embedded(
     // Graceful shutdown: signal/wait for child processes and remove the socket
     // file. No PID file was written, so pid_path removal will fail silently
     // (the error is logged to the ring buffer only).
-    graceful_shutdown(&child_registry, &ring_buffer, &socket_path, &pid_path).await;
+    graceful_shutdown(
+        &child_registry,
+        &ring_buffer,
+        &socket_path,
+        &pid_path,
+        &ca_path,
+    )
+    .await;
 
     Ok(())
 }
@@ -859,6 +898,24 @@ async fn async_main(
     };
     let child_registry = ChildRegistry::new();
 
+    // The proxy CA is generated here and nowhere earlier: key generation is
+    // pure CPU, but it must happen inside the runtime, after daemonization,
+    // so that `synchronous_startup` stays free of anything the fork could
+    // leave in an undefined state. `None` when no tool declares `proxy = true`
+    // — a daemon with no proxy tool holds no CA and writes no certificate.
+    let proxy_ca = match ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
+    {
+        Some(ca) => {
+            ca.write_cert_pem(&config.ca_path)?;
+            ring_buffer.log(format!(
+                "proxy CA published at {}",
+                config.ca_path.display()
+            ));
+            Some(Arc::new(ca))
+        }
+        None => None,
+    };
+
     // Spawn one background task per refreshable secret. Tasks live until they
     // observe the shutdown signal or get aborted at SIGTERM.
     let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
@@ -876,6 +933,7 @@ async fn async_main(
     let pid = std::process::id();
     let pid_path = config.pid_path.clone();
     let socket_path = config.socket_path.clone();
+    let ca_path = config.ca_path.clone();
 
     if let Err(e) = write_pid_file(&pid_path, pid) {
         ring_buffer.log(format!("failed to write PID file: {e}"));
@@ -918,9 +976,10 @@ async fn async_main(
                         // may swap the inner Arc later; this connection keeps
                         // its snapshot for its full lifetime.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        let ca = proxy_ca.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr).await;
+                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, ca).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -949,7 +1008,14 @@ async fn async_main(
     }
 
     // ── Graceful shutdown ──
-    graceful_shutdown(&child_registry, &ring_buffer, &socket_path, &pid_path).await;
+    graceful_shutdown(
+        &child_registry,
+        &ring_buffer,
+        &socket_path,
+        &pid_path,
+        &ca_path,
+    )
+    .await;
 
     Ok(())
 }
@@ -960,6 +1026,7 @@ async fn async_main(
 ///
 /// Reads the first NDJSON line to determine the request type, dispatches to
 /// the appropriate handler, and closes the connection.
+#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<Config>,
@@ -967,6 +1034,7 @@ async fn handle_connection(
     redactor: Arc<Redactor>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
+    proxy_ca: Option<Arc<ProxyCa>>,
 ) {
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -1051,6 +1119,7 @@ async fn handle_connection(
                 redactor,
                 ring_buffer,
                 child_registry,
+                proxy_ca,
             )
             .await;
         }
@@ -1110,12 +1179,13 @@ enum TermReason {
 /// 2. CWD validation
 /// 3. Binary resolution
 /// 4. Environment construction
-/// 5. Timeout resolution
-/// 6. Policy and sandbox profile construction
-/// 7. ExecRequest assembly and spawn
-/// 8. Child registration
-/// 9. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
-/// 10. Post-loop cleanup (drain output, send exit, kill if needed)
+/// 5. Proxy session (proxy tools only): bind the listener, overlay its env
+/// 6. Timeout resolution
+/// 7. Policy and sandbox profile construction
+/// 8. ExecRequest assembly and spawn
+/// 9. Child registration
+/// 10. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
+/// 11. Post-loop cleanup (drain output, send exit, kill if needed)
 #[allow(clippy::too_many_arguments)]
 async fn handle_exec_request(
     tool: String,
@@ -1131,6 +1201,7 @@ async fn handle_exec_request(
     redactor: Arc<Redactor>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
+    proxy_ca: Option<Arc<ProxyCa>>,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
@@ -1140,22 +1211,6 @@ async fn handle_exec_request(
     if let Err(e) = policy::validate_tool_exists(&tool, &config) {
         log_and_send_error(
             format!("unknown tool {:?}: {e}", tool),
-            &ring_buffer,
-            &mut writer,
-        )
-        .await;
-        return;
-    }
-
-    // Proxy tools are safe only with the proxy in front of them: spawned the
-    // ordinary way they would get unrestricted network and no credential,
-    // which is exactly the general-purpose network tool SECURITY.md forbids.
-    if config.tools[&tool].proxy.is_some() {
-        log_and_send_error(
-            format!(
-                "tool {:?} is a proxy tool, and this build of airlock has no proxy runtime; refusing to run it without egress enforcement",
-                tool
-            ),
             &ring_buffer,
             &mut writer,
         )
@@ -1233,12 +1288,69 @@ async fn handle_exec_request(
             return;
         }
     };
-    let env = exec::build_env(&env_pairs);
+    let mut env = exec::build_env(&env_pairs);
 
-    // ── 5. Timeout resolution ───────────────────────────────────────────────
+    // ── 5. Proxy session ────────────────────────────────────────────────────
+    //
+    // A proxy tool gets a listener of its own, bound now so that the port is
+    // known before the sandbox profile is built. The session is held in this
+    // local for the rest of the function: dropping it aborts the serve task
+    // and closes the listener, so every way out of this function — normal
+    // exit, timeout, kill, client disconnect, an early `return` below — takes
+    // the proxy down with the child.
+    let proxy_session = match &tool_config.proxy {
+        Some(policy) => {
+            // A configured proxy tool is what makes the daemon generate a CA,
+            // so the two are present or absent together.
+            let Some(ca) = proxy_ca else {
+                log_and_send_error(
+                    format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA"),
+                    &ring_buffer,
+                    &mut writer,
+                )
+                .await;
+                return;
+            };
+            match ProxySession::start(
+                tool.clone(),
+                policy.clone(),
+                ca,
+                config.ca_path.clone(),
+                Arc::clone(&secrets),
+                ring_buffer.clone(),
+            ) {
+                Ok(session) => {
+                    ring_buffer.log(format!(
+                        "proxy for tool {:?} listening on 127.0.0.1:{}",
+                        tool,
+                        session.port()
+                    ));
+                    Some(session)
+                }
+                Err(e) => {
+                    log_and_send_error(
+                        format!("failed to start the proxy for tool {:?}: {e}", tool),
+                        &ring_buffer,
+                        &mut writer,
+                    )
+                    .await;
+                    return;
+                }
+            }
+        }
+        None => None,
+    };
+
+    // Applied last so the daemon's proxy variables win over anything the
+    // tool's own `env` set.
+    if let Some(session) = &proxy_session {
+        session.apply_env(&mut env);
+    }
+
+    // ── 6. Timeout resolution ───────────────────────────────────────────────
     let timeout = tool_config.timeout.unwrap_or(config.timeout);
 
-    // ── 6. Policy and sandbox profile construction ──────────────────────────
+    // ── 7. Policy and sandbox profile construction ──────────────────────────
     let mut tool_policy = match policy::build_tool_policy(&tool, &config) {
         Ok(p) => p,
         Err(e) => {
@@ -1252,6 +1364,9 @@ async fn handle_exec_request(
         }
     };
     tool_policy.binary_path = Some(binary.clone());
+    if let Some(session) = &proxy_session {
+        tool_policy.network = sandbox::NetworkAccess::ProxyOnly(session.port());
+    }
 
     let sandbox_profile = match build_platform_sandbox_profile(&tool_policy) {
         Ok(p) => p,
@@ -1266,7 +1381,7 @@ async fn handle_exec_request(
         }
     };
 
-    // ── 7. ExecRequest assembly and spawn ───────────────────────────────────
+    // ── 8. ExecRequest assembly and spawn ───────────────────────────────────
     let request = exec::ExecRequest {
         binary,
         args,
@@ -1292,11 +1407,11 @@ async fn handle_exec_request(
     let pid = spawned.pid;
     let mut child = spawned.child;
 
-    // ── 8. Child registration ───────────────────────────────────────────────
+    // ── 9. Child registration ───────────────────────────────────────────────
     child_registry.insert(pid);
     ring_buffer.log(format!("tool {:?} spawned (PID: {pid})", tool));
 
-    // ── 9. Set up redaction pipelines ───────────────────────────────────────
+    // ── 10. Set up redaction pipelines ──────────────────────────────────────
     //
     // For each output stream (stdout/stderr), the pipeline is:
     //   async reader task → std sync channel → blocking redact task → tokio mpsc → select loop
@@ -1310,7 +1425,7 @@ async fn handle_exec_request(
     let (stdout_task, mut stdout_rx) = spawn_redaction_pipeline(redactor.clone(), spawned.stdout);
     let (stderr_task, mut stderr_rx) = spawn_redaction_pipeline(redactor, spawned.stderr);
 
-    // ── 10. Concurrent I/O loop ─────────────────────────────────────────────
+    // ── 11. Concurrent I/O loop ─────────────────────────────────────────────
     let mut child_stdin: Option<tokio::process::ChildStdin> = Some(spawned.stdin);
     let mut stdin_received = false;
     let mut stdout_done = false;
@@ -1748,6 +1863,7 @@ async fn graceful_shutdown(
     ring_buffer: &RingBuffer,
     socket_path: &Path,
     pid_path: &Path,
+    ca_path: &Path,
 ) {
     // Signal all active children with SIGTERM.
     let pids = child_registry.all();
@@ -1785,6 +1901,10 @@ async fn graceful_shutdown(
     if let Err(e) = std::fs::remove_file(pid_path) {
         ring_buffer.log(format!("failed to remove PID file: {e}"));
     }
+
+    // Remove the proxy CA certificate. Absent when no proxy tool is
+    // configured, so a missing file is not worth logging.
+    let _ = std::fs::remove_file(ca_path);
 
     ring_buffer.log("shutdown complete".to_string());
 }
@@ -2012,8 +2132,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pid_path = tmp.path().join("airlock.pid");
         let socket_path = tmp.path().join("airlock.sock");
+        let ca_path = tmp.path().join("airlock-ca.pem");
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
     }
 
@@ -2028,7 +2149,8 @@ mod tests {
         std::fs::write(&pid_path, "999999999\n").unwrap();
         std::fs::write(&socket_path, "dummy").unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
         assert!(!pid_path.exists(), "PID file should be cleaned up");
         assert!(!socket_path.exists(), "socket file should be cleaned up");
@@ -2044,7 +2166,8 @@ mod tests {
         let my_pid = std::process::id();
         std::fs::write(&pid_path, format!("{my_pid}\n")).unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -2067,7 +2190,8 @@ mod tests {
         // No PID file, but socket exists.
         std::fs::write(&socket_path, "stale").unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
         assert!(!socket_path.exists(), "stale socket should be cleaned up");
     }
@@ -2083,7 +2207,8 @@ mod tests {
         // leave the socket in place rather than silently severing it.
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(
             matches!(result, Err(DaemonError::SocketInUse { .. })),
             "expected SocketInUse, got: {result:?}"

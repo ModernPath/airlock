@@ -201,10 +201,11 @@ fn read_pid_and_check_liveness(pid_path: &Path) -> Result<PidCheckResult, ExitCo
     }
 }
 
-/// Remove stale PID and socket files, ignoring errors.
-fn cleanup_stale_files(pid_path: &Path, socket_path: &Path) {
-    let _ = std::fs::remove_file(pid_path);
-    let _ = std::fs::remove_file(socket_path);
+/// Remove the files a dead daemon left behind, ignoring errors.
+fn cleanup_stale_files(paths: &airlock::config::DiscoveredPaths) {
+    let _ = std::fs::remove_file(&paths.pid_path);
+    let _ = std::fs::remove_file(&paths.socket_path);
+    let _ = std::fs::remove_file(&paths.ca_path);
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
@@ -337,7 +338,7 @@ fn stop_daemon(cwd: &Path, config_path: Option<&Path>) -> Result<(), ExitCode> {
             return Ok(());
         }
         PidCheckResult::Stale => {
-            cleanup_stale_files(&paths.pid_path, &paths.socket_path);
+            cleanup_stale_files(&paths);
             eprintln!("cleaned up stale PID file");
             return Ok(());
         }
@@ -350,7 +351,7 @@ fn stop_daemon(cwd: &Path, config_path: Option<&Path>) -> Result<(), ExitCode> {
         let err = std::io::Error::last_os_error();
         if err.raw_os_error() == Some(libc::ESRCH) {
             // Race condition: process exited between liveness check and SIGTERM.
-            cleanup_stale_files(&paths.pid_path, &paths.socket_path);
+            cleanup_stale_files(&paths);
             eprintln!("daemon stopped");
             return Ok(());
         }
