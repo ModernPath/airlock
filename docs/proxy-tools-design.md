@@ -1,6 +1,6 @@
 # Proxy tools — design proposal
 
-**Status:** implemented through phase 2. The config schema and route matcher
+**Status:** implemented through phase 3. The config schema and route matcher
 live in [src/proxy.rs](../src/proxy.rs) and [src/config.rs](../src/config.rs);
 the runtime is [src/proxy/server.rs](../src/proxy/server.rs) and
 [src/proxy/ca.rs](../src/proxy/ca.rs), wired into `handle_exec_request` in
@@ -68,7 +68,7 @@ what it does and what this proposal takes from it:
 | Proxy auth: random token, Basic auth, constant-time compare. | Same, but per-exec (see below for why it is mandatory here). |
 | SSRF: private-range check in the dialer's `Control` callback — i.e. *after* DNS resolution, which defeats rebinding. | Same: check the resolved `SocketAddr` immediately before `connect()`. |
 | Host header vs. CONNECT authority consistency check. | Same, and the client's SNI is ignored entirely. |
-| No response redaction, no audit trail for proxied requests. | Tool stdout already flows through the redactor; proxied requests are logged to the ring buffer. |
+| No response redaction, no audit trail for proxied requests. | **Responses are redacted in the proxy** — header values and body — so nothing the tool writes to a file holds a secret; proxied requests are logged to the ring buffer. |
 
 ## Decisions taken
 
@@ -187,8 +187,12 @@ CONNECT run.googleapis.com:443
          ├─ resolve host; any private / loopback / link-local /
          │    CGNAT / ULA / metadata (169.254.0.0/16) address   → 403
          │    (checked on the SocketAddr passed to connect(), post-DNS)
+         ├─ force Accept-Encoding: identity; strip Range / If-Range
          ├─ upstream TLS ≥ 1.2, verified against public roots for `host`
-         └─ stream response back unmodified
+         ├─ response Content-Encoding ≠ identity, odd transfer coding,
+         │    or 206 / Content-Range                          → 502 (fail closed)
+         └─ redact every header value; drop Content-Length unless the
+              response is bodiless; stream the body through the redactor
 plain `GET http://…` (non-CONNECT)                    → 403   (never send credentials in cleartext)
 ```
 
@@ -258,13 +262,55 @@ backend closes both gaps and is the intended follow-up.
 
 ### Output
 
-Response bodies reach the agent via curl's stdout, which already passes
-through the Aho-Corasick redactor — so an API that echoes the bearer token is
-covered on that path. It is **not** covered when curl writes to a file
-(`-o`). That gap exists for every Airlock tool today, but it is more
-reachable here. Options, deferred: redact inside the proxy (requires forcing
-`Accept-Encoding: identity` and re-framing), or deny the tool write access
-outside a scratch directory.
+Response bodies reach the agent via curl's stdout, which passes through the
+Aho-Corasick redactor — but not when curl writes to a file (`-o`,
+`--dump-header`, `--trace`), and that is exactly what an HTTP client is for.
+Rather than fence the tool out of the filesystem, the redaction moved into the
+proxy: **every response header value and every body byte is redacted before it
+reaches the tool**, so the plaintext secret never exists inside the sandbox at
+all. The two options the first draft weighed against each other turned out not
+to be alternatives — the second only narrows where the plaintext can land,
+while the first stops it being produced.
+
+Consequences, all accepted deliberately:
+
+- **Streaming, not buffering.** The body is redacted frame by frame by an
+  incremental redactor ([src/redact.rs](../src/redact.rs)) that holds back only
+  the bytes a pattern could still be starting in — never more than the longest
+  pattern — and whose output for any chunking equals what the single-shot
+  redactor makes of the whole input. It runs inside `poll_frame` with no thread
+  and no channel behind it, so hyper's own polling is the backpressure and
+  dropping the response stops the upstream read. The `spawn_blocking` bridge the
+  stdout path uses would have cost a thread per response and would have had to
+  be cancelled by hand.
+- **The redactor is taken per response from the live handle**, not snapshotted
+  at session start. A tool runs for minutes, the proxy injects whatever the
+  store holds *now*, and a session snapshot would not know a token minted after
+  the exec began. The two generations a refresh leaves behind cover a swap that
+  lands mid-response.
+- **`Content-Length` is dropped whenever there is a body.** A placeholder is not
+  the length of the secret it replaced, and which it is cannot be known before
+  the body has been read; hyper frames the response as chunked instead, which
+  HTTP/1.1 always supports. A bodiless response (HEAD, `1xx`, `204`, `304`)
+  keeps its length — there it is metadata about the representation, and `curl
+  -I` must still report one.
+- **Compression fails closed.** The request forces `Accept-Encoding: identity`;
+  an upstream that answers with a content coding (or a transfer coding other
+  than chunked) gets a `502` and its body is dropped unread. No decompressor is
+  added: it would be a second parser of attacker-supplied bytes in the response
+  path for no security gain.
+- **Ranges are stripped, not supported.** A range may begin in the middle of a
+  secret, splitting the pattern across two responses the proxy never sees
+  together while the tool reassembles the plaintext in a file. `Range` and
+  `If-Range` are removed so the upstream sends the whole representation, and a
+  `206` arriving anyway is refused. Resumed downloads therefore do not work.
+- **Trailers are dropped.**
+- **No opt-out.** Redaction on the output path is mandatory in Airlock; the
+  proxy is an output path.
+
+What it does not catch is an upstream that *transforms* the secret — reversed,
+re-encoded in a scheme the redactor does not know — which is the same
+limitation the stdout path has always had.
 
 Each proxied request is logged to the ring buffer: method, host, path
 (no query string — it may carry data), route decision, upstream status.
@@ -301,7 +347,8 @@ request path is security-critical and small enough to audit.
 | **0** | Design; `proxy` / `routes` schema, validation, matcher, tests; daemon fails closed; `airlock list` shows routes. | landed |
 | **1** | Runtime on macOS: per-exec listener, CA, interception, injection, SSRF dial check, Seatbelt `ProxyOnly`. Curl guidance flipped in SECURITY.md / SKILL.md / README. | landed |
 | **2** | Linux: Landlock ABI v4 network rules, fail-closed kernel check. | landed; exercised by `tests/proxy_e2e_integration.rs` on the Linux CI runner (proxy port reachable, direct TCP connect refused). The fail-closed path for kernels older than 6.7 has not been run on such a kernel. |
-| 3 | In-proxy response redaction, HTTP/2, per-route upstream port, network-namespace backend. | open |
+| **3** | In-proxy response redaction: header values and body, streaming; identity encoding forced; compressed, oddly-framed and partial responses refused. | landed |
+| 4 | HTTP/2, per-route upstream port, network-namespace backend. | open |
 
 Phase 1 landed with request auditing included rather than deferred to phase 3 —
 the ring-buffer line (tool, method, host, path, decision, upstream status) falls

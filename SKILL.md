@@ -81,7 +81,7 @@ airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locati
 airlock exec -- curl -s 'https://storage.googleapis.com/storage/v1/b?project=my-project'
 ```
 
-Four things to know:
+Things to know:
 
 - **Do not pass authentication headers.** Airlock attaches the credential
   itself. An `-H 'Authorization: ...'` you supply is removed before the request
@@ -93,9 +93,18 @@ Four things to know:
   **not** retry with `--noproxy`, `--insecure`/`-k`, a different port, or a
   rewritten URL. Those either fail the same way or fail harder — the sandbox
   blocks direct connections and DNS outright. Report the refusal to the user.
-- **`-o file` skips redaction.** Output written to a file does not pass through
-  the redactor, so a response that echoes a credential lands on disk in the
-  clear. Prefer stdout.
+- **Responses are redacted, including to a file.** Header values and body are
+  redacted inside the daemon, so `-o file`, `--dump-header` and `-D` write
+  bytes that already have `[REDACTED:NAME]` in place of any credential. Seeing
+  that in a downloaded file is expected — the API echoed a secret, and Airlock
+  replaced it.
+- **Compressed transfer is not available.** The request always asks the API for
+  an uncompressed response, so `--compressed` gets you plain bytes, and an API
+  that compresses anyway produces `502 ... content-encoded`. Nothing to work
+  around; just read the plain response.
+- **Range requests and resumed downloads do not work.** `--range` / `-r` and
+  `-C -` are stripped, so the API sends the whole resource. A resume attempt
+  will fail or re-download from the start. Download in one go.
 
 ### Check daemon status
 
