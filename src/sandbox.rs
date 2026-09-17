@@ -481,10 +481,21 @@ pub mod macos {
         // HTTPS. Profiles that genuinely need keychain access (e.g.
         // `claude-relaxed`) opt in by re-adding the services in their own
         // profile rules. Privileged Mach operations remain denied by default.
+        //
+        // `com.apple.FSEvents` is the fseventsd endpoint behind
+        // `FSEventStreamCreate`. Without it every file watcher on macOS
+        // breaks, and the failures are unrecognisable: libuv reports the
+        // failed `FSEventStreamStart` as `EMFILE` (`node --watch`, nodemon,
+        // vite), Bun as "Error starting FSEvents stream". It grants change
+        // notifications only — reading a changed file still goes through the
+        // filesystem rules — but the event stream itself carries paths, so a
+        // watcher rooted outside the sandbox learns names of files it cannot
+        // open. That metadata channel is the price of working dev servers.
         out.push_str("(allow mach-lookup\n");
         out.push_str("  (global-name \"com.apple.audio.systemsoundserver\")\n");
         out.push_str("  (global-name \"com.apple.distributed_notifications@Uv3\")\n");
         out.push_str("  (global-name \"com.apple.FontObjectsServer\")\n");
+        out.push_str("  (global-name \"com.apple.FSEvents\")\n");
         out.push_str("  (global-name \"com.apple.fonts\")\n");
         out.push_str("  (global-name \"com.apple.logd\")\n");
         out.push_str("  (global-name \"com.apple.lsd.mapdb\")\n");
@@ -1259,6 +1270,18 @@ pub mod macos {
         }
 
         #[test]
+        fn profile_allows_fsevents_mach_service() {
+            // File watchers (node --watch, vite, bun, cargo-watch) fail with
+            // misleading errors — EMFILE from libuv — when fseventsd is
+            // unreachable. Both profiles must reach it.
+            let sbpl = sbpl_from_profile(&empty_policy());
+            assert!(
+                sbpl.contains("(global-name \"com.apple.FSEvents\")"),
+                "SBPL should allow the FSEvents Mach service, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
         fn profile_mach_lookup_excludes_keychain_services() {
             let sbpl = sbpl_from_profile(&empty_policy());
             // Every Mach service that backs keychain access must be absent
@@ -1949,6 +1972,15 @@ pub mod macos {
             assert!(
                 sbpl.contains("(allow mach-priv-task-port (target same-sandbox))"),
                 "agent SBPL should allow mach-priv-task-port (target same-sandbox), got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_allows_fsevents_mach_service() {
+            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+            assert!(
+                sbpl.contains("(global-name \"com.apple.FSEvents\")"),
+                "agent SBPL should allow the FSEvents Mach service, got:\n{sbpl}"
             );
         }
 
