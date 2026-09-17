@@ -1,10 +1,17 @@
 # Proxy tools — design proposal
 
-**Status:** proposal. The config schema and route matcher described in
-[Config schema](#config-schema) are implemented and tested
-([src/proxy.rs](../src/proxy.rs), [src/config.rs](../src/config.rs)). The proxy
-runtime is **not** implemented; until it is, the daemon refuses to execute a
-proxy tool ([src/daemon.rs](../src/daemon.rs), `handle_exec_request`).
+**Status:** implemented through phase 2. The config schema and route matcher
+live in [src/proxy.rs](../src/proxy.rs) and [src/config.rs](../src/config.rs);
+the runtime is [src/proxy/server.rs](../src/proxy/server.rs) and
+[src/proxy/ca.rs](../src/proxy/ca.rs), wired into `handle_exec_request` in
+[src/daemon.rs](../src/daemon.rs). Egress pinning is in
+[src/sandbox.rs](../src/sandbox.rs) for both platforms. Operator-facing
+documentation of what shipped, including the residual risks below, is in
+[SECURITY.md](../SECURITY.md#proxy-tools).
+
+This document is the design record — why the shape is what it is. It is not
+the reference for how to use the feature; that is
+[README.md](../README.md#proxy-tools) and [SKILL.md](../SKILL.md#proxy-tools).
 
 ## Problem
 
@@ -287,19 +294,35 @@ request path is security-critical and small enough to audit.
 
 ## Phasing
 
-| Phase | Content |
-|---|---|
-| **0 (this PR)** | Design; `proxy` / `routes` schema, validation, matcher, tests; daemon fails closed; `airlock list` shows routes. |
-| 1 | Runtime on macOS: per-exec listener, CA, interception, injection, SSRF dial check, Seatbelt `ProxyOnly`. Flip the curl guidance in SECURITY.md / SKILL.md / README. |
-| 2 | Linux: Landlock ABI v4 network rules, fail-closed kernel check. |
-| 3 | Request audit detail, in-proxy response redaction, HTTP/2, network-namespace backend. |
+| Phase | Content | Status |
+|---|---|---|
+| **0** | Design; `proxy` / `routes` schema, validation, matcher, tests; daemon fails closed; `airlock list` shows routes. | landed |
+| **1** | Runtime on macOS: per-exec listener, CA, interception, injection, SSRF dial check, Seatbelt `ProxyOnly`. Curl guidance flipped in SECURITY.md / SKILL.md / README. | landed |
+| **2** | Linux: Landlock ABI v4 network rules, fail-closed kernel check. | written, **not** verified on a Linux host |
+| 3 | In-proxy response redaction, HTTP/2, per-route upstream port, network-namespace backend. | open |
+
+Phase 1 landed with request auditing included rather than deferred to phase 3 —
+the ring-buffer line (tool, method, host, path, decision, upstream status) falls
+out of the request path for nothing, and a proxy that attaches credentials
+without a trail is harder to reason about than one that does not exist yet.
 
 ## Open questions
 
-- Apple's system curl is built against SecureTransport + LibreSSL. Confirm it
-  honors `CURL_CA_BUNDLE` for a proxy-intercepted connection and enforces
-  Name Constraints; otherwise document a Homebrew curl requirement.
+**Resolved: Apple's system curl.** `/usr/bin/curl` 8.7.1 (SecureTransport /
+LibreSSL 3.3.6, macOS 15) honours `CURL_CA_BUNDLE` for a proxy-intercepted
+connection and accepts a leaf issued by the name-constrained CA. No Homebrew
+curl requirement, and no need to soften the constraint to non-critical. Checked
+two ways: a hermetic test in [src/proxy/server.rs](../src/proxy/server.rs) that
+drives the real binary with nothing but the environment the daemon sets, and a
+manual run against `httpbin.org` through a real daemon.
+
+Still open:
+
 - Should `airlock run` expose a long-lived proxy to the *agent's own* HTTP
   client (no `airlock exec`)? Out of scope here; the per-exec model does not
   extend to it without revisiting proxy auth.
-- Per-route upstream port other than 443.
+- Per-route upstream port other than 443. The runtime hard-codes 443 for both
+  the CONNECT check and the dial.
+- The upstream connection is opened per request rather than pooled per tunnel.
+  Correct and simple; a pool would have to carry the proof that two requests
+  sharing a connection were vetted identically.

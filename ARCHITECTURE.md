@@ -12,6 +12,8 @@ src/
 ├── refresh.rs    Background secret refresh task, exponential-backoff retry
 ├── policy.rs     ToolPolicy / AgentPolicy construction, CWD validation
 ├── proxy.rs      Proxy-tool egress policy: route table, host / path matching
+│   ├── ca.rs     Per-daemon MITM CA: name constraints, leaf minting and cache
+│   └── server.rs Per-exec interception proxy: CONNECT, vetting, injection
 ├── redact.rs     Aho-Corasick automaton, streaming redaction
 ├── sandbox.rs    SandboxBackend trait, macOS Seatbelt, Linux Landlock
 ├── exec.rs       Binary resolution, env construction, child spawn
@@ -120,21 +122,25 @@ Each accepted connection is spawned as a `tokio::spawn(handle_connection(...))` 
 Client sends: {"type":"exec","tool":"gh","args":["repo","list"],"cwd":"/home/user/project"}
 
 Daemon handler:
- 1. Validate tool exists in config; refuse proxy tools (no proxy runtime yet —
-    see docs/proxy-tools-design.md)
+ 1. Validate tool exists in config
  2. Validate CWD is within sandbox root
  3. Resolve binary: walk PATH for "gh" → "/usr/bin/gh"
  4. Build child env: walk tool.env in declared (alphabetical) order, resolving
     Static(s) as-is and SecretRef(label) via the in-memory secret store; then
     layer the essential pass-through set (PATH, HOME, TERM, USER, TZ, and the
     standard LC_* locale family — see exec::ESSENTIAL_VARS)
- 5. Resolve timeout (per-tool override or global default)
- 6. Build ToolPolicy (merge sandbox root + global + tool paths)
- 7. Build SandboxProfile (SBPL on macOS, Landlock on Linux)
- 8. spawn(ExecRequest { binary, args, work_dir, env, sandbox_profile, timeout })
- 9. Register child PID in ChildRegistry
+ 5. Proxy tools only: bind a proxy listener on 127.0.0.1:0, then overlay the
+    daemon-owned HTTPS_PROXY / NO_PROXY / *_CA_* variables on top of step 4.
+    The ProxySession is held for the rest of the handler; dropping it aborts
+    the serve task, so every exit path takes the proxy down with the child.
+ 6. Resolve timeout (per-tool override or global default)
+ 7. Build ToolPolicy (merge sandbox root + global + tool paths), with
+    network = ProxyOnly(port) for a proxy tool and Full otherwise
+ 8. Build SandboxProfile (SBPL on macOS, Landlock on Linux)
+ 9. spawn(ExecRequest { binary, args, work_dir, env, sandbox_profile, timeout })
+10. Register child PID in ChildRegistry
 
-10. Concurrent select! loop:
+11. Concurrent select! loop:
     ├── child exit        → collect exit code, break
     ├── stdout chunk      → redact → DaemonMessage::Stdout → socket
     ├── stderr chunk      → redact → DaemonMessage::Stderr → socket
@@ -143,10 +149,59 @@ Daemon handler:
     ├── stdin timeout (2s)→ auto-close child stdin
     └── exec timeout      → SIGTERM → 5s → SIGKILL
 
-11. Drain remaining stdout/stderr
-12. Send DaemonMessage::Exit { code } or DaemonMessage::Error
-13. Unregister child PID
+12. Drain remaining stdout/stderr
+13. Send DaemonMessage::Exit { code } or DaemonMessage::Error
+14. Unregister child PID
 ```
+
+### Proxy tools
+
+A proxy tool holds no secret. Its only network path is a proxy the daemon
+binds for that one execution, which attaches the credential after the request
+has left the tool. Rationale and threat model:
+[docs/proxy-tools-design.md](docs/proxy-tools-design.md) and
+[SECURITY.md](SECURITY.md#proxy-tools).
+
+The CA is generated once per daemon in `async_main` — inside the runtime, after
+the fork, so the synchronous-startup invariant is untouched — and shared as an
+`Arc` across connections. Its key stays in memory; only the certificate is
+written, to `{sandbox_root}/airlock-ca.pem`.
+
+```
+child (curl)                     daemon                         upstream
+    │                              │                                │
+    │ CONNECT api.example.com:443  │                                │
+    │  Proxy-Authorization: Basic  │                                │
+    ├─────────────────────────────►│ constant-time token compare    │
+    │                              │ port == 443?                   │
+    │                              │ find_route(host)?              │
+    │◄─────────────────────────────┤ 200, or 407 / 403              │
+    │                              │                                │
+    │ ── TLS handshake ───────────►│ leaf minted for the CONNECT    │
+    │    (client SNI ignored)      │ authority, ALPN http/1.1       │
+    │                              │                                │
+    │ GET /v1/things?page=2        │                                │
+    │  Host: api.example.com       │                                │
+    ├─────────────────────────────►│ Host == authority?             │
+    │                              │ no TE+CL, no dup CL?           │
+    │                              │ route.permits(method, path)?   │
+    │                              │ strip client's copy of the     │
+    │                              │   inject header + hop-by-hop   │
+    │                              │ secret store lookup (Stale→502)│
+    │                              │ attach prefix+secret+suffix    │
+    │                              │ resolve host, refuse non-      │
+    │                              │   routable addrs, dial that    │
+    │                              │   exact SocketAddr             │
+    │                              ├───── TLS ≥1.2, public roots ──►│
+    │◄─────────────────────────────┤◄────── response streamed ──────┤
+    │                              │ audit: method, host, path,     │
+    │                              │   decision, status (no query,  │
+    │                              │   no header values)            │
+```
+
+Meanwhile the sandbox holds the other end: the profile permits a TCP connect to
+that port and nothing else — no DNS, no other destination — so a tool that
+ignores `HTTPS_PROXY` gets nowhere.
 
 ### Redaction pipeline
 
@@ -335,7 +390,15 @@ On unsupported platforms, the sandbox is a no-op (only `setpgid` in `pre_exec`),
 | `rustix` | Typed safe wrappers for `umask`, `setrlimit`, `prctl`, `test_kill_process` |
 | `zeroize` | Backs `Secret<T>` drop semantics (zero on drop) |
 | `anyhow` / `thiserror` | Error handling |
-| `landlock` | Linux Landlock LSM (Linux-only) |
+| `landlock` | Linux Landlock LSM, filesystem and TCP rules (Linux-only) |
+| `rustls` / `tokio-rustls` | TLS in both directions of the proxy (ring provider, installed explicitly) |
+| `rcgen` | Proxy CA and leaf certificate generation |
+| `hyper` / `hyper-util` / `http-body-util` | HTTP/1.1 server and client for the proxy |
+| `bytes` | Body buffers on the proxy path |
+| `webpki-roots` | Public trust anchors for upstream verification |
+| `time` | Certificate validity windows |
+| `getrandom` | CSPRNG for the per-exec proxy token |
+| `subtle` | Constant-time comparison of the proxy token |
 
 ## Build
 
