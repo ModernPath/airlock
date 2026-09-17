@@ -1285,6 +1285,10 @@ fn only_a_plain_whole_representation_is_forwarded() {
         vec![("content-encoding", "zstd")],
         vec![("content-encoding", "deflate")],
         vec![("content-encoding", "gzip, identity")],
+        vec![
+            ("content-encoding", "identity"),
+            ("content-encoding", "gzip"),
+        ],
         vec![("transfer-encoding", "gzip, chunked")],
         vec![("content-range", "bytes 0-9/100")],
     ] {

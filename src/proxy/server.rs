@@ -669,10 +669,12 @@ fn forward_response(
 /// decoder in the response path would be a second parser of attacker-supplied
 /// bytes for no security gain, since the request already demands `identity`.
 fn vet_response(parts: &hyper::http::response::Parts) -> Result<(), &'static str> {
-    if let Some(encoding) = parts.headers.get(header::CONTENT_ENCODING)
-        && !encoding.as_bytes().eq_ignore_ascii_case(b"identity")
-    {
-        return Err("denied: upstream response is content-encoded and cannot be redacted");
+    // Every copy, not the first: two `Content-Encoding` lines are one list,
+    // and the coding that matters could be in either.
+    for encoding in parts.headers.get_all(header::CONTENT_ENCODING) {
+        if !encoding.as_bytes().eq_ignore_ascii_case(b"identity") {
+            return Err("denied: upstream response is content-encoded and cannot be redacted");
+        }
     }
     for coding in parts.headers.get_all(header::TRANSFER_ENCODING) {
         if !coding.as_bytes().eq_ignore_ascii_case(b"chunked") {
