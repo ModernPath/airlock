@@ -27,6 +27,11 @@ discover which tools are available before attempting to execute them.
 The daemon does NOT need to be running for this command — it reads the config
 file directly.
 
+A tool listed with `proxy tool; reachable hosts:` is a proxy tool: it has no
+secrets in its environment, and the hosts shown are the only ones it will be
+able to reach. Proxy tools are not executable yet — `airlock exec` on one
+returns an error until the proxy runtime ships.
+
 Example output:
 
 ```
