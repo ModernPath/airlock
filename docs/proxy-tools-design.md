@@ -300,7 +300,7 @@ request path is security-critical and small enough to audit.
 |---|---|---|
 | **0** | Design; `proxy` / `routes` schema, validation, matcher, tests; daemon fails closed; `airlock list` shows routes. | landed |
 | **1** | Runtime on macOS: per-exec listener, CA, interception, injection, SSRF dial check, Seatbelt `ProxyOnly`. Curl guidance flipped in SECURITY.md / SKILL.md / README. | landed |
-| **2** | Linux: Landlock ABI v4 network rules, fail-closed kernel check. | written, **not** verified on a Linux host |
+| **2** | Linux: Landlock ABI v4 network rules, fail-closed kernel check. | landed; exercised by `tests/proxy_e2e_integration.rs` on the Linux CI runner (proxy port reachable, direct TCP connect refused). The fail-closed path for kernels older than 6.7 has not been run on such a kernel. |
 | 3 | In-proxy response redaction, HTTP/2, per-route upstream port, network-namespace backend. | open |
 
 Phase 1 landed with request auditing included rather than deferred to phase 3 —
