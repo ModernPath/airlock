@@ -1147,6 +1147,22 @@ async fn handle_exec_request(
         return;
     }
 
+    // Proxy tools are safe only with the proxy in front of them: spawned the
+    // ordinary way they would get unrestricted network and no credential,
+    // which is exactly the general-purpose network tool SECURITY.md forbids.
+    if config.tools[&tool].proxy.is_some() {
+        log_and_send_error(
+            format!(
+                "tool {:?} is a proxy tool, and this build of airlock has no proxy runtime; refusing to run it without egress enforcement",
+                tool
+            ),
+            &ring_buffer,
+            &mut writer,
+        )
+        .await;
+        return;
+    }
+
     // ── 2. CWD validation ───────────────────────────────────────────────────
     let cwd_path = PathBuf::from(&cwd);
     if let Err(e) = policy::validate_cwd(&cwd_path, &config.sandbox_root) {

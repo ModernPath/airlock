@@ -11,6 +11,7 @@ src/
 ├── secrets.rs    Secret<T> wrapper, pluggable secret sources, env clearing
 ├── refresh.rs    Background secret refresh task, exponential-backoff retry
 ├── policy.rs     ToolPolicy / AgentPolicy construction, CWD validation
+├── proxy.rs      Proxy-tool egress policy: route table, host / path matching
 ├── redact.rs     Aho-Corasick automaton, streaming redaction
 ├── sandbox.rs    SandboxBackend trait, macOS Seatbelt, Linux Landlock
 ├── exec.rs       Binary resolution, env construction, child spawn
@@ -119,7 +120,8 @@ Each accepted connection is spawned as a `tokio::spawn(handle_connection(...))` 
 Client sends: {"type":"exec","tool":"gh","args":["repo","list"],"cwd":"/home/user/project"}
 
 Daemon handler:
- 1. Validate tool exists in config
+ 1. Validate tool exists in config; refuse proxy tools (no proxy runtime yet —
+    see docs/proxy-tools-design.md)
  2. Validate CWD is within sandbox root
  3. Resolve binary: walk PATH for "gh" → "/usr/bin/gh"
  4. Build child env: walk tool.env in declared (alphabetical) order, resolving

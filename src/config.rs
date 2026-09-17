@@ -20,6 +20,8 @@ use std::time::Duration;
 use serde::Deserialize;
 use thiserror::Error;
 
+use crate::proxy::{HostPattern, Inject, PathRule, ProxyPolicy, ProxyRoute, RouteError};
+
 // ─── Constants ────────────────────────────────────────────────────────────────
 
 /// The config file name searched for during discovery.
@@ -229,6 +231,77 @@ pub enum ConfigError {
         /// The offending env var name.
         name: String,
     },
+
+    /// `proxy` and `routes` disagree: routes without `proxy = true`, or a
+    /// proxy tool with no routes (which could not reach anything).
+    #[error("[tools.{tool}] {reason}")]
+    ProxyRoutesMismatch {
+        /// The offending tool.
+        tool: String,
+        /// Which way the two fields disagree.
+        reason: &'static str,
+    },
+
+    /// A proxy tool's `env` references a secret. The point of a proxy tool is
+    /// that the agent fully controls its arguments, so anything in its
+    /// environment must be assumed readable by the agent.
+    #[error(
+        "[tools.{tool}.env.{var_name}] references a secret, but {tool:?} is a proxy tool; \
+         proxy tools must not receive secrets in their environment — attach the \
+         credential with a route's `inject` instead"
+    )]
+    ProxyToolSecretEnv {
+        /// The offending tool.
+        tool: String,
+        /// The env var holding the secret reference.
+        var_name: String,
+    },
+
+    /// A proxy tool's `env` sets a variable the daemon itself must control to
+    /// keep the tool pointed at the proxy and trusting its CA.
+    #[error(
+        "[tools.{tool}.env.{var_name}] is managed by Airlock for proxy tools and cannot be set"
+    )]
+    ProxyReservedEnvVar {
+        /// The offending tool.
+        tool: String,
+        /// The reserved env var name.
+        var_name: String,
+    },
+
+    /// A `[[tools.<tool>.routes]]` entry failed validation.
+    #[error("[[tools.{tool}.routes]] entry {index}: {source}")]
+    InvalidProxyRoute {
+        /// The offending tool.
+        tool: String,
+        /// Zero-based position of the route in the `routes` array.
+        index: usize,
+        /// What was wrong with it.
+        source: RouteError,
+    },
+
+    /// Two routes of one tool declare the same `host`, leaving it ambiguous
+    /// which rules and credential apply.
+    #[error("[[tools.{tool}.routes]] declares host {host:?} more than once")]
+    DuplicateProxyRouteHost {
+        /// The offending tool.
+        tool: String,
+        /// The repeated host pattern.
+        host: String,
+    },
+
+    /// A route's `inject.secret` names a label not declared in `[secrets]`.
+    #[error(
+        "[[tools.{tool}.routes]] host {host:?}: inject references undeclared secret label {label:?}"
+    )]
+    UndeclaredProxySecret {
+        /// The offending tool.
+        tool: String,
+        /// The route's host pattern.
+        host: String,
+        /// The undeclared label.
+        label: String,
+    },
 }
 
 // ─── Raw TOML structures (serde) ──────────────────────────────────────────────
@@ -407,6 +480,39 @@ struct RawToolConfig {
     /// Human-readable description of what this tool does.
     #[serde(default)]
     description: Option<String>,
+    /// Marks this tool as a proxy tool: no direct network, all HTTP(S) via
+    /// the daemon's proxy, governed by `routes`.
+    #[serde(default)]
+    proxy: bool,
+    /// Egress routes. Required when `proxy = true`, rejected otherwise.
+    #[serde(default)]
+    routes: Vec<RawProxyRoute>,
+}
+
+/// Raw deserialized `[[tools.X.routes]]` entry.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawProxyRoute {
+    /// DNS name or `*.`-prefixed DNS name.
+    host: String,
+    /// Credential header to attach to permitted requests.
+    #[serde(default)]
+    inject: Option<RawInject>,
+    /// `METHOD /path` rules; if non-empty a request must match one.
+    #[serde(default)]
+    allow: Vec<String>,
+    /// `METHOD /path` rules; a match refuses the request.
+    #[serde(default)]
+    deny: Vec<String>,
+}
+
+/// Raw deserialized `inject = { header, value, secret }` inline table.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RawInject {
+    header: String,
+    value: String,
+    secret: String,
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -527,6 +633,9 @@ pub struct ToolConfig {
 
     /// Human-readable description of what this tool does.
     pub description: Option<String>,
+
+    /// Egress policy when this is a proxy tool; `None` for ordinary tools.
+    pub proxy: Option<ProxyPolicy>,
 }
 
 /// Resolved configuration for the `[agent]` section.
@@ -946,6 +1055,105 @@ fn resolve_secret_command_env(
     })
 }
 
+// ─── Proxy tools ──────────────────────────────────────────────────────────────
+
+/// Env vars that decide where a client sends its traffic and which CAs it
+/// trusts. For a proxy tool the daemon sets these itself at spawn; a config
+/// value would either be overwritten or, worse, steer the tool around the
+/// proxy.
+const PROXY_RESERVED_ENV_VARS: &[&str] = &[
+    "ALL_PROXY",
+    "CURL_CA_BUNDLE",
+    "HTTPS_PROXY",
+    "HTTP_PROXY",
+    "NODE_EXTRA_CA_CERTS",
+    "NO_PROXY",
+    "REQUESTS_CA_BUNDLE",
+    "SSL_CERT_DIR",
+    "SSL_CERT_FILE",
+];
+
+/// Clients read the proxy variables in either case (`http_proxy` is in fact
+/// the only form curl honors for plain HTTP), so the check ignores case.
+fn is_proxy_reserved_env_var(name: &str) -> bool {
+    PROXY_RESERVED_ENV_VARS
+        .iter()
+        .any(|reserved| reserved.eq_ignore_ascii_case(name))
+}
+
+/// Validate a tool's `proxy` / `routes` pair into a [`ProxyPolicy`], or `None`
+/// for an ordinary tool.
+fn resolve_proxy_policy(
+    tool: &str,
+    proxy: bool,
+    raw_routes: Vec<RawProxyRoute>,
+    secrets: &HashMap<String, SecretSpec>,
+) -> Result<Option<ProxyPolicy>, ConfigError> {
+    if !proxy {
+        if !raw_routes.is_empty() {
+            return Err(ConfigError::ProxyRoutesMismatch {
+                tool: tool.to_string(),
+                reason: "has routes but is not a proxy tool; add `proxy = true`",
+            });
+        }
+        return Ok(None);
+    }
+    if raw_routes.is_empty() {
+        return Err(ConfigError::ProxyRoutesMismatch {
+            tool: tool.to_string(),
+            reason: "is a proxy tool with no routes; it could not reach any host",
+        });
+    }
+
+    let mut routes: Vec<ProxyRoute> = Vec::with_capacity(raw_routes.len());
+    for (index, raw) in raw_routes.into_iter().enumerate() {
+        let invalid = |source| ConfigError::InvalidProxyRoute {
+            tool: tool.to_string(),
+            index,
+            source,
+        };
+
+        let host = HostPattern::parse(&raw.host).map_err(invalid)?;
+        if routes.iter().any(|r| r.host == host) {
+            return Err(ConfigError::DuplicateProxyRouteHost {
+                tool: tool.to_string(),
+                host: host.to_string(),
+            });
+        }
+
+        let inject = match raw.inject {
+            None => None,
+            Some(i) => {
+                let inject = Inject::parse(&i.header, &i.value, &i.secret).map_err(invalid)?;
+                if !secrets.contains_key(&inject.secret) {
+                    return Err(ConfigError::UndeclaredProxySecret {
+                        tool: tool.to_string(),
+                        host: host.to_string(),
+                        label: inject.secret,
+                    });
+                }
+                Some(inject)
+            }
+        };
+
+        let parse_rules = |rules: &[String]| -> Result<Vec<PathRule>, ConfigError> {
+            rules
+                .iter()
+                .map(|r| PathRule::parse(r).map_err(invalid))
+                .collect()
+        };
+
+        routes.push(ProxyRoute {
+            host,
+            inject,
+            allow: parse_rules(&raw.allow)?,
+            deny: parse_rules(&raw.deny)?,
+        });
+    }
+
+    Ok(Some(ProxyPolicy { routes }))
+}
+
 // ─── Public API ───────────────────────────────────────────────────────────────
 
 /// Parse and resolve a raw TOML config string into a fully validated [`Config`].
@@ -1041,11 +1249,23 @@ fn parse_and_resolve_config(
                         name: var_name,
                     });
                 }
+                if raw_tool.proxy && is_proxy_reserved_env_var(&var_name) {
+                    return Err(ConfigError::ProxyReservedEnvVar {
+                        tool: name.clone(),
+                        var_name,
+                    });
+                }
                 let value = match raw_value {
                     RawEnvValue::Static(s) => {
                         EnvValue::Static(render_env_template(&s, &sandbox_root, &name, &var_name)?)
                     }
                     RawEnvValue::SecretRef(RawSecretRef { secret }) => {
+                        if raw_tool.proxy {
+                            return Err(ConfigError::ProxyToolSecretEnv {
+                                tool: name.clone(),
+                                var_name,
+                            });
+                        }
                         if !secrets.contains_key(&secret) {
                             // Location key includes the "tools." prefix so the
                             // error message formats as [tools.<name>.env.<var>].
@@ -1062,12 +1282,15 @@ fn parse_and_resolve_config(
             }
         }
 
+        let proxy = resolve_proxy_policy(&name, raw_tool.proxy, raw_tool.routes, &secrets)?;
+
         let tool_config = ToolConfig {
             env,
             extra_read: resolve_paths(&raw_tool.extra_read, &sandbox_root)?,
             extra_write: resolve_paths(&raw_tool.extra_write, &sandbox_root)?,
             timeout: raw_tool.timeout.map(Duration::from_secs),
             description: raw_tool.description,
+            proxy,
         };
 
         tools.insert(name, tool_config);
@@ -2520,6 +2743,313 @@ KNOWN = { secret = "known" }
             }
             other => panic!("expected UndeclaredSecretRefs, got: {other:?}"),
         }
+    }
+
+    // ── Proxy tools ───────────────────────────────────────────────────────
+
+    /// Load a config consisting of a declared `gcp_token` secret plus `body`.
+    fn load_with_gcp_secret(body: &str) -> Result<Config, ConfigError> {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            &format!(
+                r#"
+allow_home_root = true
+
+[secrets.gcp_token]
+source = "env"
+from = "GCP_TOKEN"
+{body}"#
+            ),
+        );
+        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        load_config(tmp.path())
+    }
+
+    #[test]
+    fn parse_proxy_tool_with_routes() {
+        let config = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "*.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_token" }
+allow = ["GET /**", "POST /v2/projects/*/locations/*/services"]
+deny = ["DELETE /**"]
+
+[[tools.curl.routes]]
+host = "example.com"
+"#,
+        )
+        .unwrap();
+
+        let policy = config.tools["curl"].proxy.as_ref().unwrap();
+        assert_eq!(policy.routes.len(), 2);
+
+        let google = policy.find_route("run.googleapis.com").unwrap();
+        let inject = google.inject.as_ref().unwrap();
+        assert_eq!(inject.header, "Authorization");
+        assert_eq!(inject.prefix, "Bearer ");
+        assert_eq!(inject.secret, "gcp_token");
+        assert!(google.permits("GET", "/v2/projects/p/locations/l/services"));
+        assert!(google.permits("POST", "/v2/projects/p/locations/l/services"));
+        assert!(!google.permits("DELETE", "/v2/projects/p/locations/l/services/s"));
+        assert!(!google.permits("PATCH", "/v2/projects/p/locations/l/services/s"));
+
+        let plain = policy.find_route("example.com").unwrap();
+        assert!(plain.inject.is_none());
+        assert!(policy.find_route("attacker.test").is_none());
+    }
+
+    #[test]
+    fn ordinary_tool_has_no_proxy_policy() {
+        let config = load_with_gcp_secret("\n[tools.gh]\n").unwrap();
+        assert!(config.tools["gh"].proxy.is_none());
+    }
+
+    #[test]
+    fn reject_routes_without_proxy_flag() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+
+[[tools.curl.routes]]
+host = "example.com"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ProxyRoutesMismatch { ref tool, .. } if tool == "curl"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_proxy_tool_without_routes() {
+        let err = load_with_gcp_secret("\n[tools.curl]\nproxy = true\n").unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ProxyRoutesMismatch { .. }),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_proxy_tool_with_secret_in_env() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[tools.curl.env]
+TOKEN = { secret = "gcp_token" }
+
+[[tools.curl.routes]]
+host = "example.com"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::ProxyToolSecretEnv { ref tool, ref var_name }
+                    if tool == "curl" && var_name == "TOKEN"
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_proxy_tool_overriding_proxy_env_in_either_case() {
+        for var in ["HTTPS_PROXY", "https_proxy", "CURL_CA_BUNDLE", "no_proxy"] {
+            let err = load_with_gcp_secret(&format!(
+                r#"
+[tools.curl]
+proxy = true
+
+[tools.curl.env]
+{var} = "x"
+
+[[tools.curl.routes]]
+host = "example.com"
+"#
+            ))
+            .unwrap_err();
+            assert!(
+                matches!(err, ConfigError::ProxyReservedEnvVar { ref var_name, .. } if var_name == var),
+                "{var}: got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_tool_may_still_set_proxy_env() {
+        let config = load_with_gcp_secret(
+            r#"
+[tools.gh.env]
+HTTPS_PROXY = "http://corp-proxy.internal:3128"
+"#,
+        )
+        .unwrap();
+        assert!(config.tools["gh"].env.contains_key("HTTPS_PROXY"));
+    }
+
+    #[test]
+    fn proxy_tool_may_set_static_env() {
+        let config = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[tools.curl.env]
+CLOUDSDK_CORE_PROJECT = "my-project"
+
+[[tools.curl.routes]]
+host = "example.com"
+"#,
+        )
+        .unwrap();
+        assert!(
+            config.tools["curl"]
+                .env
+                .contains_key("CLOUDSDK_CORE_PROJECT")
+        );
+    }
+
+    #[test]
+    fn reject_invalid_route_reports_tool_and_index() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+
+[[tools.curl.routes]]
+host = "10.0.0.1"
+"#,
+        )
+        .unwrap_err();
+        match err {
+            ConfigError::InvalidProxyRoute {
+                tool,
+                index,
+                source,
+            } => {
+                assert_eq!(tool, "curl");
+                assert_eq!(index, 1);
+                assert!(matches!(source, RouteError::InvalidHost { .. }));
+            }
+            other => panic!("expected InvalidProxyRoute, got: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_invalid_rule_and_inject() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+allow = ["get /**"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidProxyRoute {
+                    source: RouteError::InvalidRule { .. },
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+inject = { header = "Host", value = "{secret}", secret = "gcp_token" }
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InvalidProxyRoute {
+                    source: RouteError::InvalidInject { .. },
+                    ..
+                }
+            ),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_duplicate_route_host_case_insensitively() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+
+[[tools.curl.routes]]
+host = "Example.COM"
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::DuplicateProxyRouteHost { ref host, .. } if host == "example.com"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_route_with_undeclared_secret() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "ghost" }
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::UndeclaredProxySecret { ref label, .. } if label == "ghost"),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn reject_unknown_route_field() {
+        let err = load_with_gcp_secret(
+            r#"
+[tools.curl]
+proxy = true
+
+[[tools.curl.routes]]
+host = "example.com"
+alow = ["GET /**"]
+"#,
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, ConfigError::ParseError { .. }),
+            "got: {err:?}"
+        );
     }
 
     #[test]

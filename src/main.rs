@@ -544,6 +544,19 @@ fn cmd_list(config_path: Option<&Path>) -> ExitCode {
                 }
             }
         }
+
+        if let Some(policy) = &tool.proxy {
+            println!("  proxy tool; reachable hosts:");
+            for route in &policy.routes {
+                match &route.inject {
+                    Some(inject) => println!(
+                        "    {} ({} injected from <secret {:?}>)",
+                        route.host, inject.header, inject.secret
+                    ),
+                    None => println!("    {} (no credential)", route.host),
+                }
+            }
+        }
     }
 
     ExitCode::SUCCESS

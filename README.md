@@ -267,6 +267,10 @@ TF_INPUT             = "0"
 | `extra_read`  | Additional read-only paths. |
 | `extra_write` | Additional read-write paths. |
 | `timeout`     | Per-tool timeout in seconds; overrides the global value. |
+| `proxy`       | `true` marks a *proxy tool* — see below. **Schema only for now:** validated at load, but the daemon refuses to run proxy tools until the proxy runtime lands. |
+| `routes`      | `[[tools.<name>.routes]]` — hosts a proxy tool may reach, the credential header to attach, and optional `METHOD /path` allow/deny rules. |
+
+Proxy tools are the planned answer to "the API I need has no CLI": a general HTTP client such as `curl` whose only network path is a daemon-side proxy that attaches the credential *after* the request has left the tool, so the tool never holds a secret. A proxy tool's `env` may not reference secrets. Design, schema and threat model: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 > **Only declare purpose-built CLIs as tools** — never shells (`bash`), interpreters (`python`, `node`), or tools where the agent controls the request (`curl`). If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
 
