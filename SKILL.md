@@ -27,6 +27,9 @@ discover which tools are available before attempting to execute them.
 The daemon does NOT need to be running for this command — it reads the config
 file directly.
 
+A tool listed with `proxy tool; reachable hosts:` is a proxy tool — see
+[Proxy tools](#proxy-tools) for how to use one.
+
 Example output:
 
 ```
@@ -66,6 +69,33 @@ will fail with a connection error.
 Secret values in stdout/stderr are replaced with `[REDACTED:NAME]`, e.g.
 `[REDACTED:GH_TOKEN]`. This is normal and expected — it means the redaction is
 working.
+
+### Proxy tools
+
+A proxy tool is an HTTP client (typically `curl`) that reaches an API through
+Airlock instead of holding its credential. Use it exactly like any other tool,
+with ordinary `https://` URLs copied from the API docs:
+
+```
+airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
+airlock exec -- curl -s 'https://storage.googleapis.com/storage/v1/b?project=my-project'
+```
+
+Four things to know:
+
+- **Do not pass authentication headers.** Airlock attaches the credential
+  itself. An `-H 'Authorization: ...'` you supply is removed before the request
+  leaves the daemon, so it has no effect — and there is no token available to
+  you to put there anyway.
+- **Only the hosts `airlock list` shows are reachable.** Everything else fails.
+- **`403` from the proxy means the host, method or path is not permitted.**
+  The response body says which. This is policy, not a transient failure: do
+  **not** retry with `--noproxy`, `--insecure`/`-k`, a different port, or a
+  rewritten URL. Those either fail the same way or fail harder — the sandbox
+  blocks direct connections and DNS outright. Report the refusal to the user.
+- **`-o file` skips redaction.** Output written to a file does not pass through
+  the redactor, so a response that echoes a credential lands on disk in the
+  clear. Prefer stdout.
 
 ### Check daemon status
 

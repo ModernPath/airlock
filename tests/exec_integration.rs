@@ -17,7 +17,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use airlock::exec::{
     ExecRequest, SpawnedChild, build_env, kill_process_group, resolve_binary, spawn,
 };
-use airlock::sandbox::{SandboxBackend, ToolPolicy};
+use airlock::sandbox::{NetworkAccess, SandboxBackend, ToolPolicy};
 
 #[cfg(target_os = "macos")]
 use airlock::sandbox::macos::MacOSSeatbelt;
@@ -78,7 +78,7 @@ fn permissive_policy(tmp_dir: &Path) -> ToolPolicy {
     ToolPolicy {
         read_paths,
         read_write_paths: vec![PathBuf::from("/tmp"), tmp_dir.to_path_buf()],
-        requires_network: false,
+        network: NetworkAccess::None,
         binary_path: None,
     }
 }
@@ -715,7 +715,7 @@ mod macos_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -772,7 +772,7 @@ mod macos_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -819,7 +819,7 @@ mod macos_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -891,7 +891,7 @@ mod linux_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -937,7 +937,7 @@ mod linux_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -978,7 +978,7 @@ mod linux_sandbox {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 

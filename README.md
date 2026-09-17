@@ -267,8 +267,43 @@ TF_INPUT             = "0"
 | `extra_read`  | Additional read-only paths. |
 | `extra_write` | Additional read-write paths. |
 | `timeout`     | Per-tool timeout in seconds; overrides the global value. |
+| `proxy`       | `true` marks a *proxy tool* — see [Proxy tools](#proxy-tools). Requires at least one route, and forbids secrets in `env`. |
+| `routes`      | `[[tools.<name>.routes]]` — hosts a proxy tool may reach, the credential header to attach, and optional `METHOD /path` allow/deny rules. |
 
-> **Only declare purpose-built CLIs as tools** — never shells (`bash`), interpreters (`python`, `node`), or tools where the agent controls the request (`curl`). If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
+> **Only declare purpose-built CLIs as tools** — never shells (`bash`), interpreters (`python`, `node`), or any tool where the agent controls the request. If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. `curl` is the one exception, and only as a [proxy tool](#proxy-tools), where it never holds a secret to leak. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
+
+### Proxy tools
+
+The answer to "the API I need has no CLI". A proxy tool is a general HTTP client whose only network path is a daemon-side proxy that attaches the credential *after* the request has left the tool — so the tool never holds a secret, and everything the agent can read out of it is worthless.
+
+```toml
+# Minted on the trusted side, refreshed before expiry. The tool never sees it.
+[secrets.gcp_token]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token",
+           "--impersonate-service-account=agent-ro@my-project.iam.gserviceaccount.com"]
+refresh = 3000
+
+[tools.curl]
+description = "HTTP client for Google Cloud REST APIs (authenticated automatically)"
+proxy = true
+
+[[tools.curl.routes]]
+host   = "*.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_token" }
+allow  = ["GET /**", "POST /v2/projects/*/locations/*/services"]
+deny   = ["DELETE /**"]
+```
+
+The agent then uses ordinary URLs copied out of the API docs:
+
+```bash
+airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
+```
+
+What the daemon does for that invocation: binds a proxy on an ephemeral loopback port, points the tool at it with `HTTPS_PROXY` and `CURL_CA_BUNDLE`, pins the tool's egress to that one port with Seatbelt (macOS) or Landlock (Linux), and tears the whole thing down when the child exits. Per request it checks the host against the route table, the method and path against the rules, attaches the credential, and forwards over a verified TLS connection to a host it has confirmed is publicly routable. Unlisted hosts are simply unreachable — deny by default.
+
+Caveats worth knowing up front: HTTP/1.1 only (no gRPC or HTTP/2-only endpoints), certificate-pinned clients break under interception, and the agent gets the credential's full API authority on the routed hosts — scope the service account narrowly. Full threat model and residual risks: [SECURITY.md](SECURITY.md#proxy-tools); design rationale: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 ### `[agent]` — for `airlock run`
 

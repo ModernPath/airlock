@@ -488,11 +488,13 @@ fn resolve_config(
 
     let socket_path = sandbox_root.join("airlock.sock");
     let pid_path = sandbox_root.join("airlock.pid");
+    let ca_path = sandbox_root.join("airlock-ca.pem");
 
     Ok(crate::config::Config {
         sandbox_root,
         socket_path,
         pid_path,
+        ca_path,
         // 300 s matches the DEFAULT_TIMEOUT_SECS constant in config.rs.
         // This field governs daemon tool-execution timeouts; with --no-daemon
         // it is unused. Keep it at the standard default for consistency.
