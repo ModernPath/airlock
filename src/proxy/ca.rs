@@ -160,7 +160,7 @@ impl ProxyCa {
     /// daemon cannot redirect the write.
     pub fn write_cert_pem(&self, path: &Path) -> Result<(), CaError> {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
         let write = || -> io::Result<()> {
             let _ = std::fs::remove_file(path);
@@ -170,6 +170,10 @@ impl ProxyCa {
                 .mode(0o644)
                 .open(path)?;
             file.write_all(self.cert_pem.as_bytes())?;
+            // `mode` on the open is subject to the process umask, and the
+            // daemon's is whatever the operator's shell handed it. fchmod is
+            // not, so this is what actually fixes the mode.
+            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
             file.sync_all()
         };
         write().map_err(|source| CaError::Write {

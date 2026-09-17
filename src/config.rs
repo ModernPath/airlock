@@ -44,6 +44,13 @@ const SOCKET_FILENAME: &str = "airlock.sock";
 /// PID file filename derived from the sandbox root.
 const PID_FILENAME: &str = "airlock.pid";
 
+/// Filename of the proxy CA certificate, derived from the sandbox root.
+///
+/// It lives beside the socket and the PID file so it falls inside the
+/// sandbox root every tool can already read. Only the certificate is written;
+/// the key never leaves the daemon's memory.
+const CA_CERT_FILENAME: &str = "airlock-ca.pem";
+
 // ─── Error type ───────────────────────────────────────────────────────────────
 
 /// Errors that can occur during config discovery, parsing, or validation.
@@ -532,6 +539,10 @@ pub struct Config {
     /// Path to the PID file: `{sandbox_root}/airlock.pid`.
     pub pid_path: PathBuf,
 
+    /// Path to the proxy CA certificate: `{sandbox_root}/airlock-ca.pem`.
+    /// Written only when at least one tool declares `proxy = true`.
+    pub ca_path: PathBuf,
+
     /// Global timeout for tool execution.
     pub timeout: Duration,
 
@@ -675,6 +686,9 @@ pub struct DiscoveredPaths {
 
     /// Path to the PID file.
     pub pid_path: PathBuf,
+
+    /// Path to the proxy CA certificate.
+    pub ca_path: PathBuf,
 }
 
 // ─── Discovery ────────────────────────────────────────────────────────────────
@@ -1357,14 +1371,16 @@ fn parse_and_resolve_config(
         });
     }
 
-    // Derive socket and PID file paths.
+    // Derive socket, PID and CA certificate paths.
     let socket_path = sandbox_root.join(SOCKET_FILENAME);
     let pid_path = sandbox_root.join(PID_FILENAME);
+    let ca_path = sandbox_root.join(CA_CERT_FILENAME);
 
     Ok(Config {
         sandbox_root,
         socket_path,
         pid_path,
+        ca_path,
         timeout,
         filesystem_read,
         filesystem_write,
@@ -1463,6 +1479,7 @@ pub fn discover_paths(start_dir: &Path) -> Result<DiscoveredPaths, ConfigError> 
     Ok(DiscoveredPaths {
         socket_path: sandbox_root.join(SOCKET_FILENAME),
         pid_path: sandbox_root.join(PID_FILENAME),
+        ca_path: sandbox_root.join(CA_CERT_FILENAME),
         sandbox_root,
     })
 }
@@ -1510,6 +1527,7 @@ pub fn discover_paths_from_file(path: &Path) -> Result<DiscoveredPaths, ConfigEr
     Ok(DiscoveredPaths {
         socket_path: sandbox_root.join(SOCKET_FILENAME),
         pid_path: sandbox_root.join(PID_FILENAME),
+        ca_path: sandbox_root.join(CA_CERT_FILENAME),
         sandbox_root,
     })
 }
