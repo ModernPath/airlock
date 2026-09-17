@@ -82,7 +82,9 @@ From the design interview:
    now: network namespaces — airtight, but a large change to the pre-exec
    path and dependent on unprivileged user namespaces.)
 3. **Routes carry optional method/path rules**, not just hosts.
-4. **This PR: design + config schema.** Runtime follows separately.
+4. **Schema first, runtime second.** The schema landed on its own with the
+   daemon refusing to run proxy tools, so that a half-built feature could never
+   hand a tool open network; the runtime then replaced that refusal.
 
 ## Config schema
 
