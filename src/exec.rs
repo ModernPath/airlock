@@ -587,6 +587,15 @@ mod tests {
     use std::time::Duration;
 
     use super::*;
+    use crate::test_support::ENV_MUTEX;
+
+    /// Hold the crate-wide env lock. The tests below compare `build_env()`'s
+    /// snapshot of the environment against a second `std::env::var` read of the
+    /// same variable; without the lock a concurrent test mutating `HOME` or
+    /// `LANG` can change the answer between the two reads.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
 
     // ── Binary resolution ────────────────────────────────────────────────────
 
@@ -704,6 +713,8 @@ mod tests {
     /// The output map contains `PATH` with the value from the daemon's environment.
     #[test]
     fn build_env_contains_path_from_daemon_env() {
+        let _guard = env_lock();
+
         // PATH is almost certainly set in any test environment; guard anyway.
         let Ok(expected_path) = std::env::var("PATH") else {
             // PATH is not set — nothing to verify.
@@ -722,6 +733,8 @@ mod tests {
     /// in the daemon's environment.
     #[test]
     fn build_env_contains_essential_vars_when_present_in_daemon_env() {
+        let _guard = env_lock();
+
         let env = build_env(&[]);
 
         for var in &["HOME", "TERM", "LANG", "USER"] {
@@ -752,6 +765,8 @@ mod tests {
     /// 2. Every key is either a declared secret or an essential variable.
     #[test]
     fn build_env_has_exactly_secrets_plus_present_essential_vars() {
+        let _guard = env_lock();
+
         let secrets = vec![
             ("SECRET_ALPHA".to_string(), "value_a".to_string()),
             ("SECRET_BETA".to_string(), "value_b".to_string()),
@@ -837,6 +852,8 @@ mod tests {
     /// not appear.
     #[test]
     fn build_env_omits_absent_essential_vars_without_error() {
+        let _guard = env_lock();
+
         let env = build_env(&[]);
 
         match std::env::var("TERM") {

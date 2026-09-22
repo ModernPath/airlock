@@ -424,12 +424,12 @@ mod tests {
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
 
-    /// Global mutex serializing tests that modify env vars.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
-    /// RAII guard for temporary environment variable overrides.
+    /// RAII guard for temporary environment variable overrides. Holds
+    /// [`crate::test_support::ENV_MUTEX`] — the crate-wide lock — so these
+    /// tests serialize against every other test that touches the process
+    /// environment, not just the ones in this module.
     struct TempEnvVar {
         key: String,
         prev: Option<String>,
@@ -438,8 +438,13 @@ mod tests {
 
     impl TempEnvVar {
         fn new(key: &str, value: &str) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_support::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let prev = std::env::var(key).ok();
+            // SAFETY: we hold the crate-wide ENV_MUTEX, so no other test
+            // thread anywhere in the suite is reading or writing env vars
+            // concurrently.
             unsafe { std::env::set_var(key, value) };
             Self {
                 key: key.to_string(),
