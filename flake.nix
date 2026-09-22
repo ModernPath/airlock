@@ -44,10 +44,6 @@
           # an OS sandbox inside the Nix build sandbox, which is unavailable there.
           cargoTestFlags = [ "--lib" ];
 
-          # Several unit tests mutate HOME and fail when run in parallel
-          # (reproducible with plain `cargo test --lib` on a many-core machine).
-          dontUseCargoParallelTests = true;
-
           meta = {
             description = "Credential broker for AI agents — tools get your secrets, the agent never does";
             homepage = "https://github.com/ModernPath/airlock";

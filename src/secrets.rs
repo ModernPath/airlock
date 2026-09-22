@@ -379,22 +379,18 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
     use std::path::PathBuf;
-    use std::sync::{Mutex, MutexGuard};
+    use std::sync::MutexGuard;
     use std::time::Duration;
 
     use crate::config::{Config, SecretSpec};
 
     // ── Helpers ──────────────────────────────────────────────────────────
 
-    /// Global mutex that serializes all tests that modify environment variables.
-    ///
-    /// Environment variables are process-global state. Without serialization,
-    /// concurrent tests that modify env vars race against each other, producing
-    /// flaky failures.
-    static ENV_MUTEX: Mutex<()> = Mutex::new(());
-
     /// RAII guard that sets environment variables for the duration of a test
-    /// and restores them when dropped. Also holds the [`ENV_MUTEX`] lock.
+    /// and restores them when dropped. Holds
+    /// [`crate::test_support::ENV_MUTEX`] — the crate-wide lock — so these
+    /// tests serialize against every other test that touches the process
+    /// environment, not just the ones in this module.
     struct EnvGuard {
         vars: Vec<(String, Option<String>)>,
         _lock: MutexGuard<'static, ()>,
@@ -404,14 +400,17 @@ mod tests {
         /// Set the given environment variables, saving their previous values
         /// for restoration on drop.
         fn new(vars: &[(&str, &str)]) -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_support::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             let mut saved = Vec::with_capacity(vars.len());
 
             for (key, value) in vars {
                 let prev = std::env::var(*key).ok();
                 saved.push((key.to_string(), prev));
-                // SAFETY: We hold ENV_MUTEX, so no other test thread is reading
-                // or writing env vars concurrently within this test module.
+                // SAFETY: we hold the crate-wide ENV_MUTEX, so no other test
+                // thread anywhere in the suite is reading or writing env vars
+                // concurrently.
                 unsafe { std::env::set_var(*key, *value) };
             }
 
@@ -424,7 +423,9 @@ mod tests {
         /// Acquire the env mutex without setting any variables. Useful when
         /// we need to set and clear in a specific order within the test body.
         fn lock_only() -> Self {
-            let lock = ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner());
+            let lock = crate::test_support::ENV_MUTEX
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             Self {
                 vars: Vec::new(),
                 _lock: lock,
