@@ -34,11 +34,19 @@
           pname = "airlock";
           version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
 
-          # No git in the build environment, so build.rs takes its fallback and
-          # `airlock --version` reports "<version> (unknown)".
           src = self;
 
           cargoLock.lockFile = ./Cargo.lock;
+
+          # build.rs shells out to git, which this build cannot do: no git in
+          # the sandbox, and `src` is a store copy with no .git. Hand it the
+          # revision the flake was evaluated from instead. `shortRev` exists
+          # only for a clean checkout; a dirty tree gives `dirtyShortRev`,
+          # which carries a "-dirty" suffix that GIT_DIRTY already conveys.
+          AIRLOCK_GIT_HASH = nixpkgs.lib.removeSuffix "-dirty" (
+            self.shortRev or self.dirtyShortRev or "unknown"
+          );
+          AIRLOCK_GIT_DIRTY = if self ? dirtyRev then "true" else "false";
 
           # Only the unit tests: the suites under tests/ start a daemon and nest
           # an OS sandbox inside the Nix build sandbox, which is unavailable there.
