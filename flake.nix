@@ -1,0 +1,88 @@
+# Nix packaging. The cargo workflow is unchanged; this is only for installing
+# airlock with Nix.
+#
+#   nix build                    -> ./result/bin/airlock
+#   nix run . -- --help
+#   nix develop                  # cargo, rustc, clippy, rustfmt, rust-analyzer
+#   nix flake check
+#   nix profile install github:ModernPath/airlock
+{
+  description = "Credential broker for AI agents — tools get your secrets, the agent never does";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
+  };
+
+  outputs =
+    { self, nixpkgs }:
+    let
+      # x86_64-darwin is kept for consumers following a nixpkgs that still has
+      # it; it does not evaluate against the unstable pin above, since nixpkgs
+      # 26.11 dropped that platform.
+      systems = [
+        "aarch64-darwin"
+        "x86_64-darwin"
+        "aarch64-linux"
+        "x86_64-linux"
+      ];
+
+      forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      mkAirlock =
+        pkgs:
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "airlock";
+          version = (nixpkgs.lib.importTOML ./Cargo.toml).package.version;
+
+          # No git in the build environment, so build.rs takes its fallback and
+          # `airlock --version` reports "<version> (unknown)".
+          src = self;
+
+          cargoLock.lockFile = ./Cargo.lock;
+
+          # Only the unit tests: the suites under tests/ start a daemon and nest
+          # an OS sandbox inside the Nix build sandbox, which is unavailable there.
+          cargoTestFlags = [ "--lib" ];
+
+          # Several unit tests mutate HOME and fail when run in parallel
+          # (reproducible with plain `cargo test --lib` on a many-core machine).
+          dontUseCargoParallelTests = true;
+
+          meta = {
+            description = "Credential broker for AI agents — tools get your secrets, the agent never does";
+            homepage = "https://github.com/ModernPath/airlock";
+            license = pkgs.lib.licenses.mit;
+            mainProgram = "airlock";
+            platforms = pkgs.lib.platforms.darwin ++ pkgs.lib.platforms.linux;
+          };
+        };
+    in
+    {
+      packages = forAllSystems (pkgs: rec {
+        airlock = mkAirlock pkgs;
+        default = airlock;
+      });
+
+      # For consumers: nixpkgs.overlays = [ inputs.airlock.overlays.default ];
+      overlays.default = final: _prev: {
+        airlock = mkAirlock final;
+      };
+
+      devShells = forAllSystems (pkgs: {
+        default = pkgs.mkShell {
+          packages = [
+            pkgs.cargo
+            pkgs.rustc
+            pkgs.clippy
+            pkgs.rustfmt
+            pkgs.rust-analyzer
+          ];
+          # rust-analyzer cannot find the std sources without this when rustc
+          # comes from nixpkgs rather than rustup.
+          RUST_SRC_PATH = "${pkgs.rustPlatform.rustLibSrc}";
+        };
+      });
+
+      formatter = forAllSystems (pkgs: pkgs.nixfmt-tree);
+    };
+}
