@@ -16,3 +16,7 @@
 # Environment files
 .env
 .env.local
+
+# Nix build output
+/result
+/result-*
