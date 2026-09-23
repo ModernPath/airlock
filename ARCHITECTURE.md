@@ -102,15 +102,16 @@ main()
 
 ### State
 
-The daemon's shared state is wrapped in `Arc` for concurrent access across connection handlers:
+The daemon's shared state is one `DaemonShared`, built by `Daemon::start` and held in an `Arc` by every connection handler. The standalone and the embedded (`airlock run`) daemon both run through `Daemon::start` and `Daemon::serve`; they differ only in the PID file, the readiness pipe, and what ends the accept loop (SIGTERM or the `run` session's cancel signal).
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| Config | `Arc<Config>` | Parsed `airlock.toml` (immutable after startup) |
+| Config | `Config` | Parsed `airlock.toml` (immutable after startup) |
 | Secrets | `SecretStore` = `Arc<HashMap<String, RwLock<SecretSlot>>>` | Per-label slot holding `Arc<Secret<String>>` plus refresh health; the map is fixed at startup, slot contents swap on refresh |
-| Redactor | `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. A connection snapshots it for the child's stdout/stderr; a proxy session carries the handle itself and snapshots per response |
-| Ring buffer | `Arc<Mutex<RingBuffer>>` | Last 1000 log entries (`VecDeque<LogEntry>`) |
-| Child registry | `Arc<Mutex<HashSet<u32>>>` | PIDs of currently running children |
+| Redactor | `RedactorSwap` = `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. A connection snapshots it for the child's stdout/stderr; a proxy session carries the handle itself and snapshots per response |
+| Ring buffer | `RingBuffer` | Last 1000 log entries (`Arc<Mutex<VecDeque<LogEntry>>>`, cloned into refresh tasks and proxy sessions) |
+| Child registry | `ChildRegistry` | PIDs of currently running children |
+| Proxy | `Option<Arc<ProxyShared>>` | The proxy CA and what every proxy session shares; `None` when no tool is a proxy tool |
 
 ### Connection handling
 
@@ -165,7 +166,7 @@ has left the tool. Rationale and threat model:
 [docs/proxy-tools-design.md](docs/proxy-tools-design.md) and
 [SECURITY.md](SECURITY.md#proxy-tools).
 
-The CA is generated once per daemon in `async_main` — inside the runtime, after
+The CA is generated once per daemon in `Daemon::start` — inside the runtime, after
 the fork, so the synchronous-startup invariant is untouched — and shared as an
 `Arc` across connections. Its key stays in memory; only the certificate is
 written, to `{sandbox_root}/airlock-ca.pem`.

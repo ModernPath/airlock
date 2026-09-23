@@ -19,6 +19,7 @@
 //! threads in an undefined state in the child.
 
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
 use std::os::unix::io::FromRawFd;
 use std::os::unix::net as unix_net;
 use std::os::unix::process::ExitStatusExt;
@@ -27,6 +28,8 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::config::{self, Config, ConfigError};
 use crate::exec;
@@ -46,6 +49,9 @@ const RING_BUFFER_CAPACITY: usize = 1000;
 
 /// Grace period for children to exit after receiving SIGTERM during shutdown.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// How long shutdown waits for refresh tasks to stop before aborting them.
+const REFRESH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Duration to wait for initial stdin before auto-closing the child's stdin pipe.
 const STDIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -775,104 +781,24 @@ pub(crate) async fn run_embedded(
     state: StartupState,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), DaemonError> {
-    let StartupState {
-        config,
-        secrets,
-        redactor,
-        listener: std_listener,
-    } = state;
-
-    // Convert the std listener to a tokio listener (identical to async_main).
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-    let listener =
-        tokio::net::UnixListener::from_std(std_listener).map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-
-    let config = Arc::new(config);
-
     // Embedded mode does not echo log lines to stderr — stderr belongs to the
     // agent process. Writes go to the ring buffer only.
-    let ring_buffer = RingBuffer::new();
-    let child_registry = ChildRegistry::new();
+    let daemon = Daemon::start(state, RingBuffer::new())?;
+    daemon
+        .shared
+        .ring_buffer
+        .log("embedded daemon started, accepting connections");
 
-    let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
-
-    // Spawn per-secret refresh tasks, identical to async_main.
-    let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
-        &config,
-        Arc::clone(&secrets),
-        Arc::clone(&redactor),
-        ring_buffer.clone(),
-    );
-    let refresh_count = refresh_tasks.len();
-    if refresh_count > 0 {
-        ring_buffer.log(format!("spawned {refresh_count} secret refresh task(s)"));
-    }
-
-    ring_buffer.log("embedded daemon started, accepting connections".to_string());
-
-    // `oneshot::Receiver<T>` is `Unpin`, so borrowing via `&mut cancel_rx`
-    // in each select! arm is sufficient — no pinning machinery needed.
-    let mut cancel_rx = cancel_rx;
-
-    // Accept loop. The cancel oneshot is the *only* shutdown trigger:
-    // `airlock run` drops the sender once the agent child has exited. The
-    // embedded daemon must not react to SIGTERM itself (see this function's
-    // doc comment) so that it always outlives the agent it serves.
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let peer_info = format!("{:?}", addr);
-                        ring_buffer.log(format!("connection accepted from {peer_info}"));
-
-                        let rb = ring_buffer.clone();
-                        let cr = child_registry.clone();
-                        let cfg = config.clone();
-                        let sec = Arc::clone(&secrets);
-                        // Snapshot the redactor at accept time so in-flight
-                        // connections are not affected by concurrent refreshes.
-                        let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        let proxy = proxy.clone();
-
-                        tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, proxy).await;
-                            rb.log(format!("connection closed ({peer_info})"));
-                        });
-                    }
-                    Err(e) => {
-                        ring_buffer.log(format!("accept error: {e}"));
-                    }
-                }
-            }
-            _ = &mut cancel_rx => {
-                ring_buffer.log("cancel signal received, initiating graceful shutdown".to_string());
-                break;
-            }
-        }
-    }
-
-    // Stop refresh tasks before tearing down children/files (same bounded
-    // 2-second wait as async_main).
-    let _ = refresh_shutdown.send(true);
-    let drain = async { while refresh_tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(2), drain)
-        .await
-        .is_err()
-    {
-        ring_buffer.log("refresh tasks did not stop within 2s; aborting".to_string());
-        refresh_tasks.abort_all();
-    }
-
-    graceful_shutdown(&child_registry, &ring_buffer, &config).await;
+    // The cancel oneshot is the *only* shutdown trigger: `airlock run` drops
+    // the sender once the agent child has exited. The embedded daemon must
+    // not react to SIGTERM itself (see this function's doc comment) so that
+    // it always outlives the agent it serves.
+    daemon
+        .serve(async {
+            let _ = cancel_rx.await;
+            "cancel signal received"
+        })
+        .await;
 
     Ok(())
 }
@@ -907,6 +833,133 @@ fn publish_proxy_ca(
         Arc::clone(redactor),
         ring_buffer.clone(),
     ))))
+}
+
+// ─── Running daemon ─────────────────────────────────────────────────────────
+
+/// What every connection handler shares. Built once per daemon.
+struct DaemonShared {
+    config: Config,
+    secrets: SecretStore,
+    redactor: RedactorSwap,
+    ring_buffer: RingBuffer,
+    child_registry: ChildRegistry,
+    /// `None` when no tool is a proxy tool.
+    proxy: Option<Arc<ProxyShared>>,
+}
+
+/// A daemon that is set up and ready to accept. The standalone and the
+/// embedded daemon differ only in what they do between [`Daemon::start`] and
+/// [`Daemon::serve`], and in what ends `serve`.
+struct Daemon {
+    shared: Arc<DaemonShared>,
+    listener: tokio::net::UnixListener,
+    refresh_tasks: JoinSet<()>,
+    refresh_shutdown: watch::Sender<bool>,
+}
+
+impl Daemon {
+    /// Move the bound listener into the runtime, publish the proxy CA and
+    /// start one refresh task per refreshable secret.
+    fn start(state: StartupState, ring_buffer: RingBuffer) -> Result<Self, DaemonError> {
+        let StartupState {
+            config,
+            secrets,
+            redactor,
+            listener,
+        } = state;
+
+        let socket_bind = |source| DaemonError::SocketBind {
+            path: config.socket_path.clone(),
+            source,
+        };
+        listener.set_nonblocking(true).map_err(socket_bind)?;
+        let listener = tokio::net::UnixListener::from_std(listener).map_err(socket_bind)?;
+
+        let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
+
+        let (refresh_tasks, refresh_shutdown) = refresh::spawn_all(
+            &config,
+            Arc::clone(&secrets),
+            Arc::clone(&redactor),
+            ring_buffer.clone(),
+        );
+        if !refresh_tasks.is_empty() {
+            ring_buffer.log(format!(
+                "spawned {} secret refresh task(s)",
+                refresh_tasks.len()
+            ));
+        }
+
+        Ok(Daemon {
+            shared: Arc::new(DaemonShared {
+                config,
+                secrets,
+                redactor,
+                ring_buffer,
+                child_registry: ChildRegistry::new(),
+                proxy,
+            }),
+            listener,
+            refresh_tasks,
+            refresh_shutdown,
+        })
+    }
+
+    /// Accept connections until `shutdown` resolves to the reason it fired,
+    /// then stop the refresh tasks and shut down gracefully.
+    async fn serve(mut self, shutdown: impl Future<Output = &'static str>) {
+        let ring_buffer = &self.shared.ring_buffer;
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accept_result = self.listener.accept() => {
+                    match accept_result {
+                        Ok((stream, addr)) => {
+                            let peer_info = format!("{addr:?}");
+                            ring_buffer.log(format!("connection accepted from {peer_info}"));
+
+                            // Snapshot the redactor at accept time. Refresh
+                            // tasks may swap the inner Arc later; this
+                            // connection keeps its snapshot for its full
+                            // lifetime.
+                            let redactor = self.shared.redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
+                            let shared = Arc::clone(&self.shared);
+
+                            tokio::spawn(async move {
+                                handle_connection(stream, &shared, redactor).await;
+                                shared.ring_buffer.log(format!("connection closed ({peer_info})"));
+                            });
+                        }
+                        Err(e) => {
+                            ring_buffer.log(format!("accept error: {e}"));
+                        }
+                    }
+                }
+                reason = &mut shutdown => {
+                    ring_buffer.log(format!("{reason}, initiating graceful shutdown"));
+                    break;
+                }
+            }
+        }
+
+        // Stop refresh tasks before tearing down children/files. Bound the
+        // wait so a stuck task cannot wedge shutdown.
+        let _ = self.refresh_shutdown.send(true);
+        let drain = async { while self.refresh_tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(REFRESH_STOP_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            ring_buffer.log(format!(
+                "refresh tasks did not stop within {REFRESH_STOP_TIMEOUT:?}; aborting"
+            ));
+            self.refresh_tasks.abort_all();
+        }
+
+        graceful_shutdown(&self.shared).await;
+    }
 }
 
 // ─── Async runtime entry point ──────────────────────────────────────────────
@@ -961,57 +1014,21 @@ async fn async_main_inner(
     readiness: &mut Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
-    let StartupState {
-        config,
-        secrets,
-        redactor,
-        listener: std_listener,
-    } = state;
-
-    // Convert the std listener to a tokio listener.
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-    let listener =
-        tokio::net::UnixListener::from_std(std_listener).map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-
-    // Wrap shared state in Arcs for concurrent access across connections.
-    // `secrets` is already `SecretStore` (Arc<HashMap<...>>); `redactor` is
-    // already `RedactorSwap`.
-    let config = Arc::new(config);
-
-    // Create shared state. Foreground mode echoes log lines to stderr so the
-    // operator sees what the daemon is doing; daemonized mode writes to the
-    // ring buffer only (stdio is /dev/null).
+    // Foreground mode echoes log lines to stderr so the operator sees what
+    // the daemon is doing; daemonized mode writes to the ring buffer only
+    // (stdio is /dev/null).
     let ring_buffer = if foreground {
         RingBuffer::new_echoing()
     } else {
         RingBuffer::new()
     };
-    let child_registry = ChildRegistry::new();
+    let daemon = Daemon::start(state, ring_buffer)?;
+    let DaemonShared {
+        config,
+        ring_buffer,
+        ..
+    } = &*daemon.shared;
 
-    let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
-
-    // Spawn one background task per refreshable secret. Tasks live until they
-    // observe the shutdown signal or get aborted at SIGTERM.
-    let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
-        &config,
-        Arc::clone(&secrets),
-        Arc::clone(&redactor),
-        ring_buffer.clone(),
-    );
-    let refresh_count = refresh_tasks.len();
-    if refresh_count > 0 {
-        ring_buffer.log(format!("spawned {refresh_count} secret refresh task(s)"));
-    }
-
-    // Write PID file.
     let pid = std::process::id();
     if let Err(e) = write_pid_file(&config.pid_path, pid) {
         ring_buffer.log(format!("failed to write PID file: {e}"));
@@ -1028,60 +1045,15 @@ async fn async_main_inner(
         pipe.ready();
     }
 
-    // Install SIGTERM handler.
     let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .expect("failed to install SIGTERM handler");
 
-    // Accept loop with shutdown.
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let peer_info = format!("{:?}", addr);
-                        ring_buffer.log(format!("connection accepted from {peer_info}"));
-
-                        let rb = ring_buffer.clone();
-                        let cr = child_registry.clone();
-                        let cfg = config.clone();
-                        let sec = Arc::clone(&secrets);
-                        // Snapshot the redactor at accept time. Refresh tasks
-                        // may swap the inner Arc later; this connection keeps
-                        // its snapshot for its full lifetime.
-                        let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        let proxy = proxy.clone();
-
-                        tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, proxy).await;
-                            rb.log(format!("connection closed ({peer_info})"));
-                        });
-                    }
-                    Err(e) => {
-                        ring_buffer.log(format!("accept error: {e}"));
-                    }
-                }
-            }
-            _ = sigterm.recv() => {
-                ring_buffer.log("SIGTERM received, initiating graceful shutdown".to_string());
-                break;
-            }
-        }
-    }
-
-    // Stop refresh tasks before tearing down children/files. Bound the wait
-    // so a stuck task cannot wedge shutdown.
-    let _ = refresh_shutdown.send(true);
-    let drain = async { while refresh_tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(2), drain)
-        .await
-        .is_err()
-    {
-        ring_buffer.log("refresh tasks did not stop within 2s; aborting".to_string());
-        refresh_tasks.abort_all();
-    }
-
-    // ── Graceful shutdown ──
-    graceful_shutdown(&child_registry, &ring_buffer, &config).await;
+    daemon
+        .serve(async move {
+            sigterm.recv().await;
+            "SIGTERM received"
+        })
+        .await;
 
     Ok(())
 }
@@ -1094,14 +1066,12 @@ async fn async_main_inner(
 /// the appropriate handler, and closes the connection.
 async fn handle_connection(
     stream: tokio::net::UnixStream,
-    config: Arc<Config>,
-    secrets: SecretStore,
+    shared: &DaemonShared,
     redactor: Arc<Redactor>,
-    ring_buffer: RingBuffer,
-    child_registry: ChildRegistry,
-    proxy: Option<Arc<ProxyShared>>,
 ) {
     use tokio_stream::StreamExt;
+
+    let ring_buffer = &shared.ring_buffer;
     use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
     let (reader, mut writer) = stream.into_split();
@@ -1173,20 +1143,7 @@ async fn handle_connection(
             let _ = write_ndjson_message(&mut writer, &response).await;
         }
         ClientMessage::Exec { tool, args, cwd } => {
-            handle_exec_request(
-                tool,
-                args,
-                cwd,
-                framed,
-                writer,
-                config,
-                secrets,
-                redactor,
-                ring_buffer,
-                child_registry,
-                proxy,
-            )
-            .await;
+            handle_exec_request(tool, args, cwd, framed, writer, shared, redactor).await;
         }
         other => {
             // Unknown message type for initial request. Log only the variant
@@ -1251,7 +1208,6 @@ enum TermReason {
 /// 9. Child registration
 /// 10. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
 /// 11. Post-loop cleanup (drain output, send exit, kill if needed)
-#[allow(clippy::too_many_arguments)]
 async fn handle_exec_request(
     tool: String,
     args: Vec<String>,
@@ -1261,22 +1217,27 @@ async fn handle_exec_request(
         tokio_util::codec::LinesCodec,
     >,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    config: Arc<Config>,
-    secrets: SecretStore,
+    shared: &DaemonShared,
     redactor: Arc<Redactor>,
-    ring_buffer: RingBuffer,
-    child_registry: ChildRegistry,
-    proxy: Option<Arc<ProxyShared>>,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
     use tokio_util::codec::LinesCodecError;
 
+    let DaemonShared {
+        config,
+        secrets,
+        ring_buffer,
+        child_registry,
+        proxy,
+        ..
+    } = shared;
+
     // ── 1. Tool validation ──────────────────────────────────────────────────
-    if let Err(e) = policy::validate_tool_exists(&tool, &config) {
+    if let Err(e) = policy::validate_tool_exists(&tool, config) {
         log_and_send_error(
             format!("unknown tool {:?}: {e}", tool),
-            &ring_buffer,
+            ring_buffer,
             &mut writer,
         )
         .await;
@@ -1288,7 +1249,7 @@ async fn handle_exec_request(
     if let Err(e) = policy::validate_cwd(&cwd_path, &config.sandbox_root) {
         log_and_send_error(
             format!("CWD validation failed: {e}"),
-            &ring_buffer,
+            ring_buffer,
             &mut writer,
         )
         .await;
@@ -1301,7 +1262,7 @@ async fn handle_exec_request(
         Err(e) => {
             log_and_send_error(
                 format!("binary resolution failed for {:?}: {e}", tool),
-                &ring_buffer,
+                ring_buffer,
                 &mut writer,
             )
             .await;
@@ -1346,7 +1307,7 @@ async fn handle_exec_request(
         Err((label, reason)) => {
             log_and_send_error(
                 format!("secret {label:?} is stale (last refresh failed): {reason}"),
-                &ring_buffer,
+                ring_buffer,
                 &mut writer,
             )
             .await;
@@ -1370,13 +1331,13 @@ async fn handle_exec_request(
             let Some(proxy) = proxy else {
                 log_and_send_error(
                     format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA"),
-                    &ring_buffer,
+                    ring_buffer,
                     &mut writer,
                 )
                 .await;
                 return;
             };
-            match ProxySession::start(tool.clone(), policy.clone(), &proxy) {
+            match ProxySession::start(tool.clone(), policy.clone(), proxy) {
                 Ok(session) => {
                     ring_buffer.log(format!(
                         "proxy for tool {:?} listening on 127.0.0.1:{}",
@@ -1388,7 +1349,7 @@ async fn handle_exec_request(
                 Err(e) => {
                     log_and_send_error(
                         format!("failed to start the proxy for tool {:?}: {e}", tool),
-                        &ring_buffer,
+                        ring_buffer,
                         &mut writer,
                     )
                     .await;
@@ -1410,12 +1371,12 @@ async fn handle_exec_request(
 
     // ── 7. Policy and sandbox profile construction ──────────────────────────
     let proxy_port = proxy_session.as_ref().map(ProxySession::port);
-    let mut tool_policy = match policy::build_tool_policy(&tool, &config, proxy_port) {
+    let mut tool_policy = match policy::build_tool_policy(&tool, config, proxy_port) {
         Ok(p) => p,
         Err(e) => {
             log_and_send_error(
                 format!("policy construction failed for {:?}: {e}", tool),
-                &ring_buffer,
+                ring_buffer,
                 &mut writer,
             )
             .await;
@@ -1429,7 +1390,7 @@ async fn handle_exec_request(
         Err(e) => {
             log_and_send_error(
                 format!("sandbox profile construction failed for {:?}: {e}", tool),
-                &ring_buffer,
+                ring_buffer,
                 &mut writer,
             )
             .await;
@@ -1452,7 +1413,7 @@ async fn handle_exec_request(
         Err(e) => {
             log_and_send_error(
                 format!("spawn failed for {:?}: {e}", tool),
-                &ring_buffer,
+                ring_buffer,
                 &mut writer,
             )
             .await;
@@ -1914,11 +1875,14 @@ async fn write_ndjson_message<W: tokio::io::AsyncWriteExt + Unpin>(
 // ─── Graceful shutdown ──────────────────────────────────────────────────────
 
 /// Perform graceful shutdown: signal children, wait, cleanup files.
-async fn graceful_shutdown(
-    child_registry: &ChildRegistry,
-    ring_buffer: &RingBuffer,
-    config: &Config,
-) {
+async fn graceful_shutdown(shared: &DaemonShared) {
+    let DaemonShared {
+        config,
+        ring_buffer,
+        child_registry,
+        ..
+    } = shared;
+
     // Signal all active children with SIGTERM.
     let pids = child_registry.all();
     if !pids.is_empty() {
