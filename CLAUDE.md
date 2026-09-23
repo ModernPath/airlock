@@ -23,7 +23,7 @@ Read [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [SECURITY.m
 
 ## Tests
 
-- Most logic lives in `cargo test --lib` (463 tests). All hermetic.
+- Most logic lives in `cargo test --lib` (465 tests). All hermetic.
 - `tests/cli_integration.rs` spawns the real `airlock` binary and runs `daemon start/stop/status`. **These might fail in the Claude Code sandbox**
 - Some `client.rs` tests read the process's real stdin. Run `cargo test` with `< /dev/null` or they can hang on an inherited pipe that never closes.
 
