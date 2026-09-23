@@ -1186,7 +1186,8 @@ async fn log_and_send_error<W: tokio::io::AsyncWrite + Unpin>(
 /// A `Stale` slot — left behind by a failed background refresh — is an
 /// error: the exec is refused rather than handing the tool a value known to
 /// be expired. Refs are validated at config load time, so a missing label
-/// here is an internal invariant break.
+/// is an internal invariant break; it refuses the exec too, rather than
+/// running the tool without a variable it was configured with.
 fn resolve_tool_env(
     tool_config: &config::ToolConfig,
     secrets: &SecretStore,
@@ -1197,7 +1198,7 @@ fn resolve_tool_env(
             config::EnvValue::Static(s) => env_pairs.push((name.clone(), s.clone())),
             config::EnvValue::SecretRef(label) => {
                 let Some(slot_lock) = secrets.get(label) else {
-                    continue;
+                    return Err(format!("secret {label:?} is not in the secret store"));
                 };
                 let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
                 match &slot.health {
@@ -2168,6 +2169,15 @@ mod tests {
                 ("TOKEN".to_string(), "s3cret-value".to_string()),
             ]
         );
+    }
+
+    #[test]
+    fn resolve_tool_env_refuses_a_label_missing_from_the_store() {
+        let tool = tool_with_env(&[("TOKEN", config::EnvValue::SecretRef("gone".to_string()))]);
+        let store = store_with("tok", "s3cret-value", Health::Healthy);
+
+        let err = resolve_tool_env(&tool, &store).unwrap_err();
+        assert!(err.contains("\"gone\""), "{err}");
     }
 
     #[test]
