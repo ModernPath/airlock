@@ -50,7 +50,7 @@ use crate::redact::{Redactor, RedactorSwap, StreamRedactor};
 use crate::secrets::{Health, SecretStore};
 
 use super::ca::ProxyCa;
-use super::{Inject, ProxyPolicy, ProxyRoute};
+use super::{CA_BUNDLE_VARS, Inject, NO_PROXY_VARS, PROXY_URL_VARS, ProxyPolicy, ProxyRoute};
 
 // ─── Bounds on what the peer controls ─────────────────────────────────────────
 
@@ -78,45 +78,6 @@ const MAX_CONCURRENT_TUNNELS: usize = 32;
 
 /// Proxy-auth username. The password is the per-exec token.
 const PROXY_USER: &str = "airlock";
-
-/// Environment variables the daemon sets for a proxy tool, pointing it at the
-/// proxy and at the CA it must trust. [`is_reserved_env_var`] derives the
-/// names config may not set from these lists, so the two cannot drift.
-const PROXY_URL_VARS: &[&str] = &[
-    "HTTPS_PROXY",
-    "https_proxy",
-    "HTTP_PROXY",
-    "http_proxy",
-    "ALL_PROXY",
-    "all_proxy",
-];
-const NO_PROXY_VARS: &[&str] = &["NO_PROXY", "no_proxy"];
-const CA_BUNDLE_VARS: &[&str] = &[
-    "CURL_CA_BUNDLE",
-    "SSL_CERT_FILE",
-    "REQUESTS_CA_BUNDLE",
-    "NODE_EXTRA_CA_CERTS",
-];
-/// Reserved but left unset: OpenSSL adds this directory's CAs to the ones in
-/// `SSL_CERT_FILE`, so config must not be able to point it anywhere.
-const RESERVED_UNSET_VARS: &[&str] = &["SSL_CERT_DIR"];
-
-/// Whether `name` is an env var config may not set for a proxy tool: a
-/// config value would either be overwritten at spawn or, worse, steer the
-/// tool around the proxy. Clients read the proxy variables in either case
-/// (`http_proxy` is the only form curl honors for plain HTTP), so the check
-/// ignores case.
-pub fn is_reserved_env_var(name: &str) -> bool {
-    [
-        PROXY_URL_VARS,
-        NO_PROXY_VARS,
-        CA_BUNDLE_VARS,
-        RESERVED_UNSET_VARS,
-    ]
-    .iter()
-    .flat_map(|vars| vars.iter())
-    .any(|reserved| reserved.eq_ignore_ascii_case(name))
-}
 
 /// Hop-by-hop headers stripped before forwarding upstream. `Content-Length` is
 /// deliberately *not* in this list: some APIs reject a chunked upload, so a

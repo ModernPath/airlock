@@ -1254,7 +1254,7 @@ fn parse_and_resolve_config(
                         name: var_name,
                     });
                 }
-                if raw_tool.proxy && crate::proxy::server::is_reserved_env_var(&var_name) {
+                if raw_tool.proxy && crate::proxy::is_reserved_env_var(&var_name) {
                     return Err(ConfigError::ProxyReservedEnvVar {
                         tool: name.clone(),
                         var_name,
