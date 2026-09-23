@@ -364,15 +364,12 @@ pub mod macos {
 
     /// Resolve a path's canonical form via `std::fs::canonicalize`.
     ///
-    /// Returns `None` if canonicalization fails (path doesn't exist yet, etc.).
+    /// Returns `None` if canonicalization fails (path doesn't exist yet, etc.)
+    /// or the path is already canonical.
     fn try_canonicalize(path: &Path) -> Option<PathBuf> {
-        std::fs::canonicalize(path).ok().and_then(|canonical| {
-            if canonical != path {
-                Some(canonical)
-            } else {
-                None
-            }
-        })
+        std::fs::canonicalize(path)
+            .ok()
+            .filter(|canonical| canonical != path)
     }
 
     // ─── SBPL generation ────────────────────────────────────────────────────

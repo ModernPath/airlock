@@ -223,16 +223,6 @@ impl Redactor {
         }
     }
 
-    /// Returns the number of patterns in the automaton.
-    ///
-    /// Useful for testing that all encoding variants are present.
-    pub fn pattern_count(&self) -> usize {
-        match &self.automaton {
-            Some(automaton) => automaton.patterns_len(),
-            None => 0,
-        }
-    }
-
     /// The length of the longest prefix of `buf` whose redaction is already
     /// decided, and the number of matches inside it.
     ///
@@ -329,6 +319,14 @@ impl StreamRedactor {
 
 #[cfg(test)]
 impl Redactor {
+    /// The number of patterns in the automaton, so tests can check that every
+    /// encoding variant is present.
+    fn pattern_count(&self) -> usize {
+        self.automaton
+            .as_ref()
+            .map_or(0, |automaton| automaton.patterns_len())
+    }
+
     /// The longest pattern in the automaton, which bounds what a
     /// [`StreamRedactor`] can be holding between chunks.
     fn longest_pattern(&self) -> usize {
