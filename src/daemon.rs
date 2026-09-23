@@ -789,23 +789,7 @@ pub(crate) async fn run_embedded(
     let ring_buffer = RingBuffer::new();
     let child_registry = ChildRegistry::new();
 
-    // The proxy CA is generated here and nowhere earlier: key generation is
-    // pure CPU, but it must happen inside the runtime, after daemonization,
-    // so that `synchronous_startup` stays free of anything the fork could
-    // leave in an undefined state. `None` when no tool declares `proxy = true`
-    // — a daemon with no proxy tool holds no CA and writes no certificate.
-    let proxy_ca = match ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
-    {
-        Some(ca) => {
-            ca.write_cert_pem(&config.ca_path)?;
-            ring_buffer.log(format!(
-                "proxy CA published at {}",
-                config.ca_path.display()
-            ));
-            Some(Arc::new(ca))
-        }
-        None => None,
-    };
+    let proxy_ca = publish_proxy_ca(&config, &ring_buffer)?;
 
     // Spawn per-secret refresh tasks, identical to async_main.
     let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
@@ -900,6 +884,29 @@ pub(crate) async fn run_embedded(
     Ok(())
 }
 
+/// Generate the proxy CA and publish its certificate for tools to trust.
+///
+/// This runs inside the runtime and nowhere earlier: key generation is pure
+/// CPU, but it must happen after daemonization so that `synchronous_startup`
+/// stays free of anything the fork could leave in an undefined state. `None`
+/// when no tool declares `proxy = true` — a daemon with no proxy tool holds
+/// no CA and writes no certificate.
+fn publish_proxy_ca(
+    config: &Config,
+    ring_buffer: &RingBuffer,
+) -> Result<Option<Arc<ProxyCa>>, DaemonError> {
+    let Some(ca) = ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
+    else {
+        return Ok(None);
+    };
+    ca.write_cert_pem(&config.ca_path)?;
+    ring_buffer.log(format!(
+        "proxy CA published at {}",
+        config.ca_path.display()
+    ));
+    Ok(Some(Arc::new(ca)))
+}
+
 // ─── Async runtime entry point ──────────────────────────────────────────────
 
 /// Create a fresh tokio runtime and run the daemon's async main loop.
@@ -987,23 +994,7 @@ async fn async_main_inner(
     };
     let child_registry = ChildRegistry::new();
 
-    // The proxy CA is generated here and nowhere earlier: key generation is
-    // pure CPU, but it must happen inside the runtime, after daemonization,
-    // so that `synchronous_startup` stays free of anything the fork could
-    // leave in an undefined state. `None` when no tool declares `proxy = true`
-    // — a daemon with no proxy tool holds no CA and writes no certificate.
-    let proxy_ca = match ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
-    {
-        Some(ca) => {
-            ca.write_cert_pem(&config.ca_path)?;
-            ring_buffer.log(format!(
-                "proxy CA published at {}",
-                config.ca_path.display()
-            ));
-            Some(Arc::new(ca))
-        }
-        None => None,
-    };
+    let proxy_ca = publish_proxy_ca(&config, &ring_buffer)?;
 
     // Spawn one background task per refreshable secret. Tasks live until they
     // observe the shutdown signal or get aborted at SIGTERM.
