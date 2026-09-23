@@ -285,7 +285,8 @@ impl PathRule {
 /// second-round `%`, a `.` / `..` segment, an empty segment, a malformed
 /// escape — is refused rather than guessed at, since matching `allow` as one
 /// path and being served as another is exactly the bypass the rules exist
-/// to prevent.
+/// to prevent. The same checks apply to each segment with its `;params`
+/// removed, so Tomcat's `..;` is refused like `..`.
 fn split_request_path(path: &str) -> Option<Vec<Vec<u8>>> {
     let path = path.strip_prefix('/')?;
     if path.contains('\\') {
@@ -300,12 +301,40 @@ fn split_request_path(path: &str) -> Option<Vec<Vec<u8>>> {
         if decoded.iter().any(|b| matches!(b, b'/' | b'\\' | b'%' | 0)) {
             return None;
         }
-        if decoded == b"." || decoded == b".." || (decoded.is_empty() && i != last) {
+        let bare = strip_params(&decoded);
+        if bare == b"." || bare == b".." || (bare.is_empty() && i != last) {
             return None;
         }
         segments.push(decoded);
     }
     Some(segments)
+}
+
+/// A segment without its `;params`, as servlet containers (Tomcat, Spring)
+/// route it.
+fn strip_params(seg: &[u8]) -> &[u8] {
+    seg.iter()
+        .position(|&b| b == b';')
+        .map_or(seg, |i| &seg[..i])
+}
+
+/// Every path an upstream may route `segments` as: as sent, with `;params`
+/// removed from each segment, and either of those without a trailing slash
+/// (Express, Django and many gateways treat `/x/` as `/x`). A `deny` rule
+/// must hold for all of them, or `/secrets/x/` slips past
+/// `deny = ["DELETE /secrets/*"]`.
+fn upstream_readings(segments: &[Vec<u8>]) -> Vec<Vec<Vec<u8>>> {
+    let stripped = segments.iter().map(|s| strip_params(s).to_vec()).collect();
+    let mut readings = vec![segments.to_vec(), stripped];
+    for i in 0..2 {
+        // `/` is the root, not a trailing slash on something else.
+        if readings[i].len() > 1 && readings[i].last().is_some_and(|s| s.is_empty()) {
+            let mut trimmed = readings[i].clone();
+            trimmed.pop();
+            readings.push(trimmed);
+        }
+    }
+    readings
 }
 
 /// Percent-decode one path segment, or `None` on a malformed escape (`%` not
@@ -414,12 +443,17 @@ pub struct ProxyRoute {
 impl ProxyRoute {
     /// Whether a request with this method and path (no query string) may be
     /// forwarded. `deny` wins over `allow`; an empty `allow` permits anything
-    /// not denied.
+    /// not denied. `deny` is checked against every way the upstream may read
+    /// the path, `allow` only against the path as sent, so both err towards
+    /// refusing.
     pub fn permits(&self, method: &str, path: &str) -> bool {
         let Some(segments) = split_request_path(path) else {
             return false;
         };
-        if self.deny.iter().any(|r| r.matches(method, &segments)) {
+        let denied = upstream_readings(&segments)
+            .iter()
+            .any(|reading| self.deny.iter().any(|r| r.matches(method, reading)));
+        if denied {
             return false;
         }
         self.allow.is_empty() || self.allow.iter().any(|r| r.matches(method, &segments))
@@ -643,6 +677,41 @@ mod tests {
     }
 
     #[test]
+    fn deny_ignores_trailing_slash() {
+        let r = route(
+            "example.com",
+            &["* /**"],
+            &["DELETE /v1/secrets/*", "* /admin"],
+        );
+        assert!(!r.permits("DELETE", "/v1/secrets/x"));
+        assert!(!r.permits("DELETE", "/v1/secrets/x/"));
+        assert!(!r.permits("GET", "/admin/"));
+        assert!(r.permits("GET", "/admin/x"));
+        assert!(r.permits("DELETE", "/v1/secrets/"));
+    }
+
+    #[test]
+    fn deny_ignores_matrix_params() {
+        let r = route(
+            "example.com",
+            &["* /**"],
+            &["* /v1/admin/**", "DELETE /v1/secrets/*"],
+        );
+        assert!(!r.permits("GET", "/v1/admin;x"));
+        assert!(!r.permits("GET", "/v1/admin;x/users"));
+        assert!(!r.permits("GET", "/v1/admin%3Bx/users"));
+        assert!(!r.permits("DELETE", "/v1/secrets/x;y/"));
+        assert!(r.permits("GET", "/v1/administrator;x"));
+    }
+
+    #[test]
+    fn root_path_is_not_a_trailing_slash() {
+        let r = route("example.com", &["GET /"], &["DELETE /"]);
+        assert!(r.permits("GET", "/"));
+        assert!(!r.permits("DELETE", "/"));
+    }
+
+    #[test]
     fn single_star_covers_custom_verb_suffix() {
         let r = route("example.com", &["POST /v1/secrets/*"], &[]);
         assert!(r.permits("POST", "/v1/secrets/latest:access"));
@@ -660,6 +729,9 @@ mod tests {
             "/a//b",
             "//a",
             "/a/%2e%2e/b",
+            "/a/..;/b",
+            "/a/.;x/b",
+            "/a/;x/b",
             "/a/%2E%2E/b",
             "/a/%2e/b",
             "/a%2Fb",

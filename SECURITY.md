@@ -352,6 +352,8 @@ The proxy checks the allow/deny rules in this order. A request that matches any 
 
 The allow/deny rules are matched against the *percent-decoded* path, decoding each segment once, because the upstream routes on the decoded path. For example, GitHub treats `DELETE /%72epos/o/n` as `DELETE /repos/o/n`, so it must match `deny = ["DELETE /repos/**"]` in the same way. For this reason you write rules in decoded form, and a rule may not contain `%`.
 
+Upstreams also disagree on two more details. Many frameworks treat `/x/` as `/x`, and servlet containers (Tomcat, Spring) remove `;params` from each segment. So the proxy checks `deny` rules against all of these forms of the path, and `allow` rules only against the path as sent. `deny = ["DELETE /secrets/*"]` therefore also refuses `DELETE /secrets/x/` and `DELETE /secrets/x;y`. A segment that becomes `.`, `..` or empty once its `;params` are removed (for example `..;`) is refused.
+
 Before the proxy attaches the credential, it removes every copy of the injected header that the client sent. It also removes `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The proxy reads the secret from the secret store **for each request**, so a background refresh applies to the next request. The proxy builds the header value in a buffer that is zeroized after use, never with `format!`, and marks the value as sensitive.
 
 The proxy also changes the request so that the redactor can read the response. It always sets `Accept-Encoding` to `identity`, whatever the tool asked for, and it removes `Range` and `If-Range`.
