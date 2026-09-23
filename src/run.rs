@@ -117,7 +117,7 @@ pub enum RunError {
 /// Built-in filesystem profiles that pre-populate the agent's sandbox
 /// read/write paths for well-known tools.
 ///
-/// Profiles are merged into [`AgentPolicy::read_write_paths`] after the policy
+/// Profiles are merged into [`AgentPolicy::read_write_paths`](crate::sandbox::AgentPolicy::read_write_paths) after the policy
 /// is constructed from config, so anything declared in `[agent.filesystem]`
 /// composes with the profile rather than being overridden.
 #[derive(ValueEnum, Debug, Clone, Copy, PartialEq, Eq)]
@@ -361,7 +361,7 @@ pub(crate) fn build_agent_env(
 /// argument list as new flags are added (steps 002, 003, …).
 pub struct RunOptions {
     /// When `true`, skip starting an embedded daemon; call
-    /// [`daemon::harden_process`] directly instead.
+    /// `daemon::harden_process` directly instead.
     pub no_daemon: bool,
 
     /// When `true`, skip `airlock.toml` discovery entirely and read the sandbox

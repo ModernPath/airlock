@@ -22,7 +22,7 @@
 //!   drops one cycle later — this is a deliberate trade-off against
 //!   `Secret<T>`'s eager-zeroize guarantee, in exchange for closing the
 //!   redaction gap during a swap.
-//! - Rebuild, swap and publish run under one mutex in [`RefreshShared`],
+//! - Rebuild, swap and publish run under one mutex in `RefreshShared`,
 //!   shared by all refresh tasks. The rebuild reads every slot, so two overlapping
 //!   refreshes could otherwise swap in a redactor built before the other one
 //!   published, and it would miss a value the proxy is already injecting.

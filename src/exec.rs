@@ -187,7 +187,7 @@ pub fn resolve_binary(tool_name: &str) -> Result<PathBuf, ExecError> {
 /// The returned map contains exactly:
 /// - The tool's declared `secrets` (already unwrapped from `Secret<String>`
 ///   by the caller; this function does not interact with the `redact` crate).
-/// - Essential pass-through variables (see [`ESSENTIAL_VARS`]) — process
+/// - Essential pass-through variables (see `ESSENTIAL_VARS`) — process
 ///   basics, terminal, timezone, and the standard locale family — copied
 ///   from the daemon's environment. An essential variable absent from the
 ///   daemon's environment is silently omitted; this is not an error.
