@@ -89,7 +89,7 @@ curl
   HTTP client for Google Cloud REST APIs (authenticated automatically)
   (no environment)
   proxy tool; reachable hosts:
-    *.googleapis.com (Authorization injected from <secret "gcp_token">)
+    *.googleapis.com (authorization injected from <secret "gcp_token">)
 ```
 
 Rules:

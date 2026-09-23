@@ -882,10 +882,8 @@ pub(crate) fn strip_forbidden_headers(headers: &mut HeaderMap, inject: Option<&I
     }
     // `Proxy-Connection` is not a registered header name constant.
     headers.remove("proxy-connection");
-    if let Some(inject) = inject
-        && let Ok(name) = HeaderName::from_bytes(inject.header.as_bytes())
-    {
-        headers.remove(&name);
+    if let Some(inject) = inject {
+        headers.remove(&inject.header);
     }
 }
 
@@ -907,11 +905,9 @@ fn inject_credential(
         return Err("denied: injected secret is stale (last refresh failed)");
     }
 
-    let name = HeaderName::from_bytes(inject.header.as_bytes())
-        .map_err(|_| "denied: injected header name is invalid")?;
     let value = build_header_value(inject, slot.value.expose_secret())
         .map_err(|_| "denied: injected header value is invalid")?;
-    headers.insert(name, value);
+    headers.insert(inject.header.clone(), value);
     Ok(())
 }
 

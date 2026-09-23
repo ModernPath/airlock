@@ -14,6 +14,7 @@
 pub mod ca;
 pub mod server;
 
+use hyper::header::HeaderName;
 use thiserror::Error;
 
 /// Headers a route may not inject: they frame the request or address the
@@ -362,8 +363,9 @@ fn decode_segment(seg: &str) -> Option<Vec<u8>> {
 /// per request so background refreshes take effect immediately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Inject {
-    /// Header name, as written in config.
-    pub header: String,
+    /// Header name, validated once at config load so the per-request strip
+    /// and insert cannot fail on it.
+    pub header: HeaderName,
     /// Literal text before the secret (e.g. `"Bearer "`).
     pub prefix: String,
     /// Literal text after the secret.
@@ -380,13 +382,12 @@ impl Inject {
     pub fn parse(header: &str, value: &str, secret: &str) -> Result<Self, RouteError> {
         let err = |reason| RouteError::InvalidInject { reason };
 
-        let is_token_char = |b: u8| b.is_ascii_alphanumeric() || b"!#$%&'*+-.^_`|~".contains(&b);
-        if header.is_empty() || !header.bytes().all(is_token_char) {
+        let Ok(header) = HeaderName::from_bytes(header.as_bytes()) else {
             return Err(err("header is not a valid HTTP header name"));
-        }
+        };
         if FORBIDDEN_INJECT_HEADERS
             .iter()
-            .any(|h| h.eq_ignore_ascii_case(header))
+            .any(|h| h.eq_ignore_ascii_case(header.as_str()))
         {
             return Err(err(
                 "header is a framing or hop-by-hop header and cannot be injected",
@@ -416,7 +417,7 @@ impl Inject {
         }
 
         Ok(Inject {
-            header: header.to_string(),
+            header,
             prefix: prefix.to_string(),
             suffix: suffix.to_string(),
             secret: secret.to_string(),
@@ -793,7 +794,7 @@ mod tests {
     #[test]
     fn inject_splits_value_around_placeholder() {
         let i = Inject::parse("Authorization", "Bearer {secret}", "gcp_token").unwrap();
-        assert_eq!(i.header, "Authorization");
+        assert_eq!(i.header, "authorization");
         assert_eq!(i.prefix, "Bearer ");
         assert_eq!(i.suffix, "");
         assert_eq!(i.secret, "gcp_token");
