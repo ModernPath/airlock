@@ -303,11 +303,15 @@ Each `allow` and `deny` rule has the form `METHOD /path`. `*` as the method matc
 
 In the example above, `allow` limits the tool to one project, and `deny` removes `DELETE` from that. Without `deny`, you would have to list each allowed method.
 
+The proxy refuses a request that carries an `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` header. Google APIs and many frameworks take the method from that header instead of the request line, so it would let a `POST` bypass `deny = ["DELETE /**"]`.
+
 The agent then uses ordinary URLs from the API docs:
 
 ```bash
 airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
 ```
+
+A complete, read-only setup for Cloud Trace, Monitoring (including PromQL) and Logging is in [`examples/gcp-observability-curl.toml`](examples/gcp-observability-curl.toml).
 
 For each `airlock exec` of a proxy tool, the daemon:
 

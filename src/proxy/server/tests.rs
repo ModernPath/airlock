@@ -755,6 +755,30 @@ fn rules_match_the_path_and_ignore_the_query() {
     assert_eq!(err.status, StatusCode::FORBIDDEN);
 }
 
+#[test]
+fn method_override_headers_are_refused() {
+    // An empty allow list permits everything, so only the override check
+    // can refuse these.
+    let r = route(UPSTREAM_HOST, &[], None);
+    for name in [
+        "X-HTTP-Method-Override",
+        "x-http-method-override",
+        "X-HTTP-Method",
+        "X-Method-Override",
+    ] {
+        for method in ["GET", "POST"] {
+            let overridden = parts(
+                method,
+                "/v1/x",
+                &[("host", UPSTREAM_HOST), (name, "DELETE")],
+            );
+            let err = vet_request(&overridden, UPSTREAM_HOST, &r).unwrap_err();
+            assert_eq!(err.status, StatusCode::FORBIDDEN, "{method} with {name}");
+            assert!(err.reason.contains("method-override"), "{}", err.reason);
+        }
+    }
+}
+
 // ─── Forwarding ───────────────────────────────────────────────────────────────
 
 #[tokio::test]

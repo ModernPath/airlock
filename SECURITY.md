@@ -346,6 +346,7 @@ Egress restriction is the second layer, not the first. It makes the set of hosts
 | Inside the tunnel: `Host` header ≠ the CONNECT authority | `400` (no domain fronting) |
 | Inside the tunnel: absolute-form request target | `400` |
 | `Transfer-Encoding` together with `Content-Length`, or two `Content-Length` headers | `400` (request smuggling) |
+| An `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` header, whatever its value | `403`. Upstreams such as Google APIs route by this header instead of the request method, so the method the rules checked would not be the one that runs. |
 | The route's `allow` / `deny` rules do not permit the method and path | `403` |
 | The path contains `.` or `..` segments, `//`, a backslash, a malformed percent-escape, or an escape that decodes to `/`, `\`, `%` or NUL | `403`. The proxy refuses the path instead of normalizing it, because the upstream may normalize it differently than the matcher. |
 | The slot of the injected secret is `Stale` | `502` |
@@ -401,7 +402,7 @@ The proxy logs each request to the ring buffer: tool, method, host, path, decisi
 
 - **Misuse, not leakage.** The agent gets the full API permissions of the credential on the routed hosts. This is broader than a purpose-built CLI. Mitigate this first with a narrowly scoped service account, then with allow/deny rules.
 - **Data exfiltration to other tenants.** The tool can upload anything it can read to an attacker's project on an allowed multi-tenant host (`storage.googleapis.com` serves every GCP customer). It cannot upload the credential.
-- **Allow/deny rules are a convenience, not an authorization system.** They see the path, not the body. A `POST` allowed for one purpose can do something else (`:batchUpdate`, GraphQL). IAM is the real permission boundary.
+- **Allow/deny rules are a convenience, not an authorization system.** They see the path, not the body. A `POST` allowed for one purpose can do something else (`:batchUpdate`, GraphQL). Some web frameworks (Laravel, Symfony, Rails) also read the method from a `_method` field in a POST's form body or query string. The proxy refuses the method-override *headers*, but it does not parse bodies or query strings. IAM is the real permission boundary.
 - **An upstream that *transforms* the secret is not caught.** [Response redaction](#response-redaction) closes the `curl -o` / `--dump-header` / `--trace` path for response bytes. What the tool writes to a file is already redacted, so the plaintext credential never exists inside the sandbox. Redaction does not catch an upstream that returns the secret reversed, split into pieces, or in an encoding the redactor does not know. The stdout path has the same limit. Redaction also does not apply to data the agent sends: the proxy forwards the query string and request body as the agent wrote them.
 - **Linux egress restriction is port-scoped and TCP-only.** See [Linux — Landlock LSM](#linux--landlock-lsm).
 - **HTTP/1.1 only.** ALPN offers only `http/1.1`, so gRPC and HTTP/2-only endpoints do not work.
