@@ -405,13 +405,33 @@ async fn handle_proxy_request(
         ));
     };
 
+    // Also before the `200`, for the same reason. The leaf names the CONNECT
+    // authority; the client's SNI is never read.
+    let server_config = match ctx.ca.server_config(&host) {
+        Ok(config) => config,
+        Err(e) => {
+            ctx.audit(
+                req.method(),
+                &host,
+                "",
+                &format!("failed: could not mint a certificate: {e}"),
+            );
+            return Ok(refuse(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "airlock proxy: could not create a certificate for this host",
+            ));
+        }
+    };
+
     let tunnel_ctx = Arc::clone(&ctx);
     tokio::spawn(async move {
         let _permit = permit;
         let shutdown = tunnel_ctx.shutdown.clone();
         let tunnel = async {
             match hyper::upgrade::on(req).await {
-                Ok(upgraded) => run_tunnel(upgraded, host, Arc::clone(&tunnel_ctx)).await,
+                Ok(upgraded) => {
+                    run_tunnel(upgraded, host, server_config, Arc::clone(&tunnel_ctx)).await
+                }
                 Err(e) => tunnel_ctx.ring_buffer.log(format!(
                     "proxy [{}] CONNECT upgrade failed: {e}",
                     tunnel_ctx.tool
@@ -428,19 +448,12 @@ async fn handle_proxy_request(
 }
 
 /// Terminate TLS for one CONNECT tunnel and serve the requests inside it.
-async fn run_tunnel(upgraded: hyper::upgrade::Upgraded, host: String, ctx: Arc<ProxyContext>) {
-    // The leaf names the CONNECT authority. The client's SNI is never read.
-    let server_config = match ctx.ca.server_config(&host) {
-        Ok(config) => config,
-        Err(e) => {
-            ctx.ring_buffer.log(format!(
-                "proxy [{}] could not mint a certificate for {host}: {e}",
-                ctx.tool
-            ));
-            return;
-        }
-    };
-
+async fn run_tunnel(
+    upgraded: hyper::upgrade::Upgraded,
+    host: String,
+    server_config: Arc<rustls::ServerConfig>,
+    ctx: Arc<ProxyContext>,
+) {
     let accept = TlsAcceptor::from(server_config).accept(TokioIo::new(upgraded));
     let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, accept).await {
         Ok(Ok(tls)) => tls,
