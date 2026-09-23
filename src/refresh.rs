@@ -16,15 +16,19 @@
 //!   handlers snapshot the inner `Arc<Redactor>` once at accept time, so
 //!   in-flight streams keep their old redactor for their lifetime.
 //! - On every successful refresh the redactor is rebuilt with two generations
-//!   per refreshable secret (current + previous) and swapped in *before* the
+//!   per refreshed secret (current + previous) and swapped in *before* the
 //!   new value is published to the slot, so no reader can ever hand a secret
 //!   upstream that the live redactor doesn't know. The retired previous value
 //!   drops one cycle later — this is a deliberate trade-off against
 //!   `Secret<T>`'s eager-zeroize guarantee, in exchange for closing the
 //!   redaction gap during a swap.
+//! - Rebuild, swap and publish run under one [`Generations`] mutex shared by
+//!   all refresh tasks. The rebuild reads every slot, so two overlapping
+//!   refreshes could otherwise swap in a redactor built before the other one
+//!   published, and it would miss a value the proxy is already injecting.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -38,6 +42,11 @@ use crate::secrets::{Health, Secret, SecretStore, run_command_secret};
 /// Initial sleep before the first retry after a refresh failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 
+/// The value each refreshed secret held before its latest refresh, keyed by
+/// label. Every redactor rebuild includes these, and the mutex serializes
+/// refreshes (see the module docs).
+pub(crate) type Generations = Mutex<HashMap<String, Arc<Secret<String>>>>;
+
 /// Spawn one refresh task per `[secrets.<label>]` entry that declares
 /// `refresh = N`. Returns the task set and a shutdown sender — set the
 /// channel to `true` to ask all tasks to stop, then `await` the [`JoinSet`].
@@ -49,6 +58,7 @@ pub fn spawn_all(
 ) -> (JoinSet<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let mut set = JoinSet::new();
+    let previous: Arc<Generations> = Arc::default();
 
     for (label, spec) in &config.secrets {
         let SecretSource::Command {
@@ -68,6 +78,7 @@ pub fn spawn_all(
             env: env.clone(),
             store: Arc::clone(&store),
             redactor_swap: Arc::clone(&redactor_swap),
+            previous: Arc::clone(&previous),
             ring: ring.clone(),
             shutdown: rx.clone(),
         };
@@ -102,6 +113,7 @@ struct RefreshTask {
     env: CommandEnv,
     store: SecretStore,
     redactor_swap: Arc<RwLock<Arc<Redactor>>>,
+    previous: Arc<Generations>,
     ring: RingBuffer,
     shutdown: watch::Receiver<bool>,
 }
@@ -128,10 +140,20 @@ impl RefreshTask {
             let env = self.env.clone();
             let store = Arc::clone(&self.store);
             let redactor_swap = Arc::clone(&self.redactor_swap);
+            let previous = Arc::clone(&self.previous);
             let ring = self.ring.clone();
 
             let res = tokio::task::spawn_blocking(move || {
-                refresh_once(&label, &argv, timeout, &env, &store, &redactor_swap, &ring)
+                refresh_once(
+                    &label,
+                    &argv,
+                    timeout,
+                    &env,
+                    &store,
+                    &redactor_swap,
+                    &previous,
+                    &ring,
+                )
             })
             .await
             .unwrap_or_else(|join_err| Err(format!("refresh task panicked: {join_err}")));
@@ -162,6 +184,7 @@ impl RefreshTask {
 /// snapshot taken for that response has to already know it. Publishing
 /// first would open a window where an echoing upstream returns the new
 /// secret to the tool in plaintext.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn refresh_once(
     label: &str,
     argv: &[String],
@@ -169,6 +192,7 @@ pub(crate) fn refresh_once(
     env: &CommandEnv,
     store: &SecretStore,
     redactor_swap: &RwLock<Arc<Redactor>>,
+    previous: &Generations,
     ring: &RingBuffer,
 ) -> Result<(), String> {
     match run_command_secret(argv, timeout, env) {
@@ -177,18 +201,16 @@ pub(crate) fn refresh_once(
             let slot_lock = store
                 .get(label)
                 .ok_or_else(|| format!("secret label {label:?} missing from store"))?;
+
+            // Held until the new value is published; see the module docs.
+            let mut previous = previous.lock().unwrap_or_else(|e| e.into_inner());
             let previous_value = {
                 let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
                 Arc::clone(&slot.value)
             };
+            previous.insert(label.to_string(), previous_value);
 
-            rebuild_redactor(
-                store,
-                label,
-                &new_value,
-                Some(&previous_value),
-                redactor_swap,
-            )?;
+            rebuild_redactor(store, &previous, label, &new_value, redactor_swap)?;
 
             let was_stale = {
                 let mut slot = slot_lock.write().unwrap_or_else(|e| e.into_inner());
@@ -221,26 +243,27 @@ pub(crate) fn refresh_once(
     }
 }
 
-/// Rebuild the shared [`Redactor`] from the current store, plus an extra
-/// "previous" generation for the secret that just got refreshed.
+/// Rebuild the shared [`Redactor`] from the current store and the previous
+/// generation of every refreshed secret, with `refreshed_current` standing
+/// in for the not-yet-published value of `refreshed_label`.
 fn rebuild_redactor(
     store: &SecretStore,
+    previous: &HashMap<String, Arc<Secret<String>>>,
     refreshed_label: &str,
     refreshed_current: &Arc<Secret<String>>,
-    refreshed_previous: Option<&Arc<Secret<String>>>,
     redactor_swap: &RwLock<Arc<Redactor>>,
 ) -> Result<(), String> {
     let mut owned: HashMap<String, Vec<Arc<Secret<String>>>> = HashMap::with_capacity(store.len());
     for (label, slot_lock) in store.iter() {
-        let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
-        owned.insert(label.clone(), vec![Arc::clone(&slot.value)]);
-    }
-    if let Some(prev) = refreshed_previous
-        && let Some(gens) = owned.get_mut(refreshed_label)
-    {
-        gens.clear();
-        gens.push(Arc::clone(refreshed_current));
-        gens.push(Arc::clone(prev));
+        let current = if label == refreshed_label {
+            Arc::clone(refreshed_current)
+        } else {
+            let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(&slot.value)
+        };
+        let mut gens = vec![current];
+        gens.extend(previous.get(label).cloned());
+        owned.insert(label.clone(), gens);
     }
 
     let refs: Vec<(&str, &[Arc<Secret<String>>])> = owned
@@ -341,6 +364,7 @@ mod tests {
             &CommandEnv::default(),
             &store,
             &swap,
+            &Generations::default(),
             &ring,
         );
         assert!(res.is_ok(), "{res:?}");
@@ -361,6 +385,7 @@ mod tests {
             &CommandEnv::default(),
             &store,
             &swap,
+            &Generations::default(),
             &ring,
         )
         .unwrap();
@@ -370,6 +395,43 @@ mod tests {
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains("old-value"), "old generation not redacted: {s}");
         assert!(!s.contains("new-value"), "new generation not redacted: {s}");
+    }
+
+    #[test]
+    fn refreshing_one_secret_keeps_the_previous_generation_of_another() {
+        let mut map = HashMap::new();
+        for (label, value) in [("A", "a-old-value"), ("B", "b-old-value")] {
+            map.insert(
+                label.to_string(),
+                RwLock::new(SecretSlot {
+                    value: Arc::new(Secret::new(value.to_string())),
+                    health: Health::Healthy,
+                }),
+            );
+        }
+        let store: SecretStore = Arc::new(map);
+        let swap = empty_redactor_swap();
+        let previous = Generations::default();
+        let ring = RingBuffer::new();
+
+        for (label, value) in [("A", "a-new-value"), ("B", "b-new-value")] {
+            refresh_once(
+                label,
+                &echo_argv(value),
+                Duration::from_secs(2),
+                &CommandEnv::default(),
+                &store,
+                &swap,
+                &previous,
+                &ring,
+            )
+            .unwrap();
+        }
+
+        let redactor = swap.read().unwrap().clone();
+        let out = redactor.redact_bytes(b"a-old-value a-new-value b-old-value b-new-value");
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("-value"), "a generation was not redacted: {s}");
     }
 
     #[test]
@@ -385,6 +447,7 @@ mod tests {
             &CommandEnv::default(),
             &store,
             &swap,
+            &Generations::default(),
             &ring,
         );
         assert!(res.is_err());
@@ -419,6 +482,7 @@ mod tests {
             &CommandEnv::default(),
             &store,
             &swap,
+            &Generations::default(),
             &ring,
         );
         assert!(matches!(read_health(&store, "TOK"), Health::Stale { .. }));
@@ -431,6 +495,7 @@ mod tests {
             &CommandEnv::default(),
             &store,
             &swap,
+            &Generations::default(),
             &ring,
         )
         .unwrap();
