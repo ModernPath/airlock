@@ -82,9 +82,6 @@ pub struct ProxyCa {
     /// The same key in the DER form rustls wants, kept because `KeyPair` does
     /// not hand out a reusable `PrivateKeyDer`.
     leaf_key_der: PrivatePkcs8KeyDer<'static>,
-    /// The single crypto provider this daemon uses, passed explicitly so
-    /// nothing depends on process-default provider detection.
-    provider: Arc<rustls::crypto::CryptoProvider>,
     /// Host name → ready-to-use server config.
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
 }
@@ -143,7 +140,6 @@ impl ProxyCa {
             cert_pem,
             leaf_key,
             leaf_key_der,
-            provider: Arc::new(rustls::crypto::ring::default_provider()),
             cache: Mutex::new(HashMap::new()),
         }))
     }
@@ -215,8 +211,8 @@ impl ProxyCa {
         let chain = vec![leaf];
         let key = PrivateKeyDer::Pkcs8(self.leaf_key_der.clone_key());
 
-        let mut config = ServerConfig::builder_with_provider(Arc::clone(&self.provider))
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])?
+        let mut config = ServerConfig::builder_with_provider(Arc::clone(&super::CRYPTO_PROVIDER))
+            .with_protocol_versions(super::TLS_VERSIONS)?
             .with_no_client_auth()
             .with_single_cert(chain, key)?;
         // HTTP/1.1 only: the request path the proxy vets is an HTTP/1.1 one.

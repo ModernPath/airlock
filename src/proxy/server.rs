@@ -1135,11 +1135,11 @@ impl Upstream {
     }
 }
 
-/// TLS 1.2 is the floor; the upstream certificate is verified against public
-/// roots for the CONNECT authority, not for anything the client claimed.
+/// The upstream certificate is verified against public roots for the CONNECT
+/// authority, not for anything the client claimed.
 fn client_config(roots: rustls::RootCertStore) -> rustls::ClientConfig {
-    rustls::ClientConfig::builder_with_provider(Arc::new(rustls::crypto::ring::default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+    rustls::ClientConfig::builder_with_provider(Arc::clone(&super::CRYPTO_PROVIDER))
+        .with_protocol_versions(super::TLS_VERSIONS)
         .expect("TLS 1.2 and 1.3 are compiled in")
         .with_root_certificates(roots)
         .with_no_client_auth()

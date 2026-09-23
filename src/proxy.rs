@@ -14,8 +14,21 @@
 pub mod ca;
 pub mod server;
 
+use std::sync::{Arc, LazyLock};
+
 use hyper::header::HeaderName;
+use rustls::SupportedProtocolVersion;
+use rustls::crypto::CryptoProvider;
 use thiserror::Error;
+
+/// The crypto provider for both sides of the proxy, passed explicitly so
+/// nothing depends on process-default provider detection.
+static CRYPTO_PROVIDER: LazyLock<Arc<CryptoProvider>> =
+    LazyLock::new(|| Arc::new(rustls::crypto::ring::default_provider()));
+
+/// TLS versions offered to the tool and to the upstream. TLS 1.2 is the floor.
+const TLS_VERSIONS: &[&SupportedProtocolVersion] =
+    &[&rustls::version::TLS13, &rustls::version::TLS12];
 
 /// Headers a route may not inject: they frame the request or address the
 /// proxy hop, so letting config set them would desync the proxy from the
