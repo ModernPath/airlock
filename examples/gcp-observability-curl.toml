@@ -1,0 +1,143 @@
+# curl as a proxy tool for Google Cloud observability APIs
+#
+# Trace, Monitoring (including PromQL) and Logging queries have REST APIs
+# that gcloud covers only partly or not at all, so the agent needs a raw HTTP
+# client. A curl with a token in its env could send that token anywhere, so
+# here curl is a *proxy tool*: it gets no secret. Its only network path is a
+# per-exec proxy inside the daemon. The proxy attaches `Authorization` after
+# the request has left curl, for the routes below only, and redacts the
+# response before curl sees it.
+#
+# One-time setup, as yourself. The token-minting half is the same as in
+# gcp-impersonation.toml; only the roles differ:
+#
+#   gcloud iam service-accounts create agent-observability --project my-project
+#
+#   for role in roles/cloudtrace.user roles/monitoring.viewer roles/logging.viewer; do
+#     gcloud projects add-iam-policy-binding my-project \
+#       --member=serviceAccount:agent-observability@my-project.iam.gserviceaccount.com \
+#       --role=$role
+#   done
+#
+#   gcloud iam service-accounts add-iam-policy-binding \
+#     agent-observability@my-project.iam.gserviceaccount.com \
+#     --member=user:you@example.com \
+#     --role=roles/iam.serviceAccountTokenCreator
+#
+# Start the daemon:
+#
+#   airlock daemon start
+#
+# Use it with plain https:// URLs and no Authorization header. A header the
+# agent sets is replaced, and the agent has no token to put in it anyway:
+#
+#   airlock exec -- curl -s 'https://cloudtrace.googleapis.com/v1/projects/my-project/traces?pageSize=5'
+#
+#   airlock exec -- curl -s https://monitoring.googleapis.com/v1/projects/my-project/location/global/prometheus/api/v1/query \
+#     --data-urlencode 'query=sum by (job) (up)'
+#
+#   airlock exec -- curl -s https://logging.googleapis.com/v2/entries:list \
+#     -H 'Content-Type: application/json' \
+#     -d '{"resourceNames":["projects/my-project"],"filter":"severity>=ERROR","orderBy":"timestamp desc","pageSize":20}'
+#
+#   # Refused by the proxy with 403: DELETE is not on any allow list.
+#   airlock exec -- curl -s -X DELETE https://monitoring.googleapis.com/v3/projects/my-project/alertPolicies/123
+#
+# What the rules do and do not enforce
+#
+# The rules see only the host, method and path. The IAM roles above are the
+# real boundary, and they have to be read-only on their own, for three
+# reasons:
+#
+#   * Google front ends honor `X-HTTP-Method-Override`, on GET as well as on
+#     POST. The proxy matches the method on the request line, so a "GET" rule
+#     does not stop a write on that path. Only IAM does.
+#   * `entries:list` names the projects to read in the request *body*, which
+#     the proxy does not inspect. Pinning `my-project` in the paths below
+#     narrows everything else, but not this.
+#   * Response redaction covers the declared secrets only. Anything else an
+#     API returns reaches the agent as-is. That is why the notification
+#     channel and uptime check configs are denied below: their labels and
+#     headers can carry third-party credentials (webhook URLs with tokens,
+#     unmasked auth headers).
+
+timeout = 120
+
+[filesystem]
+write = ["/tmp"]
+
+# ─── Minted secret ──────────────────────────────────────────────────────────
+#
+# Runs on the trusted side, with your own gcloud login. Only the access token
+# it prints enters the secret store. See gcp-impersonation.toml for details.
+[secrets.gcp_observability_token]
+source = "command"
+command = [
+  "gcloud", "auth", "print-access-token",
+  "--impersonate-service-account=agent-observability@my-project.iam.gserviceaccount.com",
+]
+env = { CLOUDSDK_CORE_ACCOUNT = "you@example.com", CLOUDSDK_BILLING_QUOTA_PROJECT = "my-project" }
+timeout = 30
+# Tokens live 1 h. Re-mint every 50 min.
+refresh = 3000
+refresh_max_backoff = 600
+
+# ─── Proxy tool ─────────────────────────────────────────────────────────────
+#
+# `proxy = true` means: no secrets in `env`, network only through the proxy,
+# and only to the hosts routed below. Any other host gets a 403 from the
+# proxy. The description is what the agent sees in `airlock list`, so say
+# which APIs are reachable and that auth is automatic.
+[tools.curl]
+description = "curl for Google Cloud Trace / Monitoring / Logging REST APIs in my-project, read-only. Auth is injected by airlock; do not pass tokens."
+proxy = true
+timeout = 120
+
+# Each route is one host. With a non-empty `allow`, a request must match an
+# allow rule and no deny rule. In paths, `*` is one segment and `**` (last
+# only) is zero or more segments.
+
+# Cloud Trace. v1 is the read API (list and get traces); v2 is write-only.
+[[tools.curl.routes]]
+host   = "cloudtrace.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_observability_token" }
+allow  = [
+  "GET /v1/projects/my-project/traces",
+  "GET /v1/projects/my-project/traces/*",
+]
+
+# Cloud Monitoring.
+#   v3: time series, metric and resource descriptors, alert policies, groups,
+#       services and SLOs. MQL queries are a POST to `timeSeries:query`.
+#   v1: dashboards, and the Managed Service for Prometheus query API
+#       (PromQL). Its query endpoints also take POST with a form body, which
+#       is what `curl --data-urlencode` sends.
+[[tools.curl.routes]]
+host   = "monitoring.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_observability_token" }
+allow  = [
+  "GET /v3/projects/my-project/**",
+  "POST /v3/projects/my-project/timeSeries:query",
+  "GET /v1/projects/my-project/dashboards/**",
+  "GET /v1/projects/my-project/location/global/prometheus/api/v1/**",
+  "POST /v1/projects/my-project/location/global/prometheus/api/v1/query",
+  "POST /v1/projects/my-project/location/global/prometheus/api/v1/query_range",
+  "POST /v1/projects/my-project/location/global/prometheus/api/v1/series",
+  "POST /v1/projects/my-project/location/global/prometheus/api/v1/labels",
+]
+# Deny wins over allow, which carves these out of `GET /v3/projects/my-project/**`.
+deny   = [
+  "* /v3/projects/my-project/notificationChannels/**",
+  "* /v3/projects/my-project/uptimeCheckConfigs/**",
+]
+
+# Cloud Logging. Reading log entries is a POST to `entries:list`. Everything
+# under the project path is GET metadata: log names, buckets, views, sinks,
+# exclusions and log-based metrics.
+[[tools.curl.routes]]
+host   = "logging.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_observability_token" }
+allow  = [
+  "POST /v2/entries:list",
+  "GET /v2/projects/my-project/**",
+]

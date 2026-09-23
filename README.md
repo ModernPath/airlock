@@ -309,6 +309,8 @@ The agent then uses ordinary URLs from the API docs:
 airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
 ```
 
+A complete, read-only setup for Cloud Trace, Monitoring (including PromQL) and Logging is in [`examples/gcp-observability-curl.toml`](examples/gcp-observability-curl.toml).
+
 For each `airlock exec` of a proxy tool, the daemon:
 
 1. Starts a proxy on a random loopback port.
