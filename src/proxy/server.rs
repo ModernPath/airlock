@@ -564,10 +564,7 @@ async fn handle_tunneled_request(
     // route CONNECT matched; looking it up again keeps the decision next to
     // the request it governs.
     let Some(route) = ctx.policy.find_route(&host) else {
-        return Ok(refuse(
-            StatusCode::FORBIDDEN,
-            "airlock proxy: no route permits this host",
-        ));
+        return Ok(refuse(StatusCode::FORBIDDEN, "no route permits this host"));
     };
 
     let path = parts.uri.path().to_string();
@@ -598,10 +595,7 @@ async fn handle_tunneled_request(
         Ok(response) => Ok(forward_response(response, method, host, path, &ctx)),
         Err(e) => {
             ctx.audit(&method, &host, &path, &format!("upstream error: {e}"));
-            Ok(refuse(
-                StatusCode::BAD_GATEWAY,
-                "airlock proxy: upstream request failed",
-            ))
+            Ok(refuse(StatusCode::BAD_GATEWAY, "upstream request failed"))
         }
     }
 }
@@ -1001,8 +995,10 @@ fn text_body(text: &str) -> ProxyBody {
         .boxed()
 }
 
+/// The response for a request the proxy will not serve. The body names the
+/// proxy, so the tool can tell a refusal from an upstream error.
 fn refuse(status: StatusCode, reason: &str) -> Response<ProxyBody> {
-    let mut response = Response::new(text_body(reason));
+    let mut response = Response::new(text_body(&format!("airlock proxy: {reason}")));
     *response.status_mut() = status;
     response
 }
@@ -1010,7 +1006,7 @@ fn refuse(status: StatusCode, reason: &str) -> Response<ProxyBody> {
 fn auth_required() -> Response<ProxyBody> {
     let mut response = refuse(
         StatusCode::PROXY_AUTHENTICATION_REQUIRED,
-        "airlock proxy: bad or missing proxy credentials",
+        "bad or missing proxy credentials",
     );
     response.headers_mut().insert(
         header::PROXY_AUTHENTICATE,

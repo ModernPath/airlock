@@ -535,7 +535,9 @@ async fn connect_to_a_port_other_than_443_is_refused() {
     let response = h
         .connect(&format!("{UPSTREAM_HOST}:8443"), Some(&h.auth()))
         .await;
-    assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    let (status, body) = read_body(response).await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+    assert_eq!(body, "airlock proxy: denied: port 8443 is not 443\n");
     assert!(h.logs().contains("port 8443 is not 443"), "{}", h.logs());
 }
 
@@ -877,6 +879,7 @@ async fn a_denied_request_inside_a_tunnel_gets_403() {
     .await;
 
     assert_eq!(status, StatusCode::FORBIDDEN);
+    assert!(body.starts_with("airlock proxy: denied: "), "{body}");
     assert!(body.contains("not permitted by the route"), "{body}");
 }
 
