@@ -1230,17 +1230,125 @@ enum TermReason {
     ClientLineOverflow,
 }
 
-/// Handle an exec request: validate, spawn, and manage the child's lifecycle.
-///
-/// This function implements the full exec flow:
+/// A tool that passed every check and was spawned.
+struct StartedTool {
+    spawned: exec::SpawnedChild,
+    timeout: Duration,
+    /// The redactor for the child's stdout and stderr.
+    redactor: Arc<Redactor>,
+    /// Held for as long as the exec runs. Dropping it aborts the serve task
+    /// and closes the listener, so every way out of [`handle_exec_request`]
+    /// takes the proxy down with the child.
+    _proxy_session: Option<ProxySession>,
+}
+
+/// Validate an exec request and spawn the tool:
 /// 1. Tool validation
 /// 2. CWD validation
 /// 3. Binary resolution
-/// 4. Environment construction
+/// 4. Environment construction and redactor snapshot
 /// 5. Proxy session (proxy tools only): bind the listener, overlay its env
 /// 6. Timeout resolution
 /// 7. Policy and sandbox profile construction
 /// 8. ExecRequest assembly and spawn
+///
+/// An error is the message to log and send to the client.
+fn start_tool(
+    tool: &str,
+    args: Vec<String>,
+    cwd: &str,
+    shared: &DaemonShared,
+) -> Result<StartedTool, String> {
+    let DaemonShared {
+        config,
+        secrets,
+        redactor,
+        ring_buffer,
+        proxy,
+        ..
+    } = shared;
+
+    // ── 1. Tool validation ──────────────────────────────────────────────────
+    policy::validate_tool_exists(tool, config)
+        .map_err(|e| format!("unknown tool {tool:?}: {e}"))?;
+
+    // ── 2. CWD validation ───────────────────────────────────────────────────
+    let cwd_path = PathBuf::from(cwd);
+    policy::validate_cwd(&cwd_path, &config.sandbox_root)
+        .map_err(|e| format!("CWD validation failed: {e}"))?;
+
+    // ── 3. Binary resolution ────────────────────────────────────────────────
+    let binary = exec::resolve_binary(tool)
+        .map_err(|e| format!("binary resolution failed for {tool:?}: {e}"))?;
+
+    // ── 4. Environment construction ─────────────────────────────────────────
+    let tool_config = &config.tools[tool];
+    let mut env = exec::build_env(&resolve_tool_env(tool_config, secrets)?);
+
+    // Taken after the secrets are read, never earlier. A refresh swaps the
+    // redactor before it publishes the new value, so a snapshot taken now
+    // knows every value just put into `env`. One taken at accept time would
+    // miss a refresh that lands before the client sends its request, and
+    // the client chooses when that is.
+    let redactor = Arc::clone(&redactor.read().unwrap_or_else(|e| e.into_inner()));
+
+    // ── 5. Proxy session ────────────────────────────────────────────────────
+    //
+    // A proxy tool gets a listener of its own, bound now so that the port is
+    // known before the sandbox profile is built.
+    let proxy_session = match &tool_config.proxy {
+        Some(policy) => {
+            // A configured proxy tool is what makes the daemon generate a CA,
+            // so the two are present or absent together.
+            let proxy = proxy.as_ref().ok_or_else(|| {
+                format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA")
+            })?;
+            let session = ProxySession::start(tool.to_string(), policy.clone(), proxy)
+                .map_err(|e| format!("failed to start the proxy for tool {tool:?}: {e}"))?;
+            ring_buffer.log(format!(
+                "proxy for tool {tool:?} listening on 127.0.0.1:{}",
+                session.port()
+            ));
+            // Applied last so the daemon's proxy variables win over anything
+            // the tool's own `env` set.
+            session.apply_env(&mut env);
+            Some(session)
+        }
+        None => None,
+    };
+
+    // ── 6. Timeout resolution ───────────────────────────────────────────────
+    let timeout = tool_config.timeout.unwrap_or(config.timeout);
+
+    // ── 7. Policy and sandbox profile construction ──────────────────────────
+    let proxy_port = proxy_session.as_ref().map(ProxySession::port);
+    let mut tool_policy = policy::build_tool_policy(tool, config, proxy_port)
+        .map_err(|e| format!("policy construction failed for {tool:?}: {e}"))?;
+    tool_policy.binary_path = Some(binary.clone());
+
+    let sandbox_profile = build_platform_sandbox_profile(&tool_policy)
+        .map_err(|e| format!("sandbox profile construction failed for {tool:?}: {e}"))?;
+
+    // ── 8. ExecRequest assembly and spawn ───────────────────────────────────
+    let spawned = exec::spawn(exec::ExecRequest {
+        binary,
+        args,
+        work_dir: cwd_path,
+        env,
+        sandbox_profile,
+        timeout,
+    })
+    .map_err(|e| format!("spawn failed for {tool:?}: {e}"))?;
+
+    Ok(StartedTool {
+        spawned,
+        timeout,
+        redactor,
+        _proxy_session: proxy_session,
+    })
+}
+
+/// Handle an exec request: start the tool with [`start_tool`], then
 /// 9. Child registration
 /// 10. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
 /// 11. Post-loop cleanup (drain output, send exit, kill if needed)
@@ -1260,170 +1368,22 @@ async fn handle_exec_request(
     use tokio_util::codec::LinesCodecError;
 
     let DaemonShared {
-        config,
-        secrets,
-        redactor,
         ring_buffer,
         child_registry,
-        proxy,
+        ..
     } = shared;
 
-    // ── 1. Tool validation ──────────────────────────────────────────────────
-    if let Err(e) = policy::validate_tool_exists(&tool, config) {
-        log_and_send_error(
-            format!("unknown tool {:?}: {e}", tool),
-            ring_buffer,
-            &mut writer,
-        )
-        .await;
-        return;
-    }
-
-    // ── 2. CWD validation ───────────────────────────────────────────────────
-    let cwd_path = PathBuf::from(&cwd);
-    if let Err(e) = policy::validate_cwd(&cwd_path, &config.sandbox_root) {
-        log_and_send_error(
-            format!("CWD validation failed: {e}"),
-            ring_buffer,
-            &mut writer,
-        )
-        .await;
-        return;
-    }
-
-    // ── 3. Binary resolution ────────────────────────────────────────────────
-    let binary = match exec::resolve_binary(&tool) {
-        Ok(path) => path,
-        Err(e) => {
-            log_and_send_error(
-                format!("binary resolution failed for {:?}: {e}", tool),
-                ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-
-    // ── 4. Environment construction ─────────────────────────────────────────
-    let tool_config = &config.tools[&tool];
-    let env_pairs = match resolve_tool_env(tool_config, secrets) {
-        Ok(pairs) => pairs,
+    // `_proxy_session` must stay a named binding: `_` or `..` would drop the
+    // session here and take the proxy down before the tool runs.
+    let StartedTool {
+        spawned,
+        timeout,
+        redactor,
+        _proxy_session,
+    } = match start_tool(&tool, args, &cwd, shared) {
+        Ok(started) => started,
         Err(msg) => {
             log_and_send_error(msg, ring_buffer, &mut writer).await;
-            return;
-        }
-    };
-    let mut env = exec::build_env(&env_pairs);
-
-    // Taken after the secrets are read, never earlier. A refresh swaps the
-    // redactor before it publishes the new value, so a snapshot taken now
-    // knows every value just put into `env`. One taken at accept time would
-    // miss a refresh that lands before the client sends its request, and
-    // the client chooses when that is.
-    let redactor = Arc::clone(&redactor.read().unwrap_or_else(|e| e.into_inner()));
-
-    // ── 5. Proxy session ────────────────────────────────────────────────────
-    //
-    // A proxy tool gets a listener of its own, bound now so that the port is
-    // known before the sandbox profile is built. The session is held in this
-    // local for the rest of the function: dropping it aborts the serve task
-    // and closes the listener, so every way out of this function — normal
-    // exit, timeout, kill, client disconnect, an early `return` below — takes
-    // the proxy down with the child.
-    let proxy_session = match &tool_config.proxy {
-        Some(policy) => {
-            // A configured proxy tool is what makes the daemon generate a CA,
-            // so the two are present or absent together.
-            let Some(proxy) = proxy else {
-                log_and_send_error(
-                    format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA"),
-                    ring_buffer,
-                    &mut writer,
-                )
-                .await;
-                return;
-            };
-            match ProxySession::start(tool.clone(), policy.clone(), proxy) {
-                Ok(session) => {
-                    ring_buffer.log(format!(
-                        "proxy for tool {:?} listening on 127.0.0.1:{}",
-                        tool,
-                        session.port()
-                    ));
-                    Some(session)
-                }
-                Err(e) => {
-                    log_and_send_error(
-                        format!("failed to start the proxy for tool {:?}: {e}", tool),
-                        ring_buffer,
-                        &mut writer,
-                    )
-                    .await;
-                    return;
-                }
-            }
-        }
-        None => None,
-    };
-
-    // Applied last so the daemon's proxy variables win over anything the
-    // tool's own `env` set.
-    if let Some(session) = &proxy_session {
-        session.apply_env(&mut env);
-    }
-
-    // ── 6. Timeout resolution ───────────────────────────────────────────────
-    let timeout = tool_config.timeout.unwrap_or(config.timeout);
-
-    // ── 7. Policy and sandbox profile construction ──────────────────────────
-    let proxy_port = proxy_session.as_ref().map(ProxySession::port);
-    let mut tool_policy = match policy::build_tool_policy(&tool, config, proxy_port) {
-        Ok(p) => p,
-        Err(e) => {
-            log_and_send_error(
-                format!("policy construction failed for {:?}: {e}", tool),
-                ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-    tool_policy.binary_path = Some(binary.clone());
-
-    let sandbox_profile = match build_platform_sandbox_profile(&tool_policy) {
-        Ok(p) => p,
-        Err(e) => {
-            log_and_send_error(
-                format!("sandbox profile construction failed for {:?}: {e}", tool),
-                ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-
-    // ── 8. ExecRequest assembly and spawn ───────────────────────────────────
-    let request = exec::ExecRequest {
-        binary,
-        args,
-        work_dir: cwd_path,
-        env,
-        sandbox_profile,
-        timeout,
-    };
-
-    let spawned = match exec::spawn(request) {
-        Ok(s) => s,
-        Err(e) => {
-            log_and_send_error(
-                format!("spawn failed for {:?}: {e}", tool),
-                ring_buffer,
-                &mut writer,
-            )
-            .await;
             return;
         }
     };
