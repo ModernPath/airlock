@@ -171,6 +171,10 @@ pub enum DaemonError {
     #[error("failed to create tokio runtime: {0}")]
     RuntimeCreation(std::io::Error),
 
+    /// Failed to install the SIGTERM handler.
+    #[error("failed to install SIGTERM handler: {0}")]
+    SignalHandler(std::io::Error),
+
     /// The proxy certificate authority could not be created or published.
     #[error("failed to set up the proxy certificate authority: {0}")]
     ProxyCa(#[from] CaError),
@@ -1019,6 +1023,13 @@ async fn async_main_inner(
         RingBuffer::new()
     };
     let daemon = Daemon::start(state, ring_buffer)?;
+
+    // Before the readiness signal, so a failure reaches `daemon start`, and
+    // so a SIGTERM sent as soon as it returns gets a graceful shutdown rather
+    // than the default action, which would leave the socket and PID file.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(DaemonError::SignalHandler)?;
+
     let DaemonShared {
         config,
         ring_buffer,
@@ -1040,9 +1051,6 @@ async fn async_main_inner(
     if let Some(pipe) = readiness.take() {
         pipe.ready();
     }
-
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
 
     daemon
         .serve(async move {
