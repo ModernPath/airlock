@@ -1071,30 +1071,6 @@ fn resolve_secret_command_env(
 
 // ─── Proxy tools ──────────────────────────────────────────────────────────────
 
-/// Env vars that decide where a client sends its traffic and which CAs it
-/// trusts. For a proxy tool the daemon sets these itself at spawn; a config
-/// value would either be overwritten or, worse, steer the tool around the
-/// proxy.
-const PROXY_RESERVED_ENV_VARS: &[&str] = &[
-    "ALL_PROXY",
-    "CURL_CA_BUNDLE",
-    "HTTPS_PROXY",
-    "HTTP_PROXY",
-    "NODE_EXTRA_CA_CERTS",
-    "NO_PROXY",
-    "REQUESTS_CA_BUNDLE",
-    "SSL_CERT_DIR",
-    "SSL_CERT_FILE",
-];
-
-/// Clients read the proxy variables in either case (`http_proxy` is in fact
-/// the only form curl honors for plain HTTP), so the check ignores case.
-fn is_proxy_reserved_env_var(name: &str) -> bool {
-    PROXY_RESERVED_ENV_VARS
-        .iter()
-        .any(|reserved| reserved.eq_ignore_ascii_case(name))
-}
-
 /// Validate a tool's `proxy` / `routes` pair into a [`ProxyPolicy`], or `None`
 /// for an ordinary tool.
 fn resolve_proxy_policy(
@@ -1263,7 +1239,7 @@ fn parse_and_resolve_config(
                         name: var_name,
                     });
                 }
-                if raw_tool.proxy && is_proxy_reserved_env_var(&var_name) {
+                if raw_tool.proxy && crate::proxy::server::is_reserved_env_var(&var_name) {
                     return Err(ConfigError::ProxyReservedEnvVar {
                         tool: name.clone(),
                         var_name,
