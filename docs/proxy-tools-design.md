@@ -3,7 +3,7 @@
 **Status:** implemented through phase 3. The config schema and route matcher
 live in [src/proxy.rs](../src/proxy.rs) and [src/config.rs](../src/config.rs);
 the runtime is [src/proxy/server.rs](../src/proxy/server.rs) and
-[src/proxy/ca.rs](../src/proxy/ca.rs), wired into `handle_exec_request` in
+[src/proxy/ca.rs](../src/proxy/ca.rs), wired into `start_tool` in
 [src/daemon.rs](../src/daemon.rs). Egress pinning is in
 [src/sandbox.rs](../src/sandbox.rs) for both platforms. Operator-facing
 documentation of what shipped, including the residual risks below, is in
@@ -146,7 +146,7 @@ those would let a request match `allow` as one path and be served as another.
 ### Per-exec flow
 
 ```
-handle_exec_request(tool = "curl")
+start_tool(tool = "curl")
  1. policy = config.tools["curl"].proxy            (Some → proxy tool)
  2. listener = TcpListener::bind("127.0.0.1:0")    → port P (actual)
  3. token    = 32 random bytes                     (per exec)
