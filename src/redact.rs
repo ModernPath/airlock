@@ -22,7 +22,7 @@
 //! suitable for NDJSON serialization.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use aho_corasick::AhoCorasick;
 use base64::Engine;
@@ -104,6 +104,10 @@ fn finalize(patterns: Vec<Vec<u8>>, replacements: Vec<String>) -> Result<Redacto
 }
 
 // ─── Redactor ─────────────────────────────────────────────────────────────────
+
+/// The daemon's live redactor. Refresh tasks swap the inner `Arc`; a reader
+/// clones it to get a snapshot that later swaps do not affect.
+pub type RedactorSwap = Arc<RwLock<Arc<Redactor>>>;
 
 /// A redaction scanner backed by an Aho-Corasick automaton.
 ///

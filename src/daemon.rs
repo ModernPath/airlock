@@ -34,7 +34,7 @@ use crate::policy;
 use crate::protocol::{ClientMessage, DaemonMessage, LogEntry};
 use crate::proxy::ca::{CaError, ProxyCa};
 use crate::proxy::server::{ProxySession, ProxyShared};
-use crate::redact::{self, RedactError, Redactor};
+use crate::redact::{self, RedactError, Redactor, RedactorSwap};
 use crate::refresh;
 use crate::sandbox;
 use crate::secrets::{self, Health, SecretStore, SecretsError};
@@ -335,7 +335,7 @@ pub struct StartupState {
     /// The shared, swappable redactor. Refresh tasks rebuild it on each
     /// successful refresh (covering current + previous generations); active
     /// connections snapshot the inner `Arc<Redactor>` at accept time.
-    pub redactor: Arc<RwLock<Arc<Redactor>>>,
+    pub redactor: RedactorSwap,
     /// The bound std UnixListener.
     pub listener: unix_net::UnixListener,
 }
@@ -890,7 +890,7 @@ pub(crate) async fn run_embedded(
 fn publish_proxy_ca(
     config: &Config,
     secrets: &SecretStore,
-    redactor: &Arc<RwLock<Arc<Redactor>>>,
+    redactor: &RedactorSwap,
     ring_buffer: &RingBuffer,
 ) -> Result<Option<Arc<ProxyShared>>, DaemonError> {
     let Some(ca) = ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
@@ -985,7 +985,7 @@ async fn async_main_inner(
 
     // Wrap shared state in Arcs for concurrent access across connections.
     // `secrets` is already `SecretStore` (Arc<HashMap<...>>); `redactor` is
-    // already `Arc<RwLock<Arc<Redactor>>>`.
+    // already `RedactorSwap`.
     let config = Arc::new(config);
 
     // Create shared state. Foreground mode echoes log lines to stderr so the

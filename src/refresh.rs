@@ -12,7 +12,7 @@
 //! - Per-secret state lives in `RwLock<SecretSlot>` keyed inside a fixed
 //!   `Arc<HashMap<...>>` ([`SecretStore`]). The lock is held only for the
 //!   microseconds it takes to swap an `Arc` or read/clone health.
-//! - The redactor is shared as `Arc<RwLock<Arc<Redactor>>>`. Connection
+//! - The redactor is shared as `RedactorSwap`. Connection
 //!   handlers snapshot the inner `Arc<Redactor>` once at accept time, so
 //!   in-flight streams keep their old redactor for their lifetime.
 //! - On every successful refresh the redactor is rebuilt with two generations
@@ -36,7 +36,7 @@ use tokio::task::JoinSet;
 
 use crate::config::{CommandEnv, Config, RefreshSpec, SecretSource};
 use crate::daemon::RingBuffer;
-use crate::redact::Redactor;
+use crate::redact::{Redactor, RedactorSwap};
 use crate::secrets::{Health, Secret, SecretStore, run_command_secret};
 
 /// Initial sleep before the first retry after a refresh failure.
@@ -53,7 +53,7 @@ pub(crate) type Generations = Mutex<HashMap<String, Arc<Secret<String>>>>;
 pub fn spawn_all(
     config: &Config,
     store: SecretStore,
-    redactor_swap: Arc<RwLock<Arc<Redactor>>>,
+    redactor_swap: RedactorSwap,
     ring: RingBuffer,
 ) -> (JoinSet<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
@@ -112,7 +112,7 @@ struct RefreshTask {
     refresh: RefreshSpec,
     env: CommandEnv,
     store: SecretStore,
-    redactor_swap: Arc<RwLock<Arc<Redactor>>>,
+    redactor_swap: RedactorSwap,
     previous: Arc<Generations>,
     ring: RingBuffer,
     shutdown: watch::Receiver<bool>,
@@ -285,7 +285,7 @@ mod tests {
     use std::collections::HashMap;
     use std::path::PathBuf;
 
-    fn empty_redactor_swap() -> Arc<RwLock<Arc<Redactor>>> {
+    fn empty_redactor_swap() -> RedactorSwap {
         let r = Redactor::new(std::iter::empty()).unwrap();
         Arc::new(RwLock::new(Arc::new(r)))
     }

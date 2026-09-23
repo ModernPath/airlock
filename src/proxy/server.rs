@@ -25,7 +25,7 @@ use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::{Arc, RwLock};
+use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::Duration;
 
@@ -46,7 +46,7 @@ use tokio_util::sync::{CancellationToken, DropGuard};
 use zeroize::Zeroize;
 
 use crate::daemon::RingBuffer;
-use crate::redact::{Redactor, StreamRedactor};
+use crate::redact::{Redactor, RedactorSwap, StreamRedactor};
 use crate::secrets::{Health, SecretStore};
 
 use super::ca::ProxyCa;
@@ -168,7 +168,7 @@ pub struct ProxyShared {
     ca: Arc<ProxyCa>,
     ca_path: PathBuf,
     secrets: SecretStore,
-    redactor: Arc<RwLock<Arc<Redactor>>>,
+    redactor: RedactorSwap,
     ring_buffer: RingBuffer,
     upstream: Upstream,
 }
@@ -179,7 +179,7 @@ impl ProxyShared {
         ca: ProxyCa,
         ca_path: PathBuf,
         secrets: SecretStore,
-        redactor: Arc<RwLock<Arc<Redactor>>>,
+        redactor: RedactorSwap,
         ring_buffer: RingBuffer,
     ) -> Self {
         ProxyShared {
@@ -277,7 +277,7 @@ struct ProxyContext {
     /// minutes and a refreshed token is injected from the *next* request on,
     /// so a redactor snapshotted when the session started would not know the
     /// value the proxy is now attaching.
-    redactor: Arc<RwLock<Arc<Redactor>>>,
+    redactor: RedactorSwap,
     ring_buffer: RingBuffer,
     /// The full `Proxy-Authorization` value this exec accepts.
     expected_auth: String,

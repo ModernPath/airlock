@@ -66,7 +66,7 @@ fn secret_store(label: &str, value: &str, healthy: bool) -> SecretStore {
 
 /// The daemon's live redactor handle, built over the same store the proxy
 /// injects from — which is how the real daemon builds it.
-fn live_redactor(secrets: &SecretStore) -> Arc<RwLock<Arc<Redactor>>> {
+fn live_redactor(secrets: &SecretStore) -> RedactorSwap {
     let values: Vec<(String, Arc<Secret<String>>)> = secrets
         .iter()
         .map(|(name, slot)| {
@@ -337,7 +337,7 @@ struct Harness {
     ca: Arc<ProxyCa>,
     ring_buffer: RingBuffer,
     secrets: SecretStore,
-    redactor: Arc<RwLock<Arc<Redactor>>>,
+    redactor: RedactorSwap,
     seen: Seen,
 }
 
