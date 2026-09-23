@@ -15,7 +15,7 @@ Read [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [SECURITY.m
 ## Codebase invariants — do not break these
 
 - **`main()` is synchronous.** No `#[tokio::main]`. Daemonization forks; forking after tokio spawns runtime threads leaves them in undefined state in the child. The entire `synchronous_startup()` must complete before any tokio runtime exists. See [src/daemon.rs:14-19](src/daemon.rs#L14-L19).
-- **Double-fork with readiness pipe.** `daemon start` returns to the user only after the grandchild signals it's accepting connections. See [src/daemon.rs:506-572](src/daemon.rs#L506-L572).
+- **Double-fork with readiness pipe.** `daemon start` returns to the user only after the grandchild signals it's accepting connections, or reports the grandchild's startup error and exits non-zero. Every fallible startup step in `async_main` runs before the readiness signal and must report through the pipe, never silently. See `daemonize` and `ReadinessPipe` in [src/daemon.rs](src/daemon.rs).
 - **Trust boundary is the Unix socket.** The daemon is trusted; the client is not. Socket is mode `0700` and verified post-bind ([src/daemon.rs:416-435](src/daemon.rs#L416-L435)) — refuse to start if filesystem doesn't honor it.
 - **Secrets are wrapped in `Secret<T>`** ([src/secrets.rs](src/secrets.rs)) which zeroizes on drop and refuses to `Debug`-print. Never log a `Secret` value, never put one in a `format!`.
 - **Pre-exec closures must be async-signal-safe and zero-alloc.** The closure passed to `Command::pre_exec()` in [src/exec.rs](src/exec.rs) — no allocation, no mutex, no `println!`, only raw libc calls. Errors from pre-exec abort the spawn.
@@ -23,7 +23,7 @@ Read [README.md](README.md), [ARCHITECTURE.md](ARCHITECTURE.md), and [SECURITY.m
 
 ## Tests
 
-- Most logic lives in `cargo test --lib` (458 tests). All hermetic.
+- Most logic lives in `cargo test --lib` (463 tests). All hermetic.
 - `tests/cli_integration.rs` spawns the real `airlock` binary and runs `daemon start/stop/status`. **These might fail in the Claude Code sandbox**
 - Some `client.rs` tests read the process's real stdin. Run `cargo test` with `< /dev/null` or they can hang on an inherited pipe that never closes.
 

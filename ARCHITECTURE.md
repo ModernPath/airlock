@@ -46,13 +46,16 @@ main()
  │       ├─ verify_socket_permissions()  ← refuse start if not 0o700
  │       │
  │       ├─ [daemon start] daemonize()
- │       │   ├─ pipe for readiness
+ │       │   ├─ pipe for readiness (carries success, or the startup error)
  │       │   ├─ fork #1: parent waits on pipe
  │       │   ├─ setsid()
  │       │   ├─ fork #2: intermediate exits
  │       │   ├─ redirect stdio → /dev/null
  │       │   ├─ chdir("/")
- │       │   └─ signal readiness → parent exits
+ │       │   └─ signal readiness → parent exits 0
+ │       │      (a failure before that point is written into the pipe
+ │       │       instead; the parent prints it and exits 1 — the grandchild
+ │       │       has no stderr, so the pipe is its only voice)
  │       │
  │       └─ enter_async_runtime()
  │           ├─ convert std::UnixListener → tokio::UnixListener

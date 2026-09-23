@@ -19,6 +19,7 @@
 //! threads in an undefined state in the child.
 
 use std::collections::{HashSet, VecDeque};
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net as unix_net;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -606,16 +607,20 @@ pub fn daemonize(state: StartupState) -> Result<(), DaemonError> {
 
     if pid > 0 {
         // ── Original parent ──
-        // Close write end; wait for readiness signal on read end.
+        // Close write end; wait for the readiness verdict on the read end.
         unsafe { libc::close(write_end) };
+        let read_end = unsafe { std::fs::File::from_raw_fd(read_end) };
 
-        let mut buf = [0u8; 1];
-        // Blocking read — will return when child writes or pipe closes.
-        unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        unsafe { libc::close(read_end) };
+        let status = match await_readiness(read_end) {
+            Ok(()) => 0,
+            Err(reason) => {
+                eprintln!("error: daemon failed to start: {reason}");
+                1
+            }
+        };
 
         // Exit without running Rust destructors.
-        unsafe { libc::_exit(0) };
+        unsafe { libc::_exit(status) };
     }
 
     // ── First child ──
@@ -648,7 +653,60 @@ pub fn daemonize(state: StartupState) -> Result<(), DaemonError> {
     }
 
     // Enter the async runtime with the readiness pipe write end.
-    run_async_runtime(state, Some(write_end), false)
+    run_async_runtime(state, Some(ReadinessPipe(write_end)), false)
+}
+
+/// Read the grandchild's verdict from the readiness pipe.
+///
+/// The grandchild's stdio is `/dev/null`, so this pipe is the only channel
+/// through which a startup failure can reach the user. A leading
+/// [`READY`] byte means the daemon is accepting connections; a leading
+/// [`FAILED`] byte is followed by the error text. EOF before either — the
+/// grandchild died, or exited with a `?` on a path that never reached the
+/// pipe — is a failure too, never a silent success.
+fn await_readiness(mut read_end: std::fs::File) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    if let Err(e) = read_end.read_to_end(&mut buf) {
+        return Err(format!("readiness pipe read failed: {e}"));
+    }
+    match buf.split_first() {
+        Some((&READY, _)) => Ok(()),
+        Some((&FAILED, msg)) => Err(String::from_utf8_lossy(msg).into_owned()),
+        _ => Err("daemon exited before signalling readiness".to_string()),
+    }
+}
+
+const READY: u8 = 1;
+const FAILED: u8 = 0;
+
+/// Write end of the readiness pipe, owned by the grandchild.
+///
+/// Consumed exactly once: either [`ready`](Self::ready) once the daemon is
+/// accepting connections, or [`fail`](Self::fail) with the error that stopped
+/// it from getting there. Owning the fd (rather than passing a raw `c_int`
+/// around) is what guarantees nothing writes into it after it is closed and
+/// the descriptor number has been reused by a socket.
+pub(crate) struct ReadinessPipe(libc::c_int);
+
+impl ReadinessPipe {
+    fn ready(self) {
+        self.write_all(&[READY]);
+    }
+
+    fn fail(self, err: &DaemonError) {
+        let mut msg = vec![FAILED];
+        msg.extend_from_slice(err.to_string().as_bytes());
+        self.write_all(&msg);
+    }
+
+    fn write_all(self, bytes: &[u8]) {
+        use std::io::Write;
+        let mut file = unsafe { std::fs::File::from_raw_fd(self.0) };
+        // The parent may already be gone; there is nobody left to tell.
+        let _ = file.write_all(bytes);
+    }
 }
 
 /// Redirect stdin, stdout, and stderr to /dev/null.
@@ -849,23 +907,49 @@ pub(crate) async fn run_embedded(
 /// # Arguments
 ///
 /// * `state` — The startup state bundle from the synchronous phase.
-/// * `readiness_fd` — If `Some`, the write end of the readiness pipe.
-///   A single byte is written and the fd is closed after the daemon is
-///   ready to accept connections. If `None` (foreground mode), this is a no-op.
+/// * `readiness` — If `Some`, the write end of the readiness pipe. It is
+///   answered once the daemon is accepting connections, or with the error
+///   if startup fails before that point. `None` in foreground mode.
 fn run_async_runtime(
     state: StartupState,
-    readiness_fd: Option<libc::c_int>,
+    readiness: Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
-    let runtime = tokio::runtime::Runtime::new().map_err(DaemonError::RuntimeCreation)?;
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let err = DaemonError::RuntimeCreation(e);
+            if let Some(pipe) = readiness {
+                pipe.fail(&err);
+            }
+            return Err(err);
+        }
+    };
 
-    runtime.block_on(async_main(state, readiness_fd, foreground))
+    runtime.block_on(async_main(state, readiness, foreground))
 }
 
 /// The async main loop of the daemon.
+///
+/// Every startup step that can fail runs before the readiness signal, so a
+/// failure here has to be reported through the pipe: once daemonized, the
+/// process has no stderr and the parent's exit status is the user's only
+/// feedback.
 async fn async_main(
     state: StartupState,
-    readiness_fd: Option<libc::c_int>,
+    mut readiness: Option<ReadinessPipe>,
+    foreground: bool,
+) -> Result<(), DaemonError> {
+    let result = async_main_inner(state, &mut readiness, foreground).await;
+    if let (Err(err), Some(pipe)) = (&result, readiness.take()) {
+        pipe.fail(err);
+    }
+    result
+}
+
+async fn async_main_inner(
+    state: StartupState,
+    readiness: &mut Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
     let StartupState {
@@ -951,13 +1035,8 @@ async fn async_main(
         socket_path.display()
     ));
 
-    // Signal readiness.
-    if let Some(fd) = readiness_fd {
-        unsafe {
-            let byte: [u8; 1] = [1];
-            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
-            libc::close(fd);
-        }
+    if let Some(pipe) = readiness.take() {
+        pipe.ready();
     }
 
     // Install SIGTERM handler.
@@ -1974,6 +2053,36 @@ fn write_pid_file(pid_path: &Path, pid: u32) -> Result<(), DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn readiness_pair() -> (std::fs::File, ReadinessPipe) {
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        (read_end, ReadinessPipe(fds[1]))
+    }
+
+    #[test]
+    fn readiness_ready_byte_is_success() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.ready();
+        assert_eq!(await_readiness(read_end), Ok(()));
+    }
+
+    #[test]
+    fn readiness_failure_carries_the_error_text() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.fail(&DaemonError::AlreadyRunning { pid: 4242 });
+        let err = await_readiness(read_end).unwrap_err();
+        assert!(err.contains("4242"), "{err}");
+    }
+
+    #[test]
+    fn readiness_eof_without_a_verdict_is_failure() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.write_all(&[]);
+        let err = await_readiness(read_end).unwrap_err();
+        assert!(err.contains("before signalling readiness"), "{err}");
+    }
 
     // ── Ring buffer tests ──────────────────────────────────────────────────
 
