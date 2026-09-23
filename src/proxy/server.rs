@@ -19,6 +19,7 @@
 //! verified against. A forged `Host`, a forged SNI, `curl --resolve` and
 //! `curl --connect-to` cannot make any two of those disagree.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -33,7 +34,7 @@ use http_body_util::{BodyExt, Full, combinators::BoxBody};
 use hyper::body::{Body, Frame, Incoming};
 use hyper::header::{self, HeaderMap, HeaderName, HeaderValue};
 use hyper::service::service_fn;
-use hyper::{Method, Request, Response, StatusCode};
+use hyper::{Method, Request, Response, StatusCode, Uri};
 use hyper_util::rt::{TokioIo, TokioTimer};
 use rustls::pki_types::ServerName;
 use subtle::ConstantTimeEq;
@@ -291,10 +292,26 @@ impl ProxyContext {
     /// Record one proxied request. Never the query string (it may carry data)
     /// and never a header value.
     fn audit(&self, method: &Method, host: &str, path: &str, decision: &str) {
-        self.ring_buffer.log(format!(
-            "proxy [{}] {method} {host}{path} -> {decision}",
-            self.tool
-        ));
+        self.log(&format!("{method} {host}{path} -> {decision}"));
+    }
+
+    /// Audit a refused request and build the response the tool sees. The tool
+    /// gets the same reason the log records.
+    fn refuse(
+        &self,
+        method: &Method,
+        host: &str,
+        path: &str,
+        denial: Denial,
+    ) -> Response<ProxyBody> {
+        self.audit(method, host, path, &denial.reason);
+        refuse(denial.status, &denial.reason)
+    }
+
+    /// Log a proxy event that is not a request decision.
+    fn log(&self, message: &str) {
+        self.ring_buffer
+            .log(format!("proxy [{}] {message}", self.tool));
     }
 
     /// The redactor to apply to one response, taken when that response's
@@ -312,8 +329,7 @@ async fn accept_loop(listener: TcpListener, ctx: Arc<ProxyContext>) {
         let stream = match listener.accept().await {
             Ok((stream, _peer)) => stream,
             Err(e) => {
-                ctx.ring_buffer
-                    .log(format!("proxy [{}] accept error: {e}", ctx.tool));
+                ctx.log(&format!("accept error: {e}"));
                 // Back off so a persistently failing accept cannot spin.
                 tokio::time::sleep(Duration::from_millis(100)).await;
                 continue;
@@ -368,63 +384,24 @@ async fn handle_proxy_request(
         return Ok(auth_required());
     }
 
-    if req.method() != Method::CONNECT {
-        let host = req.uri().host().unwrap_or("-").to_string();
-        ctx.audit(
-            req.method(),
-            &host,
-            req.uri().path(),
-            "denied: plain HTTP proxying is not supported",
-        );
-        return Ok(refuse(
-            StatusCode::FORBIDDEN,
-            "airlock proxy: only CONNECT to an https:// host is supported",
-        ));
-    }
-
-    // For CONNECT the request-target *is* the authority; there is no path.
-    let Some((host, port)) = req.uri().authority().and_then(split_authority) else {
-        return Ok(refuse(
-            StatusCode::BAD_REQUEST,
-            "airlock proxy: malformed CONNECT target",
-        ));
+    let host = match vet_connect(req.method(), req.uri(), &ctx.policy) {
+        Ok(host) => host,
+        Err(denial) => {
+            let target = req.uri().host().unwrap_or("-");
+            return Ok(ctx.refuse(req.method(), target, req.uri().path(), denial));
+        }
     };
-
-    if port != UPSTREAM_PORT {
-        ctx.audit(
-            req.method(),
-            &host,
-            "",
-            &format!("denied: port {port} is not {UPSTREAM_PORT}"),
-        );
-        return Ok(refuse(
-            StatusCode::FORBIDDEN,
-            "airlock proxy: only port 443 may be reached",
-        ));
-    }
-
-    if ctx.policy.find_route(&host).is_none() {
-        ctx.audit(req.method(), &host, "", "denied: no route for host");
-        return Ok(refuse(
-            StatusCode::FORBIDDEN,
-            "airlock proxy: no route permits this host",
-        ));
-    }
 
     // Taken before the `200`: once the tool sees a successful CONNECT, a
     // refusal can only be a dropped connection, which looks like a TLS
     // failure instead of a busy proxy it could retry.
     let Ok(permit) = Arc::clone(&ctx.tunnels).try_acquire_owned() else {
-        ctx.audit(
-            req.method(),
-            &host,
-            "",
-            &format!("denied: {MAX_CONCURRENT_TUNNELS} tunnels already open"),
-        );
-        return Ok(refuse(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "airlock proxy: too many open tunnels, retry later",
-        ));
+        let denial = Denial {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            reason: format!("denied: {MAX_CONCURRENT_TUNNELS} tunnels already open, retry later")
+                .into(),
+        };
+        return Ok(ctx.refuse(req.method(), &host, "", denial));
     };
 
     // Also before the `200`, for the same reason. The leaf names the CONNECT
@@ -432,16 +409,11 @@ async fn handle_proxy_request(
     let server_config = match ctx.ca.server_config(&host) {
         Ok(config) => config,
         Err(e) => {
-            ctx.audit(
-                req.method(),
-                &host,
-                "",
-                &format!("failed: could not mint a certificate: {e}"),
-            );
-            return Ok(refuse(
-                StatusCode::INTERNAL_SERVER_ERROR,
-                "airlock proxy: could not create a certificate for this host",
-            ));
+            let denial = Denial {
+                status: StatusCode::INTERNAL_SERVER_ERROR,
+                reason: format!("failed: could not mint a certificate: {e}").into(),
+            };
+            return Ok(ctx.refuse(req.method(), &host, "", denial));
         }
     };
 
@@ -454,10 +426,7 @@ async fn handle_proxy_request(
                 Ok(upgraded) => {
                     run_tunnel(upgraded, host, server_config, Arc::clone(&tunnel_ctx)).await
                 }
-                Err(e) => tunnel_ctx.ring_buffer.log(format!(
-                    "proxy [{}] CONNECT upgrade failed: {e}",
-                    tunnel_ctx.tool
-                )),
+                Err(e) => tunnel_ctx.log(&format!("CONNECT upgrade failed: {e}")),
             }
         };
         tokio::select! {
@@ -480,13 +449,11 @@ async fn run_tunnel(
     let tls = match tokio::time::timeout(TLS_HANDSHAKE_TIMEOUT, accept).await {
         Ok(Ok(tls)) => tls,
         Ok(Err(e)) => {
-            ctx.ring_buffer
-                .log(format!("proxy [{}] TLS handshake failed: {e}", ctx.tool));
+            ctx.log(&format!("TLS handshake failed: {e}"));
             return;
         }
         Err(_) => {
-            ctx.ring_buffer
-                .log(format!("proxy [{}] TLS handshake timed out", ctx.tool));
+            ctx.log("TLS handshake timed out");
             return;
         }
     };
@@ -508,11 +475,54 @@ async fn run_tunnel(
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) struct Denial {
     pub(crate) status: StatusCode,
-    pub(crate) reason: &'static str,
+    pub(crate) reason: Cow<'static, str>,
 }
 
 const fn deny(status: StatusCode, reason: &'static str) -> Denial {
-    Denial { status, reason }
+    Denial {
+        status,
+        reason: Cow::Borrowed(reason),
+    }
+}
+
+/// Decide whether a proxy request may open a tunnel, and to which
+/// canonical host.
+///
+/// Pure, like [`vet_request`]: the method, the request-target and the
+/// policy are all it needs. Resources (a tunnel slot, a leaf certificate)
+/// are the caller's job.
+pub(crate) fn vet_connect(
+    method: &Method,
+    uri: &Uri,
+    policy: &ProxyPolicy,
+) -> Result<String, Denial> {
+    if method != Method::CONNECT {
+        return Err(deny(
+            StatusCode::FORBIDDEN,
+            "denied: plain HTTP proxying is not supported, only CONNECT to an https:// host",
+        ));
+    }
+
+    // For CONNECT the request-target *is* the authority; there is no path.
+    let Some((host, port)) = uri.authority().and_then(split_authority) else {
+        return Err(deny(
+            StatusCode::BAD_REQUEST,
+            "denied: malformed CONNECT target",
+        ));
+    };
+
+    if port != UPSTREAM_PORT {
+        return Err(Denial {
+            status: StatusCode::FORBIDDEN,
+            reason: format!("denied: port {port} is not {UPSTREAM_PORT}").into(),
+        });
+    }
+
+    if policy.find_route(&host).is_none() {
+        return Err(deny(StatusCode::FORBIDDEN, "denied: no route for host"));
+    }
+
+    Ok(host)
 }
 
 /// Decide whether a request inside a tunnel to `authority` may be forwarded.
@@ -599,8 +609,7 @@ async fn handle_tunneled_request(
 
     let path = parts.uri.path().to_string();
     if let Err(denial) = vet_request(&parts, &host, route) {
-        ctx.audit(&parts.method, &host, &path, denial.reason);
-        return Ok(refuse(denial.status, denial.reason));
+        return Ok(ctx.refuse(&parts.method, &host, &path, denial));
     }
 
     strip_forbidden_headers(&mut parts.headers, route.inject.as_ref());
@@ -610,8 +619,8 @@ async fn handle_tunneled_request(
         match self::inject_credential(&ctx.secrets, inject, &mut parts.headers) {
             Ok(()) => {}
             Err(reason) => {
-                ctx.audit(&parts.method, &host, &path, reason);
-                return Ok(refuse(StatusCode::BAD_GATEWAY, reason));
+                let denial = deny(StatusCode::BAD_GATEWAY, reason);
+                return Ok(ctx.refuse(&parts.method, &host, &path, denial));
             }
         }
     }
@@ -655,8 +664,7 @@ fn forward_response(
         // `body` is dropped unread. An opaque body is exactly the case where
         // forwarding would put bytes the redactor cannot see into the tool's
         // hands, so the response is refused rather than passed through.
-        ctx.audit(&method, &host, &path, reason);
-        return refuse(StatusCode::BAD_GATEWAY, reason);
+        return ctx.refuse(&method, &host, &path, deny(StatusCode::BAD_GATEWAY, reason));
     }
 
     // Extensions are how hyper carries the upstream's reason phrase (and its

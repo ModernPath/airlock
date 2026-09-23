@@ -595,6 +595,47 @@ async fn plain_http_proxying_is_refused() {
 
 // ─── Request vetting (pure) ───────────────────────────────────────────────────
 
+#[test]
+fn vet_connect_returns_the_canonical_host_or_a_denial() {
+    let policy = ProxyPolicy {
+        routes: vec![route(UPSTREAM_HOST, &[], None)],
+    };
+    let vet = |method: Method, target: &str| {
+        vet_connect(&method, &target.parse::<Uri>().unwrap(), &policy)
+    };
+
+    assert_eq!(
+        vet(Method::CONNECT, "Upstream.TEST:443").unwrap(),
+        UPSTREAM_HOST
+    );
+
+    for (method, target, status) in [
+        (Method::GET, "http://upstream.test/", StatusCode::FORBIDDEN),
+        (Method::CONNECT, "upstream.test:8443", StatusCode::FORBIDDEN),
+        (Method::CONNECT, "other.test:443", StatusCode::FORBIDDEN),
+        (Method::CONNECT, "upstream.test", StatusCode::BAD_REQUEST),
+    ] {
+        let denial = vet(method.clone(), target).unwrap_err();
+        assert_eq!(
+            denial.status, status,
+            "{method} {target}: {}",
+            denial.reason
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_malformed_connect_target_is_audited() {
+    let h = Harness::default().await;
+    let response = h.connect("upstream.test", Some(&h.auth())).await;
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    assert!(
+        h.logs().contains("malformed CONNECT target"),
+        "{}",
+        h.logs()
+    );
+}
+
 fn parts(method: &str, target: &str, headers: &[(&str, &str)]) -> hyper::http::request::Parts {
     let mut builder = Request::builder().method(method).uri(target);
     for (name, value) in headers {
