@@ -267,8 +267,71 @@ TF_INPUT             = "0"
 | `extra_read`  | Additional read-only paths. |
 | `extra_write` | Additional read-write paths. |
 | `timeout`     | Per-tool timeout in seconds; overrides the global value. |
+| `proxy`       | `true` marks a *proxy tool*. See [Proxy tools](#proxy-tools). A proxy tool needs at least one route and may not have secrets in `env`. |
+| `routes`      | `[[tools.<name>.routes]]`. Each route names a host the proxy tool may reach, an optional credential header to attach, and optional `METHOD /path` allow/deny rules. |
 
-> **Only declare purpose-built CLIs as tools** — never shells (`bash`), interpreters (`python`, `node`), or tools where the agent controls the request (`curl`). If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
+> **Only declare purpose-built CLIs as tools.** Never declare shells (`bash`), interpreters (`python`, `node`), or any tool where the agent controls the request. If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. `curl` is the one exception, and only as a [proxy tool](#proxy-tools). A proxy tool never holds a secret, so it has no secret to leak. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
+
+### Proxy tools
+
+Use a proxy tool when the API you need has no CLI. A proxy tool is a general HTTP client, such as `curl`. Its only network path is a proxy inside the daemon. The proxy attaches the credential *after* the request has left the tool. So the tool never holds a secret, and nothing the agent can read out of the tool is useful to an attacker.
+
+```toml
+# Minted on the trusted side, refreshed before expiry. The tool never sees it.
+[secrets.gcp_token]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token",
+           "--impersonate-service-account=agent-ro@my-project.iam.gserviceaccount.com"]
+refresh = 3000
+
+[tools.curl]
+description = "HTTP client for Google Cloud REST APIs (authenticated automatically)"
+proxy = true
+
+[[tools.curl.routes]]
+host   = "*.googleapis.com"
+inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_token" }
+allow  = ["* /v2/projects/my-project/**"]
+deny   = ["DELETE /**"]
+```
+
+Each `allow` and `deny` rule has the form `METHOD /path`. `*` as the method matches any method. In the path, `*` matches exactly one segment, and `**` (last segment only) matches the rest of the path. The proxy checks a request in this order:
+
+1. If the request matches any `deny` rule, the proxy refuses it. This is true even if an `allow` rule also matches.
+2. If `allow` is empty, the proxy allows the request.
+3. Otherwise the request must match at least one `allow` rule. A request that matches neither list is refused.
+
+In the example above, `allow` limits the tool to one project, and `deny` removes `DELETE` from that. Without `deny`, you would have to list each allowed method.
+
+The agent then uses ordinary URLs from the API docs:
+
+```bash
+airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
+```
+
+For each `airlock exec` of a proxy tool, the daemon:
+
+1. Starts a proxy on a random loopback port.
+2. Points the tool at the proxy with `HTTPS_PROXY`. Points it at the Airlock CA with `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`.
+3. Limits the tool's network access to that one port with Seatbelt (macOS) or Landlock (Linux).
+4. Stops the proxy when the tool exits.
+
+For each request, the proxy:
+
+1. Checks the host against the routes. A host with no route is unreachable (deny by default).
+2. Checks the method and path against the route's allow/deny rules, in the order above.
+3. Attaches the credential.
+4. Sends the request over a verified TLS connection. The host must resolve to a public address.
+
+The proxy redacts the response before the tool sees it, both header values and body. So an API that echoes the credential cannot pass it to the agent, not even through `curl -o file`. The proxy refuses compressed and partial responses instead of forwarding bytes it cannot redact. See [SECURITY.md](SECURITY.md#response-redaction).
+
+Limits to know before you start:
+
+- HTTP/1.1 only. gRPC and HTTP/2-only endpoints do not work.
+- Clients that pin certificates fail, because the proxy intercepts TLS.
+- The agent gets the full API permissions of the credential on the routed hosts. Give the service account the smallest scope that works.
+
+Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design notes: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 ### `[agent]` — for `airlock run`
 

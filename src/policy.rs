@@ -14,7 +14,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::Config;
-use crate::sandbox::{AgentPolicy, ToolPolicy};
+use crate::sandbox::{AgentPolicy, NetworkAccess, ToolPolicy};
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -47,6 +47,18 @@ pub enum PolicyError {
         path: PathBuf,
         /// The underlying I/O error.
         source: std::io::Error,
+    },
+
+    /// A proxy tool without a proxy port, or an ordinary tool with one.
+    #[error(
+        "tool {name:?}: {}",
+        if *.proxy_tool { "proxy tool has no proxy port" } else { "ordinary tool was given a proxy port" }
+    )]
+    ProxyPortMismatch {
+        /// The tool name.
+        name: String,
+        /// Whether the tool is declared with `proxy = true`.
+        proxy_tool: bool,
     },
 }
 
@@ -127,17 +139,38 @@ pub fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> Result<(), PolicyError> 
 /// All paths in the config are already fully resolved (tilde-expanded and
 /// relative paths resolved against the sandbox root) by the config module.
 ///
-/// `requires_network` is unconditionally set to `true` for all tools.
+/// `network` is [`NetworkAccess::Full`] for an ordinary tool and
+/// [`NetworkAccess::ProxyOnly`] for a proxy tool; the caller supplies the
+/// proxy's bound port because it is only known once the per-exec listener is
+/// up.
 ///
 /// # Errors
 ///
 /// Returns [`PolicyError::UnknownTool`] if the tool name is not found in the
-/// config's `[tools.*]` section.
-pub fn build_tool_policy(tool_name: &str, config: &Config) -> Result<ToolPolicy, PolicyError> {
+/// config's `[tools.*]` section, and [`PolicyError::ProxyPortMismatch`] if
+/// `proxy_port` is given for an ordinary tool or missing for a proxy tool.
+/// The mismatch is an error rather than a fallback to full network, so a
+/// caller that forgets the port cannot give a proxy tool open egress.
+pub fn build_tool_policy(
+    tool_name: &str,
+    config: &Config,
+    proxy_port: Option<u16>,
+) -> Result<ToolPolicy, PolicyError> {
     // Validate tool existence first.
     validate_tool_exists(tool_name, config)?;
 
     let tool_config = &config.tools[tool_name];
+
+    let network = match (tool_config.proxy.is_some(), proxy_port) {
+        (true, Some(port)) => NetworkAccess::ProxyOnly(port),
+        (false, None) => NetworkAccess::Full,
+        (proxy_tool, _) => {
+            return Err(PolicyError::ProxyPortMismatch {
+                name: tool_name.to_string(),
+                proxy_tool,
+            });
+        }
+    };
 
     // Build read_paths: global filesystem read + tool's extra_read.
     let mut read_paths: Vec<PathBuf> = Vec::new();
@@ -153,7 +186,7 @@ pub fn build_tool_policy(tool_name: &str, config: &Config) -> Result<ToolPolicy,
     Ok(ToolPolicy {
         read_paths,
         read_write_paths,
-        requires_network: true,
+        network,
         binary_path: None,
     })
 }
@@ -242,6 +275,7 @@ mod tests {
                     extra_write,
                     timeout: None,
                     description: None,
+                    proxy: None,
                 },
             );
         }
@@ -250,6 +284,7 @@ mod tests {
             sandbox_root: sandbox_root.clone(),
             socket_path: sandbox_root.join("airlock.sock"),
             pid_path: sandbox_root.join("airlock.pid"),
+            ca_path: sandbox_root.join("airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read,
             filesystem_write,
@@ -277,7 +312,7 @@ mod tests {
         let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
         let config = make_simple_config(sandbox_root.clone());
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert!(
             policy.read_write_paths.contains(&sandbox_root),
             "read_write_paths should contain sandbox root, got: {:?}",
@@ -296,7 +331,7 @@ mod tests {
             vec![("mytool", Vec::new(), Vec::new())],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert!(
             policy.read_paths.contains(&PathBuf::from("/usr/share")),
             "read_paths should contain global /usr/share"
@@ -318,7 +353,7 @@ mod tests {
             vec![("mytool", Vec::new(), Vec::new())],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert!(
             policy
                 .read_write_paths
@@ -338,7 +373,7 @@ mod tests {
             vec![("mytool", vec![PathBuf::from("/etc/config")], Vec::new())],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert!(
             policy.read_paths.contains(&PathBuf::from("/usr/share")),
             "read_paths should contain global path"
@@ -360,7 +395,7 @@ mod tests {
             vec![("mytool", Vec::new(), vec![PathBuf::from("/tmp/results")])],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert!(
             policy.read_write_paths.contains(&sandbox_root),
             "read_write_paths should contain sandbox root"
@@ -374,16 +409,59 @@ mod tests {
     }
 
     #[test]
-    fn requires_network_always_true() {
+    fn ordinary_tool_gets_full_network() {
         let tmp = tempdir().unwrap();
         let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
         let config = make_simple_config(sandbox_root);
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
-        assert!(
-            policy.requires_network,
-            "requires_network should always be true"
-        );
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
+        assert_eq!(policy.network, NetworkAccess::Full);
+    }
+
+    #[test]
+    fn proxy_tool_is_limited_to_its_proxy_port() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut config = make_simple_config(sandbox_root);
+        config.tools.get_mut("mytool").unwrap().proxy =
+            Some(crate::proxy::ProxyPolicy { routes: Vec::new() });
+
+        let policy = build_tool_policy("mytool", &config, Some(4242)).unwrap();
+        assert_eq!(policy.network, NetworkAccess::ProxyOnly(4242));
+    }
+
+    #[test]
+    fn proxy_tool_without_a_port_is_an_error_not_full_network() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut config = make_simple_config(sandbox_root);
+        config.tools.get_mut("mytool").unwrap().proxy =
+            Some(crate::proxy::ProxyPolicy { routes: Vec::new() });
+
+        let result = build_tool_policy("mytool", &config, None);
+        assert!(matches!(
+            result,
+            Err(PolicyError::ProxyPortMismatch {
+                proxy_tool: true,
+                ..
+            })
+        ));
+    }
+
+    #[test]
+    fn ordinary_tool_with_a_port_is_an_error() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let config = make_simple_config(sandbox_root);
+
+        let result = build_tool_policy("mytool", &config, Some(4242));
+        assert!(matches!(
+            result,
+            Err(PolicyError::ProxyPortMismatch {
+                proxy_tool: false,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -404,7 +482,7 @@ mod tests {
             )],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
 
         for path in &policy.read_paths {
             assert!(
@@ -428,7 +506,7 @@ mod tests {
         let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
         let config = make_simple_config(sandbox_root);
 
-        let result = build_tool_policy("mytool", &config);
+        let result = build_tool_policy("mytool", &config, None);
         assert!(result.is_ok(), "should succeed for existing tool");
     }
 
@@ -438,7 +516,7 @@ mod tests {
         let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
         let config = make_simple_config(sandbox_root);
 
-        let result = build_tool_policy("nonexistent", &config);
+        let result = build_tool_policy("nonexistent", &config, None);
         assert!(result.is_err(), "should fail for unknown tool");
 
         let err = match result {
@@ -635,6 +713,7 @@ mod tests {
             sandbox_root: sandbox_root.clone(),
             socket_path: sandbox_root.join("airlock.sock"),
             pid_path: sandbox_root.join("airlock.pid"),
+            ca_path: sandbox_root.join("airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read,
             filesystem_write,
@@ -829,7 +908,7 @@ mod tests {
             )],
         );
 
-        let policy = build_tool_policy("mytool", &config).unwrap();
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
 
         // read_paths: global reads + tool extra_read
         assert_eq!(policy.read_paths.len(), 3);
@@ -852,6 +931,6 @@ mod tests {
         );
 
         // Network always enabled.
-        assert!(policy.requires_network);
+        assert_eq!(policy.network, NetworkAccess::Full);
     }
 }

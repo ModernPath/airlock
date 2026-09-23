@@ -22,7 +22,7 @@
 //! suitable for NDJSON serialization.
 
 use std::io;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use aho_corasick::AhoCorasick;
 use base64::Engine;
@@ -104,6 +104,10 @@ fn finalize(patterns: Vec<Vec<u8>>, replacements: Vec<String>) -> Result<Redacto
 }
 
 // ─── Redactor ─────────────────────────────────────────────────────────────────
+
+/// The daemon's live redactor. Refresh tasks swap the inner `Arc`; a reader
+/// clones it to get a snapshot that later swaps do not affect.
+pub type RedactorSwap = Arc<RwLock<Arc<Redactor>>>;
 
 /// A redaction scanner backed by an Aho-Corasick automaton.
 ///
@@ -219,14 +223,116 @@ impl Redactor {
         }
     }
 
-    /// Returns the number of patterns in the automaton.
+    /// The length of the longest prefix of `buf` whose redaction is already
+    /// decided, and the number of matches inside it.
     ///
-    /// Useful for testing that all encoding variants are present.
-    pub fn pattern_count(&self) -> usize {
-        match &self.automaton {
-            Some(automaton) => automaton.patterns_len(),
-            None => 0,
+    /// The automaton reports a match at the position its last byte lands on,
+    /// so a match found in `buf` can never be created, extended or displaced
+    /// by bytes that arrive later. What later bytes *can* do is complete a
+    /// pattern that starts near the end of `buf`, and such a pattern must
+    /// begin within the last `max_pattern_len - 1` bytes. Everything before
+    /// that — and everything up to the end of the last match, which the
+    /// non-overlapping scan resumes from — is settled.
+    fn settled_prefix(&self, buf: &[u8]) -> (usize, usize) {
+        let Some(automaton) = &self.automaton else {
+            return (buf.len(), 0);
+        };
+        let mut matches = 0;
+        let mut end_of_last_match = 0;
+        for m in automaton.find_iter(buf) {
+            matches += 1;
+            end_of_last_match = m.end();
         }
+        let unfinishable = buf
+            .len()
+            .saturating_sub(automaton.max_pattern_len().saturating_sub(1));
+        (end_of_last_match.max(unfinishable), matches)
+    }
+}
+
+// ─── Incremental streaming redaction ──────────────────────────────────────────
+
+/// Chunk-wise redaction for callers that hold the pieces themselves.
+///
+/// Feeding a stream through [`StreamRedactor::push`] and finally
+/// [`StreamRedactor::finish`] yields, concatenated, exactly what
+/// [`Redactor::redact_bytes`] produces for the whole stream — for *any*
+/// chunking, including one that cuts a secret in half. Chunks that could still
+/// turn out to be the start of a pattern are held back until the next one
+/// arrives, so the memory held between chunks never exceeds the longest
+/// pattern.
+///
+/// This is the counterpart of [`Redactor::redact_stream`] for data that
+/// arrives as owned buffers rather than through a blocking `Read`: the proxy's
+/// response path drives it from a `poll` with no thread and no channel behind
+/// it, so backpressure is whatever the caller's own polling imposes.
+pub struct StreamRedactor {
+    redactor: Arc<Redactor>,
+    /// Trailing bytes a pattern could still be starting in.
+    carry: Vec<u8>,
+    redactions: usize,
+}
+
+impl StreamRedactor {
+    /// Start a stream against a snapshot of the redactor.
+    pub fn new(redactor: Arc<Redactor>) -> Self {
+        StreamRedactor {
+            redactor,
+            carry: Vec::new(),
+            redactions: 0,
+        }
+    }
+
+    /// Feed the next chunk and take back whatever is now settled.
+    pub fn push(&mut self, chunk: &[u8]) -> Vec<u8> {
+        self.carry.extend_from_slice(chunk);
+        let (settled, matches) = self.redactor.settled_prefix(&self.carry);
+        self.redactions += matches;
+        let out = self.redactor.redact_bytes(&self.carry[..settled]);
+        self.carry.drain(..settled);
+        out
+    }
+
+    /// Flush the held-back tail. Nothing more may be pushed afterwards — at
+    /// end of stream there is no later byte to hold anything back for.
+    pub fn finish(&mut self) -> Vec<u8> {
+        let (_, matches) = self.redactor.settled_prefix(&self.carry);
+        self.redactions += matches;
+        let out = self.redactor.redact_bytes(&self.carry);
+        self.carry.clear();
+        out
+    }
+
+    /// How many secret occurrences have been replaced so far. Counted, never
+    /// the bytes themselves.
+    pub fn redactions(&self) -> usize {
+        self.redactions
+    }
+
+    /// Bytes currently held back. Tests assert the bound; nothing else needs
+    /// to know.
+    #[cfg(test)]
+    fn carry_len(&self) -> usize {
+        self.carry.len()
+    }
+}
+
+#[cfg(test)]
+impl Redactor {
+    /// The number of patterns in the automaton, so tests can check that every
+    /// encoding variant is present.
+    fn pattern_count(&self) -> usize {
+        self.automaton
+            .as_ref()
+            .map_or(0, |automaton| automaton.patterns_len())
+    }
+
+    /// The longest pattern in the automaton, which bounds what a
+    /// [`StreamRedactor`] can be holding between chunks.
+    fn longest_pattern(&self) -> usize {
+        self.automaton
+            .as_ref()
+            .map_or(0, |automaton| automaton.max_pattern_len())
     }
 }
 
@@ -652,6 +758,127 @@ mod tests {
             text.contains("[REDACTED:CHUNK]"),
             "streaming should handle chunk boundaries, got: {text}"
         );
+    }
+
+    // ── Incremental streaming redaction ───────────────────────────────────
+
+    /// Drive a [`StreamRedactor`] over `input` cut at `splits` and return the
+    /// concatenated output.
+    fn stream_in_chunks(redactor: &Arc<Redactor>, input: &[u8], chunks: &[&[u8]]) -> Vec<u8> {
+        let mut stream = StreamRedactor::new(Arc::clone(redactor));
+        let mut out = Vec::new();
+        for chunk in chunks {
+            out.extend_from_slice(&stream.push(chunk));
+            assert!(
+                stream.carry_len() < redactor.longest_pattern().max(1),
+                "the held-back tail must stay under the longest pattern"
+            );
+        }
+        out.extend_from_slice(&stream.finish());
+        assert_eq!(
+            redactor.redact_bytes(input),
+            out,
+            "chunked output must equal whole-input redaction"
+        );
+        out
+    }
+
+    fn streaming_fixture() -> (Arc<Redactor>, Vec<u8>) {
+        let secret = Secret::new("s3cret-value".to_string());
+        let other = Secret::new("s3cret".to_string());
+        let redactor = Arc::new(Redactor::new([("API_KEY", &secret), ("SHORT", &other)]).unwrap());
+
+        let mut input = Vec::new();
+        input.extend_from_slice(b"prefix s3cret-value middle ");
+        input.extend_from_slice(encode_base64("s3cret-value").as_bytes());
+        input.extend_from_slice(b" then ");
+        input.extend_from_slice(encode_hex("s3cret-value").as_bytes());
+        input.extend_from_slice(b" and s3cret alone, s3cret-valu (partial), tail");
+        (redactor, input)
+    }
+
+    #[test]
+    fn streaming_any_two_way_split_equals_whole_input() {
+        let (redactor, input) = streaming_fixture();
+        for split in 0..=input.len() {
+            let (a, b) = input.split_at(split);
+            stream_in_chunks(&redactor, &input, &[a, b]);
+        }
+    }
+
+    #[test]
+    fn streaming_any_fixed_chunk_size_equals_whole_input() {
+        let (redactor, input) = streaming_fixture();
+        for size in 1..=input.len() {
+            let chunks: Vec<&[u8]> = input.chunks(size).collect();
+            stream_in_chunks(&redactor, &input, &chunks);
+        }
+    }
+
+    #[test]
+    fn streaming_splits_inside_a_match_and_around_a_replacement() {
+        let secret = Secret::new("abcdef".to_string());
+        let redactor = Arc::new(Redactor::new([("KEY", &secret)]).unwrap());
+        // Two adjacent occurrences: a split anywhere between them lands inside
+        // a match, and the emitted replacement is longer than what it
+        // replaced, so output and input offsets no longer line up.
+        let input = b"xxabcdefabcdefyy".to_vec();
+        for split in 0..=input.len() {
+            let (a, b) = input.split_at(split);
+            let out = stream_in_chunks(&redactor, &input, &[a, b]);
+            assert_eq!(out, b"xx[REDACTED:KEY][REDACTED:KEY]yy");
+        }
+    }
+
+    #[test]
+    fn streaming_byte_at_a_time_redacts_every_variant() {
+        let (redactor, input) = streaming_fixture();
+        let chunks: Vec<&[u8]> = input.chunks(1).collect();
+        let out = stream_in_chunks(&redactor, &input, &chunks);
+        let text = String::from_utf8_lossy(&out);
+        assert!(
+            !text.contains("s3cret"),
+            "no spelling of the secret may survive a one-byte-at-a-time stream: {text}"
+        );
+    }
+
+    #[test]
+    fn streaming_counts_redactions_without_logging_bytes() {
+        let secret = Secret::new("abcdef".to_string());
+        let redactor = Arc::new(Redactor::new([("KEY", &secret)]).unwrap());
+        let mut stream = StreamRedactor::new(redactor);
+        stream.push(b"one abc");
+        stream.push(b"def two abcdef");
+        stream.finish();
+        assert_eq!(stream.redactions(), 2);
+    }
+
+    #[test]
+    fn streaming_with_no_secrets_passes_everything_through() {
+        let redactor =
+            Arc::new(Redactor::new(std::iter::empty::<(&str, &Secret<String>)>()).unwrap());
+        let mut stream = StreamRedactor::new(redactor);
+        let mut out = stream.push(b"hello ");
+        out.extend_from_slice(&stream.push(b"world"));
+        out.extend_from_slice(&stream.finish());
+        assert_eq!(out, b"hello world");
+        assert_eq!(stream.redactions(), 0);
+    }
+
+    #[test]
+    fn streaming_holds_back_a_partial_match_at_the_end_of_a_chunk() {
+        let secret = Secret::new("tail-secret".to_string());
+        let redactor = Arc::new(Redactor::new([("KEY", &secret)]).unwrap());
+        let mut stream = StreamRedactor::new(redactor);
+
+        let mut out = stream.push(b"ends with tail-se");
+        assert!(
+            !out.ends_with(b"tail-se"),
+            "bytes that could still be the start of a secret must not be handed on"
+        );
+        out.extend_from_slice(&stream.push(b"cret and more"));
+        out.extend_from_slice(&stream.finish());
+        assert_eq!(out, b"ends with [REDACTED:KEY] and more");
     }
 
     // ── Lossy UTF-8 conversion utility ────────────────────────────────────

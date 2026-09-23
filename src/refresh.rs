@@ -12,17 +12,23 @@
 //! - Per-secret state lives in `RwLock<SecretSlot>` keyed inside a fixed
 //!   `Arc<HashMap<...>>` ([`SecretStore`]). The lock is held only for the
 //!   microseconds it takes to swap an `Arc` or read/clone health.
-//! - The redactor is shared as `Arc<RwLock<Arc<Redactor>>>`. Connection
-//!   handlers snapshot the inner `Arc<Redactor>` once at accept time, so
-//!   in-flight streams keep their old redactor for their lifetime.
+//! - The redactor is shared as [`RedactorSwap`]. An exec snapshots the
+//!   inner `Arc<Redactor>` once, right after it reads the tool's secrets, and
+//!   keeps that snapshot for the child's lifetime.
 //! - On every successful refresh the redactor is rebuilt with two generations
-//!   per refreshable secret (current + previous). The retired previous value
+//!   per refreshed secret (current + previous) and swapped in *before* the
+//!   new value is published to the slot, so no reader can ever hand a secret
+//!   upstream that the live redactor doesn't know. The retired previous value
 //!   drops one cycle later — this is a deliberate trade-off against
 //!   `Secret<T>`'s eager-zeroize guarantee, in exchange for closing the
 //!   redaction gap during a swap.
+//! - Rebuild, swap and publish run under one mutex in `RefreshShared`,
+//!   shared by all refresh tasks. The rebuild reads every slot, so two overlapping
+//!   refreshes could otherwise swap in a redactor built before the other one
+//!   published, and it would miss a value the proxy is already injecting.
 
 use std::collections::HashMap;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use tokio::sync::watch;
@@ -30,11 +36,33 @@ use tokio::task::JoinSet;
 
 use crate::config::{CommandEnv, Config, RefreshSpec, SecretSource};
 use crate::daemon::RingBuffer;
-use crate::redact::Redactor;
+use crate::redact::{Redactor, RedactorSwap};
 use crate::secrets::{Health, Secret, SecretStore, run_command_secret};
 
 /// Initial sleep before the first retry after a refresh failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
+
+/// What all refresh tasks share.
+pub(crate) struct RefreshShared {
+    store: SecretStore,
+    redactor_swap: RedactorSwap,
+    /// The value each refreshed secret held before its latest refresh, keyed
+    /// by label. Every redactor rebuild includes these, and the mutex
+    /// serializes refreshes (see the module docs).
+    previous: Mutex<HashMap<String, Arc<Secret<String>>>>,
+    ring: RingBuffer,
+}
+
+impl RefreshShared {
+    pub(crate) fn new(store: SecretStore, redactor_swap: RedactorSwap, ring: RingBuffer) -> Self {
+        RefreshShared {
+            store,
+            redactor_swap,
+            previous: Mutex::default(),
+            ring,
+        }
+    }
+}
 
 /// Spawn one refresh task per `[secrets.<label>]` entry that declares
 /// `refresh = N`. Returns the task set and a shutdown sender — set the
@@ -42,11 +70,12 @@ const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 pub fn spawn_all(
     config: &Config,
     store: SecretStore,
-    redactor_swap: Arc<RwLock<Arc<Redactor>>>,
+    redactor_swap: RedactorSwap,
     ring: RingBuffer,
 ) -> (JoinSet<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let mut set = JoinSet::new();
+    let shared = Arc::new(RefreshShared::new(store, redactor_swap, ring));
 
     for (label, spec) in &config.secrets {
         let SecretSource::Command {
@@ -64,9 +93,7 @@ pub fn spawn_all(
             timeout: *timeout,
             refresh: refresh.clone(),
             env: env.clone(),
-            store: Arc::clone(&store),
-            redactor_swap: Arc::clone(&redactor_swap),
-            ring: ring.clone(),
+            shared: Arc::clone(&shared),
             shutdown: rx.clone(),
         };
         set.spawn(task.run());
@@ -98,9 +125,7 @@ struct RefreshTask {
     timeout: Duration,
     refresh: RefreshSpec,
     env: CommandEnv,
-    store: SecretStore,
-    redactor_swap: Arc<RwLock<Arc<Redactor>>>,
-    ring: RingBuffer,
+    shared: Arc<RefreshShared>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -124,12 +149,10 @@ impl RefreshTask {
             let argv = self.argv.clone();
             let timeout = self.timeout;
             let env = self.env.clone();
-            let store = Arc::clone(&self.store);
-            let redactor_swap = Arc::clone(&self.redactor_swap);
-            let ring = self.ring.clone();
+            let shared = Arc::clone(&self.shared);
 
             let res = tokio::task::spawn_blocking(move || {
-                refresh_once(&label, &argv, timeout, &env, &store, &redactor_swap, &ring)
+                refresh_once(&label, &argv, timeout, &env, &shared)
             })
             .await
             .unwrap_or_else(|join_err| Err(format!("refresh task panicked: {join_err}")));
@@ -148,42 +171,55 @@ impl RefreshTask {
     }
 }
 
-/// Run one refresh attempt synchronously. On success, swap the slot's value
-/// to the freshly-fetched one, mark `Healthy`, and rebuild the redactor with
-/// two generations per refreshable secret. On failure, mark the slot
-/// `Stale`, leave the value alone (so its bytes still feed the redactor),
-/// and log to the ring buffer.
+/// Run one refresh attempt synchronously. On success, rebuild the redactor
+/// with two generations for this secret and swap it in, then publish the
+/// freshly-fetched value to the slot and mark it `Healthy`. On failure, mark
+/// the slot `Stale`, leave the value alone (so its bytes still feed the
+/// redactor), and log to the ring buffer.
+///
+/// The redactor must be swapped *before* the slot is published: anything
+/// that reads the slot (the proxy's credential injection, exec's env
+/// building) may send the new value upstream immediately, and the redactor
+/// snapshot taken for that response has to already know it. Publishing
+/// first would open a window where an echoing upstream returns the new
+/// secret to the tool in plaintext.
 pub(crate) fn refresh_once(
     label: &str,
     argv: &[String],
     timeout: Duration,
     env: &CommandEnv,
-    store: &SecretStore,
-    redactor_swap: &RwLock<Arc<Redactor>>,
-    ring: &RingBuffer,
+    shared: &RefreshShared,
 ) -> Result<(), String> {
+    let RefreshShared {
+        store,
+        redactor_swap,
+        previous,
+        ring,
+    } = shared;
     match run_command_secret(argv, timeout, env) {
         Ok(value) => {
             let new_value = Arc::new(Secret::new(value));
-            let (previous_value, was_stale) = {
-                let slot_lock = store
-                    .get(label)
-                    .ok_or_else(|| format!("secret label {label:?} missing from store"))?;
-                let mut slot = slot_lock.write().unwrap_or_else(|e| e.into_inner());
-                let prev = Arc::clone(&slot.value);
-                let was_stale = matches!(slot.health, Health::Stale { .. });
-                slot.value = Arc::clone(&new_value);
-                slot.health = Health::Healthy;
-                (prev, was_stale)
-            };
+            let slot_lock = store
+                .get(label)
+                .ok_or_else(|| format!("secret label {label:?} missing from store"))?;
 
-            rebuild_redactor(
-                store,
-                label,
-                &new_value,
-                Some(&previous_value),
-                redactor_swap,
-            )?;
+            // Held until the new value is published; see the module docs.
+            let mut previous = previous.lock().unwrap_or_else(|e| e.into_inner());
+            let previous_value = {
+                let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+                Arc::clone(&slot.value)
+            };
+            previous.insert(label.to_string(), previous_value);
+
+            rebuild_redactor(store, &previous, label, &new_value, redactor_swap)?;
+
+            let was_stale = {
+                let mut slot = slot_lock.write().unwrap_or_else(|e| e.into_inner());
+                let was_stale = matches!(slot.health, Health::Stale { .. });
+                slot.value = new_value;
+                slot.health = Health::Healthy;
+                was_stale
+            };
             if was_stale {
                 ring.log(format!(
                     "secret refresh recovered for {label} (now healthy)"
@@ -208,26 +244,27 @@ pub(crate) fn refresh_once(
     }
 }
 
-/// Rebuild the shared [`Redactor`] from the current store, plus an extra
-/// "previous" generation for the secret that just got refreshed.
+/// Rebuild the shared [`Redactor`] from the current store and the previous
+/// generation of every refreshed secret, with `refreshed_current` standing
+/// in for the not-yet-published value of `refreshed_label`.
 fn rebuild_redactor(
     store: &SecretStore,
+    previous: &HashMap<String, Arc<Secret<String>>>,
     refreshed_label: &str,
     refreshed_current: &Arc<Secret<String>>,
-    refreshed_previous: Option<&Arc<Secret<String>>>,
-    redactor_swap: &RwLock<Arc<Redactor>>,
+    redactor_swap: &RedactorSwap,
 ) -> Result<(), String> {
     let mut owned: HashMap<String, Vec<Arc<Secret<String>>>> = HashMap::with_capacity(store.len());
     for (label, slot_lock) in store.iter() {
-        let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
-        owned.insert(label.clone(), vec![Arc::clone(&slot.value)]);
-    }
-    if let Some(prev) = refreshed_previous
-        && let Some(gens) = owned.get_mut(refreshed_label)
-    {
-        gens.clear();
-        gens.push(Arc::clone(refreshed_current));
-        gens.push(Arc::clone(prev));
+        let current = if label == refreshed_label {
+            Arc::clone(refreshed_current)
+        } else {
+            let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+            Arc::clone(&slot.value)
+        };
+        let mut gens = vec![current];
+        gens.extend(previous.get(label).cloned());
+        owned.insert(label.clone(), gens);
     }
 
     let refs: Vec<(&str, &[Arc<Secret<String>>])> = owned
@@ -248,8 +285,9 @@ mod tests {
     use crate::secrets::{Health, SecretSlot};
     use std::collections::HashMap;
     use std::path::PathBuf;
+    use std::sync::RwLock;
 
-    fn empty_redactor_swap() -> Arc<RwLock<Arc<Redactor>>> {
+    fn empty_redactor_swap() -> RedactorSwap {
         let r = Redactor::new(std::iter::empty()).unwrap();
         Arc::new(RwLock::new(Arc::new(r)))
     }
@@ -317,42 +355,42 @@ mod tests {
 
     #[test]
     fn refresh_once_replaces_value_and_marks_healthy() {
-        let store = store_with("TOK", "old");
-        let swap = empty_redactor_swap();
-        let ring = RingBuffer::new();
+        let shared = &RefreshShared::new(
+            store_with("TOK", "old"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
 
         let res = refresh_once(
             "TOK",
             &echo_argv("new-value"),
             Duration::from_secs(2),
             &CommandEnv::default(),
-            &store,
-            &swap,
-            &ring,
+            shared,
         );
         assert!(res.is_ok(), "{res:?}");
-        assert_eq!(read_value(&store, "TOK"), "new-value");
-        assert!(matches!(read_health(&store, "TOK"), Health::Healthy));
+        assert_eq!(read_value(&shared.store, "TOK"), "new-value");
+        assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
     }
 
     #[test]
     fn refresh_once_rebuilds_redactor_with_both_generations() {
-        let store = store_with("TOK", "old-value");
-        let swap = empty_redactor_swap();
-        let ring = RingBuffer::new();
+        let shared = &RefreshShared::new(
+            store_with("TOK", "old-value"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
 
         refresh_once(
             "TOK",
             &echo_argv("new-value"),
             Duration::from_secs(2),
             &CommandEnv::default(),
-            &store,
-            &swap,
-            &ring,
+            shared,
         )
         .unwrap();
 
-        let redactor = swap.read().unwrap().clone();
+        let redactor = shared.redactor_swap.read().unwrap().clone();
         let out = redactor.redact_bytes(b"saw old-value and new-value here");
         let s = String::from_utf8_lossy(&out);
         assert!(!s.contains("old-value"), "old generation not redacted: {s}");
@@ -360,27 +398,62 @@ mod tests {
     }
 
     #[test]
+    fn refreshing_one_secret_keeps_the_previous_generation_of_another() {
+        let mut map = HashMap::new();
+        for (label, value) in [("A", "a-old-value"), ("B", "b-old-value")] {
+            map.insert(
+                label.to_string(),
+                RwLock::new(SecretSlot {
+                    value: Arc::new(Secret::new(value.to_string())),
+                    health: Health::Healthy,
+                }),
+            );
+        }
+        let shared = &RefreshShared::new(Arc::new(map), empty_redactor_swap(), RingBuffer::new());
+
+        for (label, value) in [("A", "a-new-value"), ("B", "b-new-value")] {
+            refresh_once(
+                label,
+                &echo_argv(value),
+                Duration::from_secs(2),
+                &CommandEnv::default(),
+                shared,
+            )
+            .unwrap();
+        }
+
+        let redactor = shared.redactor_swap.read().unwrap().clone();
+        let out = redactor.redact_bytes(b"a-old-value a-new-value b-old-value b-new-value");
+        let s = String::from_utf8_lossy(&out);
+        assert!(!s.contains("-value"), "a generation was not redacted: {s}");
+    }
+
+    #[test]
     fn refresh_once_failure_marks_stale_and_keeps_value() {
-        let store = store_with("TOK", "still-good-for-now");
-        let swap = empty_redactor_swap();
-        let ring = RingBuffer::new();
+        let shared = &RefreshShared::new(
+            store_with("TOK", "still-good-for-now"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
 
         let res = refresh_once(
             "TOK",
             &nonexistent_argv(),
             Duration::from_secs(1),
             &CommandEnv::default(),
-            &store,
-            &swap,
-            &ring,
+            shared,
         );
         assert!(res.is_err());
         // Value preserved.
-        assert_eq!(read_value(&store, "TOK"), "still-good-for-now");
+        assert_eq!(read_value(&shared.store, "TOK"), "still-good-for-now");
         // Health flipped.
-        assert!(matches!(read_health(&store, "TOK"), Health::Stale { .. }));
+        assert!(matches!(
+            read_health(&shared.store, "TOK"),
+            Health::Stale { .. }
+        ));
         // Failure logged.
-        let log = ring
+        let log = shared
+            .ring
             .entries()
             .iter()
             .map(|e| e.message.clone())
@@ -394,9 +467,11 @@ mod tests {
 
     #[test]
     fn refresh_once_success_after_failure_restores_healthy() {
-        let store = store_with("TOK", "old");
-        let swap = empty_redactor_swap();
-        let ring = RingBuffer::new();
+        let shared = &RefreshShared::new(
+            store_with("TOK", "old"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
 
         // Force into Stale.
         let _ = refresh_once(
@@ -404,11 +479,12 @@ mod tests {
             &nonexistent_argv(),
             Duration::from_secs(1),
             &CommandEnv::default(),
-            &store,
-            &swap,
-            &ring,
+            shared,
         );
-        assert!(matches!(read_health(&store, "TOK"), Health::Stale { .. }));
+        assert!(matches!(
+            read_health(&shared.store, "TOK"),
+            Health::Stale { .. }
+        ));
 
         // Successful refresh restores Healthy.
         refresh_once(
@@ -416,12 +492,10 @@ mod tests {
             &echo_argv("recovered"),
             Duration::from_secs(2),
             &CommandEnv::default(),
-            &store,
-            &swap,
-            &ring,
+            shared,
         )
         .unwrap();
-        assert_eq!(read_value(&store, "TOK"), "recovered");
-        assert!(matches!(read_health(&store, "TOK"), Health::Healthy));
+        assert_eq!(read_value(&shared.store, "TOK"), "recovered");
+        assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
     }
 }

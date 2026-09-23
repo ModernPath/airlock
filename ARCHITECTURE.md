@@ -11,6 +11,9 @@ src/
 ├── secrets.rs    Secret<T> wrapper, pluggable secret sources, env clearing
 ├── refresh.rs    Background secret refresh task, exponential-backoff retry
 ├── policy.rs     ToolPolicy / AgentPolicy construction, CWD validation
+├── proxy.rs      Proxy-tool egress policy: route table, host / path matching
+│   ├── ca.rs     Per-daemon MITM CA: name constraints, leaf minting and cache
+│   └── server.rs Daemon-side interception proxy, one per exec request: CONNECT, vetting, injection
 ├── redact.rs     Aho-Corasick automaton, streaming redaction
 ├── sandbox.rs    SandboxBackend trait, macOS Seatbelt, Linux Landlock
 ├── exec.rs       Binary resolution, env construction, child spawn
@@ -43,13 +46,16 @@ main()
  │       ├─ verify_socket_permissions()  ← refuse start if not 0o700
  │       │
  │       ├─ [daemon start] daemonize()
- │       │   ├─ pipe for readiness
+ │       │   ├─ pipe for readiness (carries success, or the startup error)
  │       │   ├─ fork #1: parent waits on pipe
  │       │   ├─ setsid()
  │       │   ├─ fork #2: intermediate exits
  │       │   ├─ redirect stdio → /dev/null
  │       │   ├─ chdir("/")
- │       │   └─ signal readiness → parent exits
+ │       │   └─ signal readiness → parent exits 0
+ │       │      (a failure before that point is written into the pipe
+ │       │       instead; the parent prints it and exits 1 — the grandchild
+ │       │       has no stderr, so the pipe is its only voice)
  │       │
  │       └─ enter_async_runtime()
  │           ├─ convert std::UnixListener → tokio::UnixListener
@@ -96,15 +102,16 @@ main()
 
 ### State
 
-The daemon's shared state is wrapped in `Arc` for concurrent access across connection handlers:
+The daemon's shared state is one `DaemonShared`, built by `Daemon::start` and held in an `Arc` by every connection handler. The standalone and the embedded (`airlock run`) daemon both run through `Daemon::start` and `Daemon::serve`; they differ only in the PID file, the readiness pipe, and what ends the accept loop (SIGTERM or the `run` session's cancel signal).
 
 | Component | Type | Purpose |
 |-----------|------|---------|
-| Config | `Arc<Config>` | Parsed `airlock.toml` (immutable after startup) |
+| Config | `Config` | Parsed `airlock.toml` (immutable after startup) |
 | Secrets | `SecretStore` = `Arc<HashMap<String, RwLock<SecretSlot>>>` | Per-label slot holding `Arc<Secret<String>>` plus refresh health; the map is fixed at startup, slot contents swap on refresh |
-| Redactor | `Arc<Redactor>` | Aho-Corasick automaton for output redaction |
-| Ring buffer | `Arc<Mutex<RingBuffer>>` | Last 1000 log entries (`VecDeque<LogEntry>`) |
-| Child registry | `Arc<Mutex<HashSet<u32>>>` | PIDs of currently running children |
+| Redactor | `RedactorSwap` = `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. An exec snapshots it for the child's stdout/stderr right after reading the tool's secrets; a proxy session carries the handle itself and snapshots per response |
+| Ring buffer | `RingBuffer` | Last 1000 log entries (`Arc<Mutex<VecDeque<LogEntry>>>`, cloned into refresh tasks and proxy sessions) |
+| Child registry | `ChildRegistry` | PIDs of currently running children |
+| Proxy | `Option<Arc<ProxyShared>>` | The proxy CA and what every proxy session shares; `None` when no tool is a proxy tool |
 
 ### Connection handling
 
@@ -126,13 +133,18 @@ Daemon handler:
     Static(s) as-is and SecretRef(label) via the in-memory secret store; then
     layer the essential pass-through set (PATH, HOME, TERM, USER, TZ, and the
     standard LC_* locale family — see exec::ESSENTIAL_VARS)
- 5. Resolve timeout (per-tool override or global default)
- 6. Build ToolPolicy (merge sandbox root + global + tool paths)
- 7. Build SandboxProfile (SBPL on macOS, Landlock on Linux)
- 8. spawn(ExecRequest { binary, args, work_dir, env, sandbox_profile, timeout })
- 9. Register child PID in ChildRegistry
+ 5. Proxy tools only: bind a proxy listener on 127.0.0.1:0, then overlay the
+    daemon-owned HTTPS_PROXY / NO_PROXY / *_CA_* variables on top of step 4.
+    The ProxySession is held for the rest of the handler; dropping it aborts
+    the serve task, so every exit path takes the proxy down with the child.
+ 6. Resolve timeout (per-tool override or global default)
+ 7. Build ToolPolicy (merge sandbox root + global + tool paths), with
+    network = ProxyOnly(port) for a proxy tool and Full otherwise
+ 8. Build SandboxProfile (SBPL on macOS, Landlock on Linux)
+ 9. spawn(ExecRequest { binary, args, work_dir, env, sandbox_profile, timeout })
+10. Register child PID in ChildRegistry
 
-10. Concurrent select! loop:
+11. Concurrent select! loop:
     ├── child exit        → collect exit code, break
     ├── stdout chunk      → redact → DaemonMessage::Stdout → socket
     ├── stderr chunk      → redact → DaemonMessage::Stderr → socket
@@ -141,10 +153,73 @@ Daemon handler:
     ├── stdin timeout (2s)→ auto-close child stdin
     └── exec timeout      → SIGTERM → 5s → SIGKILL
 
-11. Drain remaining stdout/stderr
-12. Send DaemonMessage::Exit { code } or DaemonMessage::Error
-13. Unregister child PID
+12. Drain remaining stdout/stderr
+13. Send DaemonMessage::Exit { code } or DaemonMessage::Error
+14. Unregister child PID
 ```
+
+### Proxy tools
+
+A proxy tool holds no secret. Its only network path is a proxy the daemon
+binds for that one execution, which attaches the credential after the request
+has left the tool. Rationale and threat model:
+[docs/proxy-tools-design.md](docs/proxy-tools-design.md) and
+[SECURITY.md](SECURITY.md#proxy-tools).
+
+The CA is generated once per daemon in `Daemon::start` — inside the runtime, after
+the fork, so the synchronous-startup invariant is untouched — and shared as an
+`Arc` across connections. Its key stays in memory; only the certificate is
+written, to `{sandbox_root}/airlock-ca.pem`.
+
+```
+child (curl)                     daemon                         upstream
+    │                              │                                │
+    │ CONNECT api.example.com:443  │                                │
+    │  Proxy-Authorization: Basic  │                                │
+    ├─────────────────────────────►│ constant-time token compare    │
+    │                              │ port == 443?                   │
+    │                              │ find_route(host)?              │
+    │◄─────────────────────────────┤ 200, or 407 / 403              │
+    │                              │                                │
+    │ ── TLS handshake ───────────►│ leaf minted for the CONNECT    │
+    │    (client SNI ignored)      │ authority, ALPN http/1.1       │
+    │                              │                                │
+    │ GET /v1/things?page=2        │                                │
+    │  Host: api.example.com       │                                │
+    ├─────────────────────────────►│ Host == authority?             │
+    │                              │ no TE+CL, no dup CL?           │
+    │                              │ route.permits(method, path)?   │
+    │                              │ strip client's copy of the     │
+    │                              │   inject header + hop-by-hop   │
+    │                              │ secret store lookup (Stale→502)│
+    │                              │ attach prefix+secret+suffix    │
+    │                              │ force Accept-Encoding:identity,│
+    │                              │   strip Range / If-Range       │
+    │                              │ resolve host, refuse non-      │
+    │                              │   routable addrs, dial that    │
+    │                              │   exact SocketAddr             │
+    │                              ├───── TLS ≥1.2, public roots ──►│
+    │                              │◄──────── response head ────────┤
+    │                              │ content-encoded / odd framing /│
+    │                              │   206?  → 502, body unread     │
+    │                              │ redact every header value      │
+    │                              │ drop Content-Length unless the │
+    │                              │   response is bodiless         │
+    │◄──── redacted, chunked ──────┤◄──── body frames streamed ─────┤
+    │                              │ audit: method, host, path,     │
+    │                              │   decision, status, redaction  │
+    │                              │   counts (no query, no header  │
+    │                              │   values, no matched bytes)    │
+```
+
+The response never reaches the tool unexamined. Header values and body both go
+through the redactor, so what `curl -o` writes into the sandbox was already
+redacted — see [SECURITY.md](SECURITY.md#response-redaction) for what that
+covers and what fails closed.
+
+Meanwhile the sandbox holds the other end: the profile permits a TCP connect to
+that port and nothing else — no DNS, no other destination — so a tool that
+ignores `HTTPS_PROXY` gets nowhere.
 
 ### Redaction pipeline
 
@@ -170,6 +245,24 @@ select! loop → NDJSON → Unix socket → client
 ```
 
 This design keeps the automaton's streaming state machine on a dedicated blocking thread (via `spawn_blocking`) while the daemon's main loop remains fully async.
+
+The proxy's response path does not use this bridge. It already holds the bytes
+as owned frames handed to it by hyper, so it drives a `StreamRedactor` — an
+incremental redactor that keeps between chunks only the bytes a pattern could
+still be starting in, and whose output for any chunking is what `redact_bytes`
+makes of the whole input — directly from `poll_frame`. No thread and no channel
+per response: hyper's polling is the backpressure, and dropping the response
+stops the upstream read.
+
+Both paths take their redactor from the same `Arc<RwLock<Arc<Redactor>>>`. An
+exec snapshots it once for the child's stdout and stderr, right after it reads
+the secrets the child is spawned with. A refresh swaps the redactor before it
+publishes a new value, so that snapshot knows every value in the child's
+environment; one taken when the connection opened would miss a refresh that
+lands before the client sends its request. A proxy response
+snapshots it per response, because the proxy injects whatever the store holds
+at that moment and a token refreshed mid-exec must be redacted on the way
+back.
 
 ## Wire protocol
 
@@ -247,7 +340,11 @@ When a `command` secret declares `refresh = N`, a dedicated tokio task is
 spawned in the async runtime to re-run the command every `N` seconds and swap
 the in-memory value. The redactor is rebuilt on each successful refresh and
 keeps both the new and previous-generation values for one cycle, so output
-captured just before the swap is still redacted. On failure, the slot's
+captured just before the swap is still redacted. The rebuilt redactor is
+swapped in *before* the new value is published to the slot: the proxy reads
+the slot per request, so any other order would let an echoing upstream hand
+the fresh credential back through a redactor that has never seen it. On
+failure, the slot's
 health flips to `Stale`, the previous value is retained but the exec path
 refuses to inject it, and the task retries with exponential backoff capped
 at `refresh_max_backoff` until the upstream recovers.
@@ -333,7 +430,15 @@ On unsupported platforms, the sandbox is a no-op (only `setpgid` in `pre_exec`),
 | `rustix` | Typed safe wrappers for `umask`, `setrlimit`, `prctl`, `test_kill_process` |
 | `zeroize` | Backs `Secret<T>` drop semantics (zero on drop) |
 | `anyhow` / `thiserror` | Error handling |
-| `landlock` | Linux Landlock LSM (Linux-only) |
+| `landlock` | Linux Landlock LSM, filesystem and TCP rules (Linux-only) |
+| `rustls` / `tokio-rustls` | TLS in both directions of the proxy (ring provider, installed explicitly) |
+| `rcgen` | Proxy CA and leaf certificate generation |
+| `hyper` / `hyper-util` / `http-body-util` | HTTP/1.1 server and client for the proxy |
+| `bytes` | Body buffers on the proxy path |
+| `webpki-roots` | Public trust anchors for upstream verification |
+| `time` | Certificate validity windows |
+| `getrandom` | CSPRNG for the per-exec proxy token |
+| `subtle` | Constant-time comparison of the proxy token |
 
 ## Build
 

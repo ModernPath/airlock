@@ -187,7 +187,7 @@ pub fn resolve_binary(tool_name: &str) -> Result<PathBuf, ExecError> {
 /// The returned map contains exactly:
 /// - The tool's declared `secrets` (already unwrapped from `Secret<String>`
 ///   by the caller; this function does not interact with the `redact` crate).
-/// - Essential pass-through variables (see [`ESSENTIAL_VARS`]) — process
+/// - Essential pass-through variables (see `ESSENTIAL_VARS`) — process
 ///   basics, terminal, timezone, and the standard locale family — copied
 ///   from the daemon's environment. An essential variable absent from the
 ///   daemon's environment is silently omitted; this is not an error.
@@ -901,12 +901,12 @@ mod tests {
     #[test]
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn exec_request_can_be_constructed_and_accepted_by_spawn() {
-        use crate::sandbox::{SandboxBackend, ToolPolicy};
+        use crate::sandbox::{NetworkAccess, SandboxBackend, ToolPolicy};
 
         let policy = ToolPolicy {
             read_paths: vec![PathBuf::from("/tmp")],
             read_write_paths: vec![],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 
@@ -1060,7 +1060,7 @@ mod tests {
     #[tokio::test]
     async fn landlock_fd_closed_in_parent_after_spawn() {
         use crate::sandbox::linux::{FdClosedProbe, LinuxLandlock};
-        use crate::sandbox::{SandboxBackend, ToolPolicy};
+        use crate::sandbox::{NetworkAccess, SandboxBackend, ToolPolicy};
 
         let mut read_paths: Vec<PathBuf> = vec![
             PathBuf::from("/usr/lib"),
@@ -1079,7 +1079,7 @@ mod tests {
         let policy = ToolPolicy {
             read_paths,
             read_write_paths: vec![PathBuf::from("/tmp")],
-            requires_network: false,
+            network: NetworkAccess::None,
             binary_path: None,
         };
 

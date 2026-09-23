@@ -19,6 +19,8 @@
 //! threads in an undefined state in the child.
 
 use std::collections::{HashSet, VecDeque};
+use std::future::Future;
+use std::os::unix::io::FromRawFd;
 use std::os::unix::net as unix_net;
 use std::os::unix::process::ExitStatusExt;
 use std::path::{Path, PathBuf};
@@ -26,12 +28,16 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::Duration;
 
 use thiserror::Error;
+use tokio::sync::watch;
+use tokio::task::JoinSet;
 
 use crate::config::{self, Config, ConfigError};
 use crate::exec;
 use crate::policy;
 use crate::protocol::{ClientMessage, DaemonMessage, LogEntry};
-use crate::redact::{self, RedactError, Redactor};
+use crate::proxy::ca::{CaError, ProxyCa};
+use crate::proxy::server::{ProxySession, ProxyShared};
+use crate::redact::{self, RedactError, Redactor, RedactorSwap};
 use crate::refresh;
 use crate::sandbox;
 use crate::secrets::{self, Health, SecretStore, SecretsError};
@@ -43,6 +49,9 @@ const RING_BUFFER_CAPACITY: usize = 1000;
 
 /// Grace period for children to exit after receiving SIGTERM during shutdown.
 const SHUTDOWN_GRACE_PERIOD: Duration = Duration::from_secs(5);
+
+/// How long shutdown waits for refresh tasks to stop before aborting them.
+const REFRESH_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Duration to wait for initial stdin before auto-closing the child's stdin pipe.
 const STDIN_TIMEOUT: Duration = Duration::from_secs(2);
@@ -161,6 +170,14 @@ pub enum DaemonError {
     /// Failed to create the tokio runtime.
     #[error("failed to create tokio runtime: {0}")]
     RuntimeCreation(std::io::Error),
+
+    /// Failed to install the SIGTERM handler.
+    #[error("failed to install SIGTERM handler: {0}")]
+    SignalHandler(std::io::Error),
+
+    /// The proxy certificate authority could not be created or published.
+    #[error("failed to set up the proxy certificate authority: {0}")]
+    ProxyCa(#[from] CaError),
 }
 
 // ─── Ring buffer logging ──────────────────────────────────────────────────────
@@ -276,23 +293,15 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 ///
 /// Supports insert, remove, and iterate-all operations. Safe to access from
 /// multiple tokio tasks concurrently.
-#[derive(Clone)]
+#[derive(Default)]
 pub struct ChildRegistry {
-    inner: Arc<Mutex<HashSet<u32>>>,
-}
-
-impl Default for ChildRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    inner: Mutex<HashSet<u32>>,
 }
 
 impl ChildRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashSet::new())),
-        }
+        Self::default()
     }
 
     /// Register a child PID. Duplicate insertions are handled gracefully.
@@ -326,9 +335,10 @@ pub struct StartupState {
     /// Per-secret slots wrapped for shared, in-place mutation by refresh tasks.
     pub secrets: SecretStore,
     /// The shared, swappable redactor. Refresh tasks rebuild it on each
-    /// successful refresh (covering current + previous generations); active
-    /// connections snapshot the inner `Arc<Redactor>` at accept time.
-    pub redactor: Arc<RwLock<Arc<Redactor>>>,
+    /// successful refresh (covering current + previous generations); an exec
+    /// snapshots the inner `Arc<Redactor>` once it has read the tool's
+    /// secrets.
+    pub redactor: RedactorSwap,
     /// The bound std UnixListener.
     pub listener: unix_net::UnixListener,
 }
@@ -377,7 +387,7 @@ pub fn synchronous_startup(
     };
 
     // 2. Stale state detection and cleanup.
-    check_and_cleanup_stale_state(&config.pid_path, &config.socket_path)?;
+    check_and_cleanup_stale_state(&config.pid_path, &config.socket_path, &config.ca_path)?;
 
     // 3. Secret collection. Wrapped per-slot so refresh tasks can later swap
     //    values in place; every slot starts `Healthy`.
@@ -439,7 +449,11 @@ pub fn synchronous_startup(
 ///   that answers (an embedded `airlock run` daemon, which writes no PID file)
 ///   yields `SocketInUse`; an unresponsive socket is removed as stale.
 /// - If neither exists, proceeds normally.
-fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<(), DaemonError> {
+fn check_and_cleanup_stale_state(
+    pid_path: &Path,
+    socket_path: &Path,
+    ca_path: &Path,
+) -> Result<(), DaemonError> {
     if pid_path.exists() {
         // Read the PID from the file.
         let contents = std::fs::read_to_string(pid_path).map_err(|e| DaemonError::PidFileRead {
@@ -463,8 +477,7 @@ fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<
         }
 
         // Process is dead (ESRCH) — stale state. Clean up.
-        let _ = std::fs::remove_file(pid_path);
-        let _ = std::fs::remove_file(socket_path);
+        remove_runtime_files([pid_path, socket_path, ca_path]);
     } else if socket_path.exists() {
         // No PID file, but a socket file is present. It is either a live
         // embedded daemon (an `airlock run` session writes no PID file) or a
@@ -477,10 +490,26 @@ fn check_and_cleanup_stale_state(pid_path: &Path, socket_path: &Path) -> Result<
                 path: socket_path.to_path_buf(),
             });
         }
-        let _ = std::fs::remove_file(socket_path);
+        remove_runtime_files([pid_path, socket_path, ca_path]);
     }
 
     Ok(())
+}
+
+/// Remove the daemon's runtime files. Returns the ones that exist but could
+/// not be removed; a file that is already gone is not an error, since which
+/// files exist depends on the mode (no PID file for an embedded daemon, no
+/// CA without a proxy tool).
+pub fn remove_runtime_files<'a>(
+    files: impl IntoIterator<Item = &'a Path>,
+) -> Vec<(&'a Path, std::io::Error)> {
+    files
+        .into_iter()
+        .filter_map(|path| match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some((path, e)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Verify the socket file has owner-only permissions.
@@ -594,16 +623,20 @@ pub fn daemonize(state: StartupState) -> Result<(), DaemonError> {
 
     if pid > 0 {
         // ── Original parent ──
-        // Close write end; wait for readiness signal on read end.
+        // Close write end; wait for the readiness verdict on the read end.
         unsafe { libc::close(write_end) };
+        let read_end = unsafe { std::fs::File::from_raw_fd(read_end) };
 
-        let mut buf = [0u8; 1];
-        // Blocking read — will return when child writes or pipe closes.
-        unsafe { libc::read(read_end, buf.as_mut_ptr() as *mut libc::c_void, 1) };
-        unsafe { libc::close(read_end) };
+        let status = match await_readiness(read_end) {
+            Ok(()) => 0,
+            Err(reason) => {
+                eprintln!("error: daemon failed to start: {reason}");
+                1
+            }
+        };
 
         // Exit without running Rust destructors.
-        unsafe { libc::_exit(0) };
+        unsafe { libc::_exit(status) };
     }
 
     // ── First child ──
@@ -636,7 +669,60 @@ pub fn daemonize(state: StartupState) -> Result<(), DaemonError> {
     }
 
     // Enter the async runtime with the readiness pipe write end.
-    run_async_runtime(state, Some(write_end), false)
+    run_async_runtime(state, Some(ReadinessPipe(write_end)), false)
+}
+
+/// Read the grandchild's verdict from the readiness pipe.
+///
+/// The grandchild's stdio is `/dev/null`, so this pipe is the only channel
+/// through which a startup failure can reach the user. A leading
+/// [`READY`] byte means the daemon is accepting connections; a leading
+/// [`FAILED`] byte is followed by the error text. EOF before either — the
+/// grandchild died, or exited with a `?` on a path that never reached the
+/// pipe — is a failure too, never a silent success.
+fn await_readiness(mut read_end: std::fs::File) -> Result<(), String> {
+    use std::io::Read;
+
+    let mut buf = Vec::new();
+    if let Err(e) = read_end.read_to_end(&mut buf) {
+        return Err(format!("readiness pipe read failed: {e}"));
+    }
+    match buf.split_first() {
+        Some((&READY, _)) => Ok(()),
+        Some((&FAILED, msg)) => Err(String::from_utf8_lossy(msg).into_owned()),
+        _ => Err("daemon exited before signalling readiness".to_string()),
+    }
+}
+
+const READY: u8 = 1;
+const FAILED: u8 = 0;
+
+/// Write end of the readiness pipe, owned by the grandchild.
+///
+/// Consumed exactly once: either [`ready`](Self::ready) once the daemon is
+/// accepting connections, or [`fail`](Self::fail) with the error that stopped
+/// it from getting there. Owning the fd (rather than passing a raw `c_int`
+/// around) is what guarantees nothing writes into it after it is closed and
+/// the descriptor number has been reused by a socket.
+pub(crate) struct ReadinessPipe(libc::c_int);
+
+impl ReadinessPipe {
+    fn ready(self) {
+        self.write_all(&[READY]);
+    }
+
+    fn fail(self, err: &DaemonError) {
+        let mut msg = vec![FAILED];
+        msg.extend_from_slice(err.to_string().as_bytes());
+        self.write_all(&msg);
+    }
+
+    fn write_all(self, bytes: &[u8]) {
+        use std::io::Write;
+        let mut file = unsafe { std::fs::File::from_raw_fd(self.0) };
+        // The parent may already be gone; there is nobody left to tell.
+        let _ = file.write_all(bytes);
+    }
 }
 
 /// Redirect stdin, stdout, and stderr to /dev/null.
@@ -692,110 +778,180 @@ pub(crate) async fn run_embedded(
     state: StartupState,
     cancel_rx: tokio::sync::oneshot::Receiver<()>,
 ) -> Result<(), DaemonError> {
-    let StartupState {
-        config,
-        secrets,
-        redactor,
-        listener: std_listener,
-    } = state;
-
-    // Convert the std listener to a tokio listener (identical to async_main).
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-    let listener =
-        tokio::net::UnixListener::from_std(std_listener).map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-
-    let config = Arc::new(config);
-
     // Embedded mode does not echo log lines to stderr — stderr belongs to the
     // agent process. Writes go to the ring buffer only.
-    let ring_buffer = RingBuffer::new();
-    let child_registry = ChildRegistry::new();
+    let daemon = Daemon::start(state, RingBuffer::new())?;
+    daemon
+        .shared
+        .ring_buffer
+        .log("embedded daemon started, accepting connections");
 
-    // Spawn per-secret refresh tasks, identical to async_main.
-    let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
-        &config,
-        Arc::clone(&secrets),
-        Arc::clone(&redactor),
-        ring_buffer.clone(),
-    );
-    let refresh_count = refresh_tasks.len();
-    if refresh_count > 0 {
-        ring_buffer.log(format!("spawned {refresh_count} secret refresh task(s)"));
-    }
-
-    // Capture paths before moving config into Arc.
-    let socket_path = config.socket_path.clone();
-    let pid_path = config.pid_path.clone();
-
-    ring_buffer.log("embedded daemon started, accepting connections".to_string());
-
-    // `oneshot::Receiver<T>` is `Unpin`, so borrowing via `&mut cancel_rx`
-    // in each select! arm is sufficient — no pinning machinery needed.
-    let mut cancel_rx = cancel_rx;
-
-    // Accept loop. The cancel oneshot is the *only* shutdown trigger:
-    // `airlock run` drops the sender once the agent child has exited. The
-    // embedded daemon must not react to SIGTERM itself (see this function's
-    // doc comment) so that it always outlives the agent it serves.
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let peer_info = format!("{:?}", addr);
-                        ring_buffer.log(format!("connection accepted from {peer_info}"));
-
-                        let rb = ring_buffer.clone();
-                        let cr = child_registry.clone();
-                        let cfg = config.clone();
-                        let sec = Arc::clone(&secrets);
-                        // Snapshot the redactor at accept time so in-flight
-                        // connections are not affected by concurrent refreshes.
-                        let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-
-                        tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr).await;
-                            rb.log(format!("connection closed ({peer_info})"));
-                        });
-                    }
-                    Err(e) => {
-                        ring_buffer.log(format!("accept error: {e}"));
-                    }
-                }
-            }
-            _ = &mut cancel_rx => {
-                ring_buffer.log("cancel signal received, initiating graceful shutdown".to_string());
-                break;
-            }
-        }
-    }
-
-    // Stop refresh tasks before tearing down children/files (same bounded
-    // 2-second wait as async_main).
-    let _ = refresh_shutdown.send(true);
-    let drain = async { while refresh_tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(2), drain)
-        .await
-        .is_err()
-    {
-        ring_buffer.log("refresh tasks did not stop within 2s; aborting".to_string());
-        refresh_tasks.abort_all();
-    }
-
-    // Graceful shutdown: signal/wait for child processes and remove the socket
-    // file. No PID file was written, so pid_path removal will fail silently
-    // (the error is logged to the ring buffer only).
-    graceful_shutdown(&child_registry, &ring_buffer, &socket_path, &pid_path).await;
+    // The cancel oneshot is the *only* shutdown trigger: `airlock run` drops
+    // the sender once the agent child has exited. The embedded daemon must
+    // not react to SIGTERM itself (see this function's doc comment) so that
+    // it always outlives the agent it serves.
+    daemon
+        .serve(async {
+            let _ = cancel_rx.await;
+            "cancel signal received"
+        })
+        .await;
 
     Ok(())
+}
+
+/// Generate the proxy CA, publish its certificate for tools to trust, and
+/// build the state every proxy session shares.
+///
+/// This runs inside the runtime and nowhere earlier: key generation is pure
+/// CPU, but it must happen after daemonization so that `synchronous_startup`
+/// stays free of anything the fork could leave in an undefined state. `None`
+/// when no tool declares `proxy = true` — a daemon with no proxy tool holds
+/// no CA and writes no certificate.
+fn publish_proxy_ca(
+    config: &Config,
+    secrets: &SecretStore,
+    redactor: &RedactorSwap,
+    ring_buffer: &RingBuffer,
+) -> Result<Option<Arc<ProxyShared>>, DaemonError> {
+    let Some(ca) = ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
+    else {
+        return Ok(None);
+    };
+    ca.write_cert_pem(&config.ca_path)?;
+    ring_buffer.log(format!(
+        "proxy CA published at {}",
+        config.ca_path.display()
+    ));
+    Ok(Some(Arc::new(ProxyShared::new(
+        ca,
+        config.ca_path.clone(),
+        Arc::clone(secrets),
+        Arc::clone(redactor),
+        ring_buffer.clone(),
+    ))))
+}
+
+// ─── Running daemon ─────────────────────────────────────────────────────────
+
+/// What every connection handler shares. Built once per daemon.
+struct DaemonShared {
+    config: Config,
+    secrets: SecretStore,
+    redactor: RedactorSwap,
+    ring_buffer: RingBuffer,
+    child_registry: ChildRegistry,
+    /// `None` when no tool is a proxy tool.
+    proxy: Option<Arc<ProxyShared>>,
+}
+
+/// A daemon that is set up and ready to accept. The standalone and the
+/// embedded daemon differ only in what they do between [`Daemon::start`] and
+/// [`Daemon::serve`], and in what ends `serve`.
+struct Daemon {
+    shared: Arc<DaemonShared>,
+    listener: tokio::net::UnixListener,
+    refresh_tasks: JoinSet<()>,
+    refresh_shutdown: watch::Sender<bool>,
+}
+
+impl Daemon {
+    /// Move the bound listener into the runtime, publish the proxy CA and
+    /// start one refresh task per refreshable secret.
+    fn start(state: StartupState, ring_buffer: RingBuffer) -> Result<Self, DaemonError> {
+        let StartupState {
+            config,
+            secrets,
+            redactor,
+            listener,
+        } = state;
+
+        let socket_bind = |source| DaemonError::SocketBind {
+            path: config.socket_path.clone(),
+            source,
+        };
+        listener.set_nonblocking(true).map_err(socket_bind)?;
+        let listener = tokio::net::UnixListener::from_std(listener).map_err(socket_bind)?;
+
+        let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
+
+        let (refresh_tasks, refresh_shutdown) = refresh::spawn_all(
+            &config,
+            Arc::clone(&secrets),
+            Arc::clone(&redactor),
+            ring_buffer.clone(),
+        );
+        if !refresh_tasks.is_empty() {
+            ring_buffer.log(format!(
+                "spawned {} secret refresh task(s)",
+                refresh_tasks.len()
+            ));
+        }
+
+        Ok(Daemon {
+            shared: Arc::new(DaemonShared {
+                config,
+                secrets,
+                redactor,
+                ring_buffer,
+                child_registry: ChildRegistry::new(),
+                proxy,
+            }),
+            listener,
+            refresh_tasks,
+            refresh_shutdown,
+        })
+    }
+
+    /// Accept connections until `shutdown` resolves to the reason it fired,
+    /// then stop the refresh tasks and shut down gracefully.
+    async fn serve(mut self, shutdown: impl Future<Output = &'static str>) {
+        let ring_buffer = &self.shared.ring_buffer;
+        tokio::pin!(shutdown);
+
+        loop {
+            tokio::select! {
+                accept_result = self.listener.accept() => {
+                    match accept_result {
+                        Ok((stream, addr)) => {
+                            let peer_info = format!("{addr:?}");
+                            ring_buffer.log(format!("connection accepted from {peer_info}"));
+
+                            let shared = Arc::clone(&self.shared);
+
+                            tokio::spawn(async move {
+                                handle_connection(stream, &shared).await;
+                                shared.ring_buffer.log(format!("connection closed ({peer_info})"));
+                            });
+                        }
+                        Err(e) => {
+                            ring_buffer.log(format!("accept error: {e}"));
+                        }
+                    }
+                }
+                reason = &mut shutdown => {
+                    ring_buffer.log(format!("{reason}, initiating graceful shutdown"));
+                    break;
+                }
+            }
+        }
+
+        // Stop refresh tasks before tearing down children/files. Bound the
+        // wait so a stuck task cannot wedge shutdown.
+        let _ = self.refresh_shutdown.send(true);
+        let drain = async { while self.refresh_tasks.join_next().await.is_some() {} };
+        if tokio::time::timeout(REFRESH_STOP_TIMEOUT, drain)
+            .await
+            .is_err()
+        {
+            ring_buffer.log(format!(
+                "refresh tasks did not stop within {REFRESH_STOP_TIMEOUT:?}; aborting"
+            ));
+            self.refresh_tasks.abort_all();
+        }
+
+        graceful_shutdown(&self.shared).await;
+    }
 }
 
 // ─── Async runtime entry point ──────────────────────────────────────────────
@@ -805,79 +961,75 @@ pub(crate) async fn run_embedded(
 /// # Arguments
 ///
 /// * `state` — The startup state bundle from the synchronous phase.
-/// * `readiness_fd` — If `Some`, the write end of the readiness pipe.
-///   A single byte is written and the fd is closed after the daemon is
-///   ready to accept connections. If `None` (foreground mode), this is a no-op.
+/// * `readiness` — If `Some`, the write end of the readiness pipe. It is
+///   answered once the daemon is accepting connections, or with the error
+///   if startup fails before that point. `None` in foreground mode.
 fn run_async_runtime(
     state: StartupState,
-    readiness_fd: Option<libc::c_int>,
+    readiness: Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
-    let runtime = tokio::runtime::Runtime::new().map_err(DaemonError::RuntimeCreation)?;
+    let runtime = match tokio::runtime::Runtime::new() {
+        Ok(rt) => rt,
+        Err(e) => {
+            let err = DaemonError::RuntimeCreation(e);
+            if let Some(pipe) = readiness {
+                pipe.fail(&err);
+            }
+            return Err(err);
+        }
+    };
 
-    runtime.block_on(async_main(state, readiness_fd, foreground))
+    runtime.block_on(async_main(state, readiness, foreground))
 }
 
 /// The async main loop of the daemon.
+///
+/// Every startup step that can fail runs before the readiness signal, so a
+/// failure here has to be reported through the pipe: once daemonized, the
+/// process has no stderr and the parent's exit status is the user's only
+/// feedback.
 async fn async_main(
     state: StartupState,
-    readiness_fd: Option<libc::c_int>,
+    mut readiness: Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
-    let StartupState {
-        config,
-        secrets,
-        redactor,
-        listener: std_listener,
-    } = state;
+    let result = async_main_inner(state, &mut readiness, foreground).await;
+    if let (Err(err), Some(pipe)) = (&result, readiness.take()) {
+        pipe.fail(err);
+    }
+    result
+}
 
-    // Convert the std listener to a tokio listener.
-    std_listener
-        .set_nonblocking(true)
-        .map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-    let listener =
-        tokio::net::UnixListener::from_std(std_listener).map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        })?;
-
-    // Wrap shared state in Arcs for concurrent access across connections.
-    // `secrets` is already `SecretStore` (Arc<HashMap<...>>); `redactor` is
-    // already `Arc<RwLock<Arc<Redactor>>>`.
-    let config = Arc::new(config);
-
-    // Create shared state. Foreground mode echoes log lines to stderr so the
-    // operator sees what the daemon is doing; daemonized mode writes to the
-    // ring buffer only (stdio is /dev/null).
+async fn async_main_inner(
+    state: StartupState,
+    readiness: &mut Option<ReadinessPipe>,
+    foreground: bool,
+) -> Result<(), DaemonError> {
+    // Foreground mode echoes log lines to stderr so the operator sees what
+    // the daemon is doing; daemonized mode writes to the ring buffer only
+    // (stdio is /dev/null).
     let ring_buffer = if foreground {
         RingBuffer::new_echoing()
     } else {
         RingBuffer::new()
     };
-    let child_registry = ChildRegistry::new();
+    let daemon = Daemon::start(state, ring_buffer)?;
 
-    // Spawn one background task per refreshable secret. Tasks live until they
-    // observe the shutdown signal or get aborted at SIGTERM.
-    let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
-        &config,
-        Arc::clone(&secrets),
-        Arc::clone(&redactor),
-        ring_buffer.clone(),
-    );
-    let refresh_count = refresh_tasks.len();
-    if refresh_count > 0 {
-        ring_buffer.log(format!("spawned {refresh_count} secret refresh task(s)"));
-    }
+    // Before the readiness signal, so a failure reaches `daemon start`, and
+    // so a SIGTERM sent as soon as it returns gets a graceful shutdown rather
+    // than the default action, which would leave the socket and PID file.
+    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+        .map_err(DaemonError::SignalHandler)?;
 
-    // Write PID file.
+    let DaemonShared {
+        config,
+        ring_buffer,
+        ..
+    } = &*daemon.shared;
+
     let pid = std::process::id();
-    let pid_path = config.pid_path.clone();
-    let socket_path = config.socket_path.clone();
-
-    if let Err(e) = write_pid_file(&pid_path, pid) {
+    if let Err(e) = write_pid_file(&config.pid_path, pid) {
         ring_buffer.log(format!("failed to write PID file: {e}"));
         return Err(e);
     }
@@ -885,71 +1037,19 @@ async fn async_main(
     ring_buffer.log(format!("daemon started (PID: {pid})"));
     ring_buffer.log(format!(
         "listening on {} — ready to accept connections",
-        socket_path.display()
+        config.socket_path.display()
     ));
 
-    // Signal readiness.
-    if let Some(fd) = readiness_fd {
-        unsafe {
-            let byte: [u8; 1] = [1];
-            libc::write(fd, byte.as_ptr() as *const libc::c_void, 1);
-            libc::close(fd);
-        }
+    if let Some(pipe) = readiness.take() {
+        pipe.ready();
     }
 
-    // Install SIGTERM handler.
-    let mut sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
-        .expect("failed to install SIGTERM handler");
-
-    // Accept loop with shutdown.
-    loop {
-        tokio::select! {
-            accept_result = listener.accept() => {
-                match accept_result {
-                    Ok((stream, addr)) => {
-                        let peer_info = format!("{:?}", addr);
-                        ring_buffer.log(format!("connection accepted from {peer_info}"));
-
-                        let rb = ring_buffer.clone();
-                        let cr = child_registry.clone();
-                        let cfg = config.clone();
-                        let sec = Arc::clone(&secrets);
-                        // Snapshot the redactor at accept time. Refresh tasks
-                        // may swap the inner Arc later; this connection keeps
-                        // its snapshot for its full lifetime.
-                        let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-
-                        tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr).await;
-                            rb.log(format!("connection closed ({peer_info})"));
-                        });
-                    }
-                    Err(e) => {
-                        ring_buffer.log(format!("accept error: {e}"));
-                    }
-                }
-            }
-            _ = sigterm.recv() => {
-                ring_buffer.log("SIGTERM received, initiating graceful shutdown".to_string());
-                break;
-            }
-        }
-    }
-
-    // Stop refresh tasks before tearing down children/files. Bound the wait
-    // so a stuck task cannot wedge shutdown.
-    let _ = refresh_shutdown.send(true);
-    let drain = async { while refresh_tasks.join_next().await.is_some() {} };
-    if tokio::time::timeout(Duration::from_secs(2), drain)
-        .await
-        .is_err()
-    {
-        ring_buffer.log("refresh tasks did not stop within 2s; aborting".to_string());
-        refresh_tasks.abort_all();
-    }
-
-    // ── Graceful shutdown ──
-    graceful_shutdown(&child_registry, &ring_buffer, &socket_path, &pid_path).await;
+    daemon
+        .serve(async move {
+            sigterm.recv().await;
+            "SIGTERM received"
+        })
+        .await;
 
     Ok(())
 }
@@ -960,15 +1060,10 @@ async fn async_main(
 ///
 /// Reads the first NDJSON line to determine the request type, dispatches to
 /// the appropriate handler, and closes the connection.
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    config: Arc<Config>,
-    secrets: SecretStore,
-    redactor: Arc<Redactor>,
-    ring_buffer: RingBuffer,
-    child_registry: ChildRegistry,
-) {
+async fn handle_connection(stream: tokio::net::UnixStream, shared: &DaemonShared) {
     use tokio_stream::StreamExt;
+
+    let ring_buffer = &shared.ring_buffer;
     use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
 
     let (reader, mut writer) = stream.into_split();
@@ -1040,19 +1135,7 @@ async fn handle_connection(
             let _ = write_ndjson_message(&mut writer, &response).await;
         }
         ClientMessage::Exec { tool, args, cwd } => {
-            handle_exec_request(
-                tool,
-                args,
-                cwd,
-                framed,
-                writer,
-                config,
-                secrets,
-                redactor,
-                ring_buffer,
-                child_registry,
-            )
-            .await;
+            handle_exec_request(tool, args, cwd, framed, writer, shared).await;
         }
         other => {
             // Unknown message type for initial request. Log only the variant
@@ -1089,6 +1172,43 @@ async fn log_and_send_error<W: tokio::io::AsyncWrite + Unpin>(
     let _ = write_ndjson_message(writer, &DaemonMessage::Error { message: msg }).await;
 }
 
+/// The tool's `env` map with every secret reference resolved, in the map's
+/// (alphabetical) order.
+///
+/// A `Stale` slot — left behind by a failed background refresh — is an
+/// error: the exec is refused rather than handing the tool a value known to
+/// be expired. Refs are validated at config load time, so a missing label
+/// is an internal invariant break; it refuses the exec too, rather than
+/// running the tool without a variable it was configured with.
+fn resolve_tool_env(
+    tool_config: &config::ToolConfig,
+    secrets: &SecretStore,
+) -> Result<Vec<(String, String)>, String> {
+    let mut env_pairs = Vec::with_capacity(tool_config.env.len());
+    for (name, value) in &tool_config.env {
+        match value {
+            config::EnvValue::Static(s) => env_pairs.push((name.clone(), s.clone())),
+            config::EnvValue::SecretRef(label) => {
+                let Some(slot_lock) = secrets.get(label) else {
+                    return Err(format!("secret {label:?} is not in the secret store"));
+                };
+                let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+                match &slot.health {
+                    Health::Healthy => {
+                        env_pairs.push((name.clone(), slot.value.expose_secret().clone()));
+                    }
+                    Health::Stale { reason, .. } => {
+                        return Err(format!(
+                            "secret {label:?} is stale (last refresh failed): {reason}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(env_pairs)
+}
+
 /// The reason the concurrent I/O loop terminated.
 enum TermReason {
     /// The child process exited with the given status.
@@ -1103,20 +1223,128 @@ enum TermReason {
     ClientLineOverflow,
 }
 
-/// Handle an exec request: validate, spawn, and manage the child's lifecycle.
-///
-/// This function implements the full exec flow:
+/// A tool that passed every check and was spawned.
+struct StartedTool {
+    spawned: exec::SpawnedChild,
+    timeout: Duration,
+    /// The redactor for the child's stdout and stderr.
+    redactor: Arc<Redactor>,
+    /// Held for as long as the exec runs. Dropping it aborts the serve task
+    /// and closes the listener, so every way out of [`handle_exec_request`]
+    /// takes the proxy down with the child.
+    _proxy_session: Option<ProxySession>,
+}
+
+/// Validate an exec request and spawn the tool:
 /// 1. Tool validation
 /// 2. CWD validation
 /// 3. Binary resolution
-/// 4. Environment construction
-/// 5. Timeout resolution
-/// 6. Policy and sandbox profile construction
-/// 7. ExecRequest assembly and spawn
-/// 8. Child registration
-/// 9. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
-/// 10. Post-loop cleanup (drain output, send exit, kill if needed)
-#[allow(clippy::too_many_arguments)]
+/// 4. Environment construction and redactor snapshot
+/// 5. Proxy session (proxy tools only): bind the listener, overlay its env
+/// 6. Timeout resolution
+/// 7. Policy and sandbox profile construction
+/// 8. ExecRequest assembly and spawn
+///
+/// An error is the message to log and send to the client.
+fn start_tool(
+    tool: &str,
+    args: Vec<String>,
+    cwd: &str,
+    shared: &DaemonShared,
+) -> Result<StartedTool, String> {
+    let DaemonShared {
+        config,
+        secrets,
+        redactor,
+        ring_buffer,
+        proxy,
+        ..
+    } = shared;
+
+    // ── 1. Tool validation ──────────────────────────────────────────────────
+    policy::validate_tool_exists(tool, config)
+        .map_err(|e| format!("unknown tool {tool:?}: {e}"))?;
+
+    // ── 2. CWD validation ───────────────────────────────────────────────────
+    let cwd_path = PathBuf::from(cwd);
+    policy::validate_cwd(&cwd_path, &config.sandbox_root)
+        .map_err(|e| format!("CWD validation failed: {e}"))?;
+
+    // ── 3. Binary resolution ────────────────────────────────────────────────
+    let binary = exec::resolve_binary(tool)
+        .map_err(|e| format!("binary resolution failed for {tool:?}: {e}"))?;
+
+    // ── 4. Environment construction ─────────────────────────────────────────
+    let tool_config = &config.tools[tool];
+    let mut env = exec::build_env(&resolve_tool_env(tool_config, secrets)?);
+
+    // Taken after the secrets are read, never earlier. A refresh swaps the
+    // redactor before it publishes the new value, so a snapshot taken now
+    // knows every value just put into `env`. One taken at accept time would
+    // miss a refresh that lands before the client sends its request, and
+    // the client chooses when that is.
+    let redactor = Arc::clone(&redactor.read().unwrap_or_else(|e| e.into_inner()));
+
+    // ── 5. Proxy session ────────────────────────────────────────────────────
+    //
+    // A proxy tool gets a listener of its own, bound now so that the port is
+    // known before the sandbox profile is built.
+    let proxy_session = match &tool_config.proxy {
+        Some(policy) => {
+            // A configured proxy tool is what makes the daemon generate a CA,
+            // so the two are present or absent together.
+            let proxy = proxy.as_ref().ok_or_else(|| {
+                format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA")
+            })?;
+            let session = ProxySession::start(tool.to_string(), policy.clone(), proxy)
+                .map_err(|e| format!("failed to start the proxy for tool {tool:?}: {e}"))?;
+            ring_buffer.log(format!(
+                "proxy for tool {tool:?} listening on 127.0.0.1:{}",
+                session.port()
+            ));
+            // Applied last so the daemon's proxy variables win over anything
+            // the tool's own `env` set.
+            session.apply_env(&mut env);
+            Some(session)
+        }
+        None => None,
+    };
+
+    // ── 6. Timeout resolution ───────────────────────────────────────────────
+    let timeout = tool_config.timeout.unwrap_or(config.timeout);
+
+    // ── 7. Policy and sandbox profile construction ──────────────────────────
+    let proxy_port = proxy_session.as_ref().map(ProxySession::port);
+    let mut tool_policy = policy::build_tool_policy(tool, config, proxy_port)
+        .map_err(|e| format!("policy construction failed for {tool:?}: {e}"))?;
+    tool_policy.binary_path = Some(binary.clone());
+
+    let sandbox_profile = build_platform_sandbox_profile(&tool_policy)
+        .map_err(|e| format!("sandbox profile construction failed for {tool:?}: {e}"))?;
+
+    // ── 8. ExecRequest assembly and spawn ───────────────────────────────────
+    let spawned = exec::spawn(exec::ExecRequest {
+        binary,
+        args,
+        work_dir: cwd_path,
+        env,
+        sandbox_profile,
+        timeout,
+    })
+    .map_err(|e| format!("spawn failed for {tool:?}: {e}"))?;
+
+    Ok(StartedTool {
+        spawned,
+        timeout,
+        redactor,
+        _proxy_session: proxy_session,
+    })
+}
+
+/// Handle an exec request: start the tool with [`start_tool`], then
+/// 9. Child registration
+/// 10. Concurrent I/O loop (output streaming, stdin forwarding, timeout, disconnect)
+/// 11. Post-loop cleanup (drain output, send exit, kill if needed)
 async fn handle_exec_request(
     tool: String,
     args: Vec<String>,
@@ -1126,149 +1354,29 @@ async fn handle_exec_request(
         tokio_util::codec::LinesCodec,
     >,
     mut writer: tokio::net::unix::OwnedWriteHalf,
-    config: Arc<Config>,
-    secrets: SecretStore,
-    redactor: Arc<Redactor>,
-    ring_buffer: RingBuffer,
-    child_registry: ChildRegistry,
+    shared: &DaemonShared,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
     use tokio_util::codec::LinesCodecError;
 
-    // ── 1. Tool validation ──────────────────────────────────────────────────
-    if let Err(e) = policy::validate_tool_exists(&tool, &config) {
-        log_and_send_error(
-            format!("unknown tool {:?}: {e}", tool),
-            &ring_buffer,
-            &mut writer,
-        )
-        .await;
-        return;
-    }
+    let DaemonShared {
+        ring_buffer,
+        child_registry,
+        ..
+    } = shared;
 
-    // ── 2. CWD validation ───────────────────────────────────────────────────
-    let cwd_path = PathBuf::from(&cwd);
-    if let Err(e) = policy::validate_cwd(&cwd_path, &config.sandbox_root) {
-        log_and_send_error(
-            format!("CWD validation failed: {e}"),
-            &ring_buffer,
-            &mut writer,
-        )
-        .await;
-        return;
-    }
-
-    // ── 3. Binary resolution ────────────────────────────────────────────────
-    let binary = match exec::resolve_binary(&tool) {
-        Ok(path) => path,
-        Err(e) => {
-            log_and_send_error(
-                format!("binary resolution failed for {:?}: {e}", tool),
-                &ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-
-    // ── 4. Environment construction ─────────────────────────────────────────
-    //
-    // Walk the tool's env map in order (BTreeMap → alphabetical). Static
-    // entries pass through; SecretRef entries take a short-lived read lock on
-    // the slot. A `Stale` slot — left behind by a failed background refresh —
-    // is a hard error: we refuse the exec rather than hand the tool a value
-    // we know to be expired. Refs are validated at config load time, so a
-    // missing label here is an internal invariant break.
-    let tool_config = &config.tools[&tool];
-    let env_build_result: Result<Vec<(String, String)>, (String, String)> = (|| {
-        let mut env_pairs: Vec<(String, String)> = Vec::with_capacity(tool_config.env.len());
-        for (name, value) in tool_config.env.iter() {
-            match value {
-                config::EnvValue::Static(s) => env_pairs.push((name.clone(), s.clone())),
-                config::EnvValue::SecretRef(label) => {
-                    let Some(slot_lock) = secrets.get(label) else {
-                        continue;
-                    };
-                    let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
-                    match &slot.health {
-                        Health::Healthy => {
-                            env_pairs.push((name.clone(), slot.value.expose_secret().clone()));
-                        }
-                        Health::Stale { reason, .. } => {
-                            return Err((label.clone(), reason.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(env_pairs)
-    })();
-    let env_pairs = match env_build_result {
-        Ok(p) => p,
-        Err((label, reason)) => {
-            log_and_send_error(
-                format!("secret {label:?} is stale (last refresh failed): {reason}"),
-                &ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-    let env = exec::build_env(&env_pairs);
-
-    // ── 5. Timeout resolution ───────────────────────────────────────────────
-    let timeout = tool_config.timeout.unwrap_or(config.timeout);
-
-    // ── 6. Policy and sandbox profile construction ──────────────────────────
-    let mut tool_policy = match policy::build_tool_policy(&tool, &config) {
-        Ok(p) => p,
-        Err(e) => {
-            log_and_send_error(
-                format!("policy construction failed for {:?}: {e}", tool),
-                &ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-    tool_policy.binary_path = Some(binary.clone());
-
-    let sandbox_profile = match build_platform_sandbox_profile(&tool_policy) {
-        Ok(p) => p,
-        Err(e) => {
-            log_and_send_error(
-                format!("sandbox profile construction failed for {:?}: {e}", tool),
-                &ring_buffer,
-                &mut writer,
-            )
-            .await;
-            return;
-        }
-    };
-
-    // ── 7. ExecRequest assembly and spawn ───────────────────────────────────
-    let request = exec::ExecRequest {
-        binary,
-        args,
-        work_dir: cwd_path,
-        env,
-        sandbox_profile,
+    // `_proxy_session` must stay a named binding: `_` or `..` would drop the
+    // session here and take the proxy down before the tool runs.
+    let StartedTool {
+        spawned,
         timeout,
-    };
-
-    let spawned = match exec::spawn(request) {
-        Ok(s) => s,
-        Err(e) => {
-            log_and_send_error(
-                format!("spawn failed for {:?}: {e}", tool),
-                &ring_buffer,
-                &mut writer,
-            )
-            .await;
+        redactor,
+        _proxy_session,
+    } = match start_tool(&tool, args, &cwd, shared) {
+        Ok(started) => started,
+        Err(msg) => {
+            log_and_send_error(msg, ring_buffer, &mut writer).await;
             return;
         }
     };
@@ -1276,11 +1384,11 @@ async fn handle_exec_request(
     let pid = spawned.pid;
     let mut child = spawned.child;
 
-    // ── 8. Child registration ───────────────────────────────────────────────
+    // ── 9. Child registration ───────────────────────────────────────────────
     child_registry.insert(pid);
     ring_buffer.log(format!("tool {:?} spawned (PID: {pid})", tool));
 
-    // ── 9. Set up redaction pipelines ───────────────────────────────────────
+    // ── 10. Set up redaction pipelines ──────────────────────────────────────
     //
     // For each output stream (stdout/stderr), the pipeline is:
     //   async reader task → std sync channel → blocking redact task → tokio mpsc → select loop
@@ -1294,7 +1402,7 @@ async fn handle_exec_request(
     let (stdout_task, mut stdout_rx) = spawn_redaction_pipeline(redactor.clone(), spawned.stdout);
     let (stderr_task, mut stderr_rx) = spawn_redaction_pipeline(redactor, spawned.stderr);
 
-    // ── 10. Concurrent I/O loop ─────────────────────────────────────────────
+    // ── 11. Concurrent I/O loop ─────────────────────────────────────────────
     let mut child_stdin: Option<tokio::process::ChildStdin> = Some(spawned.stdin);
     let mut stdin_received = false;
     let mut stdout_done = false;
@@ -1322,36 +1430,16 @@ async fn handle_exec_request(
             // Stdout redacted output.
             data = stdout_rx.recv(), if !stdout_done => {
                 match data {
-                    Some(bytes) => {
-                        let text = redact::bytes_to_lossy_utf8(&bytes);
-                        if !text.is_empty() {
-                            let _ = write_ndjson_message(
-                                &mut writer,
-                                &DaemonMessage::Stdout { data: text },
-                            ).await;
-                        }
-                    }
-                    None => {
-                        stdout_done = true;
-                    }
+                    Some(bytes) => send_output(&mut writer, &bytes, stdout_message).await,
+                    None => stdout_done = true,
                 }
             }
 
             // Stderr redacted output.
             data = stderr_rx.recv(), if !stderr_done => {
                 match data {
-                    Some(bytes) => {
-                        let text = redact::bytes_to_lossy_utf8(&bytes);
-                        if !text.is_empty() {
-                            let _ = write_ndjson_message(
-                                &mut writer,
-                                &DaemonMessage::Stderr { data: text },
-                            ).await;
-                        }
-                    }
-                    None => {
-                        stderr_done = true;
-                    }
+                    Some(bytes) => send_output(&mut writer, &bytes, stderr_message).await,
+                    None => stderr_done = true,
                 }
             }
 
@@ -1427,15 +1515,13 @@ async fn handle_exec_request(
             let _ = stderr_task.await;
 
             // Drain remaining output from channels.
-            drain_channel_to_client(&mut stdout_rx, &mut writer, true).await;
-            drain_channel_to_client(&mut stderr_rx, &mut writer, false).await;
+            drain_channel_to_client(&mut stdout_rx, &mut writer, stdout_message).await;
+            drain_channel_to_client(&mut stderr_rx, &mut writer, stderr_message).await;
 
             // Send exit message.
             let code = exit_code_from_status(status);
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code }).await;
 
-            // Clean up.
-            child_registry.remove(pid);
             ring_buffer.log(format!("tool {:?} exited (PID: {pid}, code: {code})", tool));
         }
 
@@ -1444,7 +1530,6 @@ async fn handle_exec_request(
             let _ = exec::kill_process_group(pid, libc::SIGKILL);
             let code = -1;
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code }).await;
-            child_registry.remove(pid);
             ring_buffer.log(format!("tool {:?} wait error (PID: {pid}): {e}", tool));
         }
 
@@ -1463,8 +1548,6 @@ async fn handle_exec_request(
                 timeout.as_secs()
             );
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Error { message: msg }).await;
-
-            child_registry.remove(pid);
         }
 
         TermReason::ClientDisconnect => {
@@ -1474,8 +1557,6 @@ async fn handle_exec_request(
             ));
 
             sigterm_then_sigkill(&mut child, pid).await;
-
-            child_registry.remove(pid);
             // No message to client — already disconnected.
         }
 
@@ -1497,10 +1578,10 @@ async fn handle_exec_request(
             )
             .await;
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code: -1 }).await;
-
-            child_registry.remove(pid);
         }
     }
+
+    child_registry.remove(pid);
 }
 
 // ─── Child lifecycle helpers ─────────────────────────────────────────────────
@@ -1529,25 +1610,34 @@ async fn sigterm_then_sigkill(child: &mut tokio::process::Child, pid: u32) {
 }
 
 /// Drain all remaining redacted output from a channel and send it to the client.
-///
-/// `is_stdout` selects whether to wrap each chunk as a `Stdout` or `Stderr`
-/// NDJSON message.
 async fn drain_channel_to_client<W: tokio::io::AsyncWriteExt + Unpin>(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     writer: &mut W,
-    is_stdout: bool,
+    message: fn(String) -> DaemonMessage,
 ) {
     while let Ok(bytes) = rx.try_recv() {
-        let text = redact::bytes_to_lossy_utf8(&bytes);
-        if !text.is_empty() {
-            let msg = if is_stdout {
-                DaemonMessage::Stdout { data: text }
-            } else {
-                DaemonMessage::Stderr { data: text }
-            };
-            let _ = write_ndjson_message(writer, &msg).await;
-        }
+        send_output(writer, &bytes, message).await;
     }
+}
+
+/// Send one redacted chunk to the client, wrapped by `message`.
+async fn send_output<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    message: fn(String) -> DaemonMessage,
+) {
+    let text = redact::bytes_to_lossy_utf8(bytes);
+    if !text.is_empty() {
+        let _ = write_ndjson_message(writer, &message(text)).await;
+    }
+}
+
+fn stdout_message(data: String) -> DaemonMessage {
+    DaemonMessage::Stdout { data }
+}
+
+fn stderr_message(data: String) -> DaemonMessage {
+    DaemonMessage::Stderr { data }
 }
 
 /// Set up an async reader -> sync channel -> blocking redact -> tokio mpsc pipeline
@@ -1727,12 +1817,14 @@ async fn write_ndjson_message<W: tokio::io::AsyncWriteExt + Unpin>(
 // ─── Graceful shutdown ──────────────────────────────────────────────────────
 
 /// Perform graceful shutdown: signal children, wait, cleanup files.
-async fn graceful_shutdown(
-    child_registry: &ChildRegistry,
-    ring_buffer: &RingBuffer,
-    socket_path: &Path,
-    pid_path: &Path,
-) {
+async fn graceful_shutdown(shared: &DaemonShared) {
+    let DaemonShared {
+        config,
+        ring_buffer,
+        child_registry,
+        ..
+    } = shared;
+
     // Signal all active children with SIGTERM.
     let pids = child_registry.all();
     if !pids.is_empty() {
@@ -1760,14 +1852,8 @@ async fn graceful_shutdown(
         }
     }
 
-    // Remove socket file.
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        ring_buffer.log(format!("failed to remove socket file: {e}"));
-    }
-
-    // Remove PID file.
-    if let Err(e) = std::fs::remove_file(pid_path) {
-        ring_buffer.log(format!("failed to remove PID file: {e}"));
+    for (path, e) in remove_runtime_files(config.runtime_files()) {
+        ring_buffer.log(format!("failed to remove {}: {e}", path.display()));
     }
 
     ring_buffer.log("shutdown complete".to_string());
@@ -1824,6 +1910,48 @@ fn write_pid_file(pid_path: &Path, pid: u32) -> Result<(), DaemonError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn readiness_pair() -> (std::fs::File, ReadinessPipe) {
+        let mut fds: [libc::c_int; 2] = [0; 2];
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        (read_end, ReadinessPipe(fds[1]))
+    }
+
+    #[test]
+    fn remove_runtime_files_ignores_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("airlock.sock");
+        let missing = tmp.path().join("airlock.pid");
+        std::fs::write(&present, b"").unwrap();
+
+        let failed = remove_runtime_files([present.as_path(), missing.as_path()]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(!present.exists());
+    }
+
+    #[test]
+    fn readiness_ready_byte_is_success() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.ready();
+        assert_eq!(await_readiness(read_end), Ok(()));
+    }
+
+    #[test]
+    fn readiness_failure_carries_the_error_text() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.fail(&DaemonError::AlreadyRunning { pid: 4242 });
+        let err = await_readiness(read_end).unwrap_err();
+        assert!(err.contains("4242"), "{err}");
+    }
+
+    #[test]
+    fn readiness_eof_without_a_verdict_is_failure() {
+        let (read_end, pipe) = readiness_pair();
+        pipe.write_all(&[]);
+        let err = await_readiness(read_end).unwrap_err();
+        assert!(err.contains("before signalling readiness"), "{err}");
+    }
 
     // ── Ring buffer tests ──────────────────────────────────────────────────
 
@@ -1968,11 +2096,11 @@ mod tests {
 
     #[tokio::test]
     async fn registry_concurrent_access() {
-        let reg = ChildRegistry::new();
+        let reg = Arc::new(ChildRegistry::new());
         let mut handles = Vec::new();
 
         for i in 0..10 {
-            let reg_clone = reg.clone();
+            let reg_clone = Arc::clone(&reg);
             handles.push(tokio::spawn(async move {
                 for j in 0..100 {
                     let pid = (i * 1000 + j) as u32 + 2; // Ensure PIDs >= 2
@@ -1989,6 +2117,79 @@ mod tests {
         assert_eq!(pids.len(), 1000);
     }
 
+    // ── Tool env resolution tests ──────────────────────────────────────────
+
+    fn tool_with_env(env: &[(&str, config::EnvValue)]) -> config::ToolConfig {
+        config::ToolConfig {
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+            extra_read: Vec::new(),
+            extra_write: Vec::new(),
+            timeout: None,
+            description: None,
+            proxy: None,
+        }
+    }
+
+    fn store_with(label: &str, value: &str, health: Health) -> SecretStore {
+        let slot = secrets::SecretSlot {
+            value: Arc::new(secrets::Secret::new(value.to_string())),
+            health,
+        };
+        Arc::new(
+            [(label.to_string(), RwLock::new(slot))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn resolve_tool_env_fills_in_secret_references() {
+        let tool = tool_with_env(&[
+            ("MODE", config::EnvValue::Static("ci".to_string())),
+            ("TOKEN", config::EnvValue::SecretRef("tok".to_string())),
+        ]);
+        let store = store_with("tok", "s3cret-value", Health::Healthy);
+
+        let env = resolve_tool_env(&tool, &store).unwrap();
+        assert_eq!(
+            env,
+            [
+                ("MODE".to_string(), "ci".to_string()),
+                ("TOKEN".to_string(), "s3cret-value".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_tool_env_refuses_a_label_missing_from_the_store() {
+        let tool = tool_with_env(&[("TOKEN", config::EnvValue::SecretRef("gone".to_string()))]);
+        let store = store_with("tok", "s3cret-value", Health::Healthy);
+
+        let err = resolve_tool_env(&tool, &store).unwrap_err();
+        assert!(err.contains("\"gone\""), "{err}");
+    }
+
+    #[test]
+    fn resolve_tool_env_refuses_a_stale_secret_without_naming_its_value() {
+        let tool = tool_with_env(&[("TOKEN", config::EnvValue::SecretRef("tok".to_string()))]);
+        let store = store_with(
+            "tok",
+            "s3cret-value",
+            Health::Stale {
+                reason: "command exited 1".to_string(),
+                since: std::time::Instant::now(),
+            },
+        );
+
+        let err = resolve_tool_env(&tool, &store).unwrap_err();
+        assert!(err.contains("\"tok\" is stale"), "{err}");
+        assert!(err.contains("command exited 1"), "{err}");
+        assert!(!err.contains("s3cret-value"), "{err}");
+    }
+
     // ── Stale state detection tests ────────────────────────────────────────
 
     #[test]
@@ -1996,8 +2197,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let pid_path = tmp.path().join("airlock.pid");
         let socket_path = tmp.path().join("airlock.sock");
+        let ca_path = tmp.path().join("airlock-ca.pem");
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
     }
 
@@ -2012,7 +2214,8 @@ mod tests {
         std::fs::write(&pid_path, "999999999\n").unwrap();
         std::fs::write(&socket_path, "dummy").unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
         assert!(!pid_path.exists(), "PID file should be cleaned up");
         assert!(!socket_path.exists(), "socket file should be cleaned up");
@@ -2028,7 +2231,8 @@ mod tests {
         let my_pid = std::process::id();
         std::fs::write(&pid_path, format!("{my_pid}\n")).unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_err());
         let err = result.unwrap_err();
         let msg = err.to_string();
@@ -2051,7 +2255,8 @@ mod tests {
         // No PID file, but socket exists.
         std::fs::write(&socket_path, "stale").unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(result.is_ok());
         assert!(!socket_path.exists(), "stale socket should be cleaned up");
     }
@@ -2067,7 +2272,8 @@ mod tests {
         // leave the socket in place rather than silently severing it.
         let _listener = std::os::unix::net::UnixListener::bind(&socket_path).unwrap();
 
-        let result = check_and_cleanup_stale_state(&pid_path, &socket_path);
+        let ca_path = tmp.path().join("airlock-ca.pem");
+        let result = check_and_cleanup_stale_state(&pid_path, &socket_path, &ca_path);
         assert!(
             matches!(result, Err(DaemonError::SocketInUse { .. })),
             "expected SocketInUse, got: {result:?}"

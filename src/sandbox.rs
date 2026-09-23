@@ -30,6 +30,19 @@ pub enum SandboxError {
     ProfileBuildError(String),
 }
 
+/// How much of the network a tool may reach.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkAccess {
+    /// No sockets at all; the profile's default deny covers it.
+    None,
+    /// Unrestricted outbound access plus name resolution.
+    Full,
+    /// Only the daemon's per-exec proxy listener on `127.0.0.1:<port>`. Name
+    /// resolution stays denied — the daemon resolves on the tool's behalf, so
+    /// a tool that could resolve names could also use DNS as an exfil channel.
+    ProxyOnly(u16),
+}
+
 /// Describes what a tool is allowed to access.
 ///
 /// Used as input to a `SandboxBackend` to produce a `SandboxProfile`.
@@ -38,12 +51,10 @@ pub struct ToolPolicy {
     pub read_paths: Vec<PathBuf>,
     /// Filesystem paths the tool may read and write (from tool's `extra_write`).
     pub read_write_paths: Vec<PathBuf>,
-    /// Whether the tool requires any network access.
-    ///
-    /// Derived from whether `allowed_hosts` is non-empty in the config.
-    /// On macOS, this drives a binary allow/deny decision — per-hostname filtering
-    /// is not supported by the Seatbelt framework.
-    pub requires_network: bool,
+    /// How much of the network this tool may reach. Proxy tools get
+    /// [`NetworkAccess::ProxyOnly`]; every other tool gets
+    /// [`NetworkAccess::Full`].
+    pub network: NetworkAccess,
     /// The resolved absolute path to the tool's executable binary.
     ///
     /// On macOS, Security.framework re-reads the process's own binary at runtime
@@ -265,7 +276,9 @@ pub mod macos {
     use std::ffi::{CString, c_char};
     use std::path::{Path, PathBuf};
 
-    use super::{AgentPolicy, AgentProfileKind, SandboxError, SandboxProfile, ToolPolicy};
+    use super::{
+        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile, ToolPolicy,
+    };
 
     // ─── FFI bindings ────────────────────────────────────────────────────────
 
@@ -351,15 +364,12 @@ pub mod macos {
 
     /// Resolve a path's canonical form via `std::fs::canonicalize`.
     ///
-    /// Returns `None` if canonicalization fails (path doesn't exist yet, etc.).
+    /// Returns `None` if canonicalization fails (path doesn't exist yet, etc.)
+    /// or the path is already canonical.
     fn try_canonicalize(path: &Path) -> Option<PathBuf> {
-        std::fs::canonicalize(path).ok().and_then(|canonical| {
-            if canonical != path {
-                Some(canonical)
-            } else {
-                None
-            }
-        })
+        std::fs::canonicalize(path)
+            .ok()
+            .filter(|canonical| canonical != path)
     }
 
     // ─── SBPL generation ────────────────────────────────────────────────────
@@ -698,6 +708,23 @@ pub mod macos {
         out.push_str("(allow network-bind (local unix-socket))\n");
     }
 
+    /// Emit the only network rule a proxy tool gets: a TCP connect to the
+    /// daemon's per-exec proxy listener.
+    ///
+    /// Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the
+    /// host — an IP literal is a profile compile error — and `localhost`
+    /// resolves to the loopback interface, which is where the listener binds.
+    /// Everything else is left to the profile's `(deny default)`: no
+    /// mDNSResponder socket (so `getaddrinfo` fails and DNS cannot be used as
+    /// an exfiltration channel), no unix-socket bind, no blanket
+    /// `system-socket` — verified empirically that a TCP connect to the
+    /// allowed port needs none of them.
+    fn emit_proxy_network_rules(port: u16, out: &mut String) {
+        out.push_str(&format!(
+            "(allow network-outbound (remote tcp \"localhost:{port}\"))\n"
+        ));
+    }
+
     fn generate_profile(policy: &ToolPolicy) -> Result<String, SandboxError> {
         let mut out = String::with_capacity(4096);
 
@@ -728,11 +755,12 @@ pub mod macos {
 
         emit_filesystem_rules(&policy.read_paths, &policy.read_write_paths, &mut out)?;
 
-        if policy.requires_network {
-            emit_network_rules(&mut out);
+        match policy.network {
+            // The profile's `(deny default)` already blocks every socket.
+            NetworkAccess::None => {}
+            NetworkAccess::Full => emit_network_rules(&mut out),
+            NetworkAccess::ProxyOnly(port) => emit_proxy_network_rules(port, &mut out),
         }
-        // If requires_network is false, the default deny handles blocking;
-        // no explicit rule is needed.
 
         Ok(out)
     }
@@ -1113,14 +1141,14 @@ pub mod macos {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{SandboxBackend, ToolPolicy};
+        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
         use super::MacOSSeatbelt;
 
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
@@ -1129,7 +1157,7 @@ pub mod macos {
             ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![PathBuf::from(path)],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
@@ -1138,7 +1166,7 @@ pub mod macos {
             ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
@@ -1147,7 +1175,7 @@ pub mod macos {
             ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![],
-                requires_network: true,
+                network: NetworkAccess::Full,
                 binary_path: None,
             }
         }
@@ -1465,7 +1493,7 @@ pub mod macos {
             );
         }
 
-        // ── Network: requires_network = true ─────────────────────────────────
+        // ── Network: NetworkAccess::Full ─────────────────────────────────────
 
         #[test]
         fn network_policy_produces_allow_network_outbound() {
@@ -1550,7 +1578,57 @@ pub mod macos {
             );
         }
 
-        // ── Network: requires_network = false ────────────────────────────────
+        // ── Network: NetworkAccess::ProxyOnly ────────────────────────────────
+
+        fn proxy_policy(port: u16) -> ToolPolicy {
+            ToolPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                network: NetworkAccess::ProxyOnly(port),
+                binary_path: None,
+            }
+        }
+
+        #[test]
+        fn proxy_policy_allows_only_the_proxy_port() {
+            let sbpl = sbpl_from_profile(&proxy_policy(54321));
+            assert!(
+                sbpl.contains("(allow network-outbound (remote tcp \"localhost:54321\"))"),
+                "SBPL should allow outbound TCP to the proxy port, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("(allow network-outbound)\n"),
+                "SBPL must not contain the blanket network-outbound rule, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn proxy_policy_omits_dns_and_bind_rules() {
+            let sbpl = sbpl_from_profile(&proxy_policy(1024));
+            assert!(
+                !sbpl.contains("mDNSResponder"),
+                "a proxy tool resolves nothing itself; SBPL must not reach mDNSResponder, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("network-bind"),
+                "SBPL must not allow any bind for a proxy tool, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("(allow system-socket)\n"),
+                "SBPL must not contain the blanket system-socket rule, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn proxy_policy_port_is_the_one_from_the_policy() {
+            // The port is the *bound* port of a per-exec listener, so a
+            // profile built for one exec must never permit another's.
+            let sbpl = sbpl_from_profile(&proxy_policy(1));
+            assert!(sbpl.contains("\"localhost:1\""), "got:\n{sbpl}");
+            assert!(!sbpl.contains("\"localhost:*\""), "got:\n{sbpl}");
+        }
+
+        // ── Network: NetworkAccess::None ─────────────────────────────────────
 
         #[test]
         fn no_network_policy_contains_no_allow_network_rule() {
@@ -1589,7 +1667,7 @@ pub mod macos {
             let policy = ToolPolicy {
                 read_paths: vec![PathBuf::from("/usr/local\nbad")],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             };
             let result = MacOSSeatbelt.build(&policy);
@@ -1629,7 +1707,7 @@ pub mod macos {
             let policy = ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![],
-                requires_network: true,
+                network: NetworkAccess::Full,
                 binary_path: Some(PathBuf::from("/usr/local/bin/mytool")),
             };
             let sbpl = sbpl_from_profile(&policy);
@@ -1646,7 +1724,7 @@ pub mod macos {
             let policy = ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: Some(PathBuf::from("/opt/homebrew/Cellar/gh/2.0/bin/gh")),
             };
             let sbpl = sbpl_from_profile(&policy);
@@ -1695,7 +1773,7 @@ pub mod macos {
                 let policy = ToolPolicy {
                     read_paths: vec![],
                     read_write_paths: vec![],
-                    requires_network: false,
+                    network: NetworkAccess::None,
                     binary_path: Some(symlink_path.clone()),
                 };
                 let sbpl = sbpl_from_profile(&policy);
@@ -2309,11 +2387,13 @@ pub mod linux {
     use std::os::unix::io::{AsRawFd, OwnedFd};
 
     use landlock::{
-        ABI, Access, AccessFs, CompatLevel, Compatible, PathBeneath, PathFd, Ruleset, RulesetAttr,
-        RulesetCreatedAttr,
+        ABI, Access, AccessFs, AccessNet, CompatLevel, Compatible, NetPort, PathBeneath, PathFd,
+        Ruleset, RulesetAttr, RulesetCreatedAttr,
     };
 
-    use super::{AgentPolicy, SandboxBackend, SandboxError, SandboxProfile, ToolPolicy};
+    use super::{
+        AgentPolicy, NetworkAccess, SandboxBackend, SandboxError, SandboxProfile, ToolPolicy,
+    };
 
     /// Convert any `Display`-able Landlock error into a [`SandboxError::ProfileBuildError`].
     ///
@@ -2321,6 +2401,18 @@ pub mod linux {
     /// six times in `LinuxLandlock::build()`.
     fn to_profile_err(e: impl std::fmt::Display) -> SandboxError {
         SandboxError::ProfileBuildError(format!("{e}"))
+    }
+
+    /// Landlock ABI level that introduced TCP bind/connect rules (Linux 6.7).
+    const NET_ABI: ABI = ABI::V4;
+
+    /// Error for a kernel that cannot enforce a proxy tool's egress pinning.
+    fn proxy_net_unsupported(e: impl std::fmt::Display) -> SandboxError {
+        SandboxError::ProfileBuildError(format!(
+            "proxy tools need Landlock network rules (ABI v4, Linux 6.7+) to pin \
+             the tool's egress to the proxy port, which the running kernel does \
+             not support: {e}"
+        ))
     }
 
     /// Baseline read-only paths granted to every tool, mirroring the macOS
@@ -2564,6 +2656,7 @@ pub mod linux {
         baseline: &[&str],
         read_paths: &[std::path::PathBuf],
         read_write_paths: &[std::path::PathBuf],
+        network: NetworkAccess,
     ) -> Result<SandboxProfile, SandboxError> {
         let abi = ABI::V1;
 
@@ -2575,12 +2668,44 @@ pub mod linux {
         //
         // `HardRequirement` ensures we fail immediately if the kernel does not
         // support Landlock V1, rather than silently degrading to a no-op.
-        let mut ruleset = Ruleset::default()
+        let mut header = Ruleset::default()
             .set_compatibility(CompatLevel::HardRequirement)
             .handle_access(AccessFs::from_all(abi))
-            .map_err(to_profile_err)?
-            .create()
             .map_err(to_profile_err)?;
+
+        // ── Network access rights (proxy tools only) ──────────────────────
+        // `NetworkAccess::None` and `Full` leave network rights unhandled, so
+        // sockets behave exactly as they did before proxy tools existed;
+        // Landlock is a filesystem sandbox for those tools and the process
+        // keeps whatever network the host gives it. A proxy tool is different:
+        // pinning egress to the proxy port is a load-bearing part of its
+        // policy, so the ABI v4 network rights are a hard requirement and an
+        // older kernel fails the exec rather than running unpinned.
+        if matches!(network, NetworkAccess::ProxyOnly(_)) {
+            header = header
+                .handle_access(AccessNet::from_all(NET_ABI))
+                .map_err(proxy_net_unsupported)?;
+        }
+
+        let mut ruleset = header.create().map_err(|e| {
+            if matches!(network, NetworkAccess::ProxyOnly(_)) {
+                proxy_net_unsupported(e)
+            } else {
+                to_profile_err(e)
+            }
+        })?;
+
+        // Allow exactly one destination: a TCP connect to the daemon's
+        // per-exec proxy listener. `BindTcp` is handled but never granted, so
+        // the tool cannot become a listener either. The rule is port-scoped,
+        // not address-scoped — Landlock has no notion of a destination host —
+        // so the tool may reach that port on any host. SECURITY.md documents
+        // that gap, and UDP (hence DNS) is outside Landlock's reach entirely.
+        if let NetworkAccess::ProxyOnly(port) = network {
+            ruleset = ruleset
+                .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                .map_err(to_profile_err)?;
+        }
 
         // ── Baseline read-only system paths ───────────────────────────────
         // Always-allowed reads for the dynamic linker, libc, system
@@ -2678,6 +2803,7 @@ pub mod linux {
                 LINUX_BASELINE_READ_PATHS,
                 &policy.read_paths,
                 &policy.read_write_paths,
+                policy.network,
             )
         }
 
@@ -2693,6 +2819,7 @@ pub mod linux {
                 LINUX_AGENT_BASELINE_READ_PATHS,
                 &policy.read_paths,
                 &policy.read_write_paths,
+                NetworkAccess::Full,
             )
         }
     }
@@ -2703,14 +2830,14 @@ pub mod linux {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{SandboxBackend, ToolPolicy};
+        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
         use super::{FdClosedProbe, LinuxLandlock, check_landlock_availability};
 
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
@@ -2719,7 +2846,7 @@ pub mod linux {
             ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![PathBuf::from(path)],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
@@ -2728,7 +2855,7 @@ pub mod linux {
             ToolPolicy {
                 read_paths: vec![],
                 read_write_paths: vec![],
-                requires_network: false,
+                network: NetworkAccess::None,
                 binary_path: None,
             }
         }
