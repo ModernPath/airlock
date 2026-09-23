@@ -1,7 +1,9 @@
-//! The per-exec HTTPS interception proxy that fronts a proxy tool.
+//! The HTTPS interception proxy that fronts a proxy tool. It runs inside the
+//! daemon; the client (`airlock exec`) never touches it.
 //!
-//! One listener is bound on an ephemeral loopback port for the lifetime of one
-//! `airlock exec`, carrying only that tool's routes. The tool is pointed at it
+//! The daemon binds one listener on an ephemeral loopback port for each exec
+//! request it handles, for as long as that tool runs, carrying only that
+//! tool's routes. The tool is pointed at it
 //! through `HTTPS_PROXY` and told to trust the daemon's CA; the sandbox pins
 //! the tool's egress to that one port, so the proxy is the tool's entire view
 //! of the network.

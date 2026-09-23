@@ -13,7 +13,7 @@ src/
 ├── policy.rs     ToolPolicy / AgentPolicy construction, CWD validation
 ├── proxy.rs      Proxy-tool egress policy: route table, host / path matching
 │   ├── ca.rs     Per-daemon MITM CA: name constraints, leaf minting and cache
-│   └── server.rs Per-exec interception proxy: CONNECT, vetting, injection
+│   └── server.rs Daemon-side interception proxy, one per exec request: CONNECT, vetting, injection
 ├── redact.rs     Aho-Corasick automaton, streaming redaction
 ├── sandbox.rs    SandboxBackend trait, macOS Seatbelt, Linux Landlock
 ├── exec.rs       Binary resolution, env construction, child spawn
