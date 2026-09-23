@@ -120,11 +120,11 @@ fn root_store(ca: &ProxyCa) -> rustls::RootCertStore {
     roots
 }
 
-fn ca_for(hosts: &[&str]) -> Arc<ProxyCa> {
+fn ca_for(hosts: &[&str]) -> ProxyCa {
     let policy = ProxyPolicy {
         routes: hosts.iter().map(|h| route(h, &[], None)).collect(),
     };
-    Arc::new(ProxyCa::generate([policy].iter()).unwrap().unwrap())
+    ProxyCa::generate([policy].iter()).unwrap().unwrap()
 }
 
 // ─── The local "upstream" ─────────────────────────────────────────────────────
@@ -142,7 +142,7 @@ type Seen = Arc<std::sync::Mutex<Vec<String>>>;
 /// produces it.
 struct TestUpstream {
     addr: SocketAddr,
-    ca: Arc<ProxyCa>,
+    ca: ProxyCa,
     seen: Seen,
 }
 
@@ -334,7 +334,7 @@ async fn start_upstream() -> TestUpstream {
 
 struct Harness {
     session: ProxySession,
-    ca: Arc<ProxyCa>,
+    shared: Arc<ProxyShared>,
     ring_buffer: RingBuffer,
     secrets: SecretStore,
     redactor: RedactorSwap,
@@ -347,19 +347,19 @@ impl Harness {
         let ca = ca_for(&[UPSTREAM_HOST, "other.test"]);
         let ring_buffer = RingBuffer::new();
         let redactor = live_redactor(&secrets);
-        let shared = ProxyShared {
-            ca: Arc::clone(&ca),
+        let shared = Arc::new(ProxyShared {
+            ca,
             ca_path: PathBuf::from("/nonexistent/airlock-ca.pem"),
             secrets: Arc::clone(&secrets),
             redactor: Arc::clone(&redactor),
             ring_buffer: ring_buffer.clone(),
             upstream: Upstream::fixed(upstream.addr, root_store(&upstream.ca)),
-        };
+        });
         let session =
             ProxySession::start("curl".to_string(), ProxyPolicy { routes }, &shared).unwrap();
         Harness {
             session,
-            ca,
+            shared,
             ring_buffer,
             secrets,
             redactor,
@@ -458,7 +458,7 @@ impl Harness {
         assert_eq!(response.status(), StatusCode::OK, "CONNECT should succeed");
 
         let upgraded = hyper::upgrade::on(response).await.unwrap();
-        let connector = TlsConnector::from(Arc::new(client_config(root_store(&self.ca))));
+        let connector = TlsConnector::from(Arc::new(client_config(root_store(&self.shared.ca))));
         let name = ServerName::try_from(authority.to_string()).unwrap();
         let tls = connector
             .connect(name, TokioIo::new(upgraded))
@@ -1598,7 +1598,7 @@ async fn system_curl_completes_a_request_through_the_proxy() {
     let h = Harness::default().await;
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("airlock-ca.pem");
-    h.ca.write_cert_pem(&ca_path).unwrap();
+    h.shared.ca.write_cert_pem(&ca_path).unwrap();
 
     let mut env: HashMap<String, String> = HashMap::new();
     h.session.apply_env(&mut env);
@@ -1663,7 +1663,7 @@ async fn system_curl_writes_a_file_that_does_not_contain_the_secret() {
     let h = Harness::default().await;
     let dir = tempfile::tempdir().unwrap();
     let ca_path = dir.path().join("airlock-ca.pem");
-    h.ca.write_cert_pem(&ca_path).unwrap();
+    h.shared.ca.write_cert_pem(&ca_path).unwrap();
     let out_path = dir.path().join("out.json");
     let header_path = dir.path().join("headers.txt");
 

@@ -165,9 +165,13 @@ impl Drop for ProxySession {
 /// What every proxy session in one daemon shares. Built once, when the
 /// daemon publishes its CA, so per-exec setup is only a listener and a token.
 pub struct ProxyShared {
-    ca: Arc<ProxyCa>,
+    ca: ProxyCa,
     ca_path: PathBuf,
     secrets: SecretStore,
+    /// The daemon's live redactor, not a snapshot of it. A tool runs for
+    /// minutes and a refreshed token is injected from the *next* request on,
+    /// so a redactor snapshotted when the session started would not know the
+    /// value the proxy is now attaching.
     redactor: RedactorSwap,
     ring_buffer: RingBuffer,
     upstream: Upstream,
@@ -183,7 +187,7 @@ impl ProxyShared {
         ring_buffer: RingBuffer,
     ) -> Self {
         ProxyShared {
-            ca: Arc::new(ca),
+            ca,
             ca_path,
             secrets,
             redactor,
@@ -195,7 +199,11 @@ impl ProxyShared {
 
 impl ProxySession {
     /// Bind a listener and start serving `policy` on it.
-    pub fn start(tool: String, policy: ProxyPolicy, shared: &ProxyShared) -> std::io::Result<Self> {
+    pub fn start(
+        tool: String,
+        policy: ProxyPolicy,
+        shared: &Arc<ProxyShared>,
+    ) -> std::io::Result<Self> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         // The *bound* port, never a configured one: the listener asked for an
@@ -210,12 +218,8 @@ impl ProxySession {
         let ctx = Arc::new(ProxyContext {
             tool,
             policy,
-            ca: Arc::clone(&shared.ca),
-            secrets: Arc::clone(&shared.secrets),
-            redactor: Arc::clone(&shared.redactor),
-            ring_buffer: shared.ring_buffer.clone(),
+            shared: Arc::clone(shared),
             expected_auth: basic_auth_header(&token),
-            upstream: shared.upstream.clone(),
             tunnels: Arc::new(Semaphore::new(MAX_CONCURRENT_TUNNELS)),
             shutdown: shutdown.clone(),
         });
@@ -271,17 +275,9 @@ impl ProxySession {
 struct ProxyContext {
     tool: String,
     policy: ProxyPolicy,
-    ca: Arc<ProxyCa>,
-    secrets: SecretStore,
-    /// The daemon's live redactor, not a snapshot of it. A tool runs for
-    /// minutes and a refreshed token is injected from the *next* request on,
-    /// so a redactor snapshotted when the session started would not know the
-    /// value the proxy is now attaching.
-    redactor: RedactorSwap,
-    ring_buffer: RingBuffer,
+    shared: Arc<ProxyShared>,
     /// The full `Proxy-Authorization` value this exec accepts.
     expected_auth: String,
-    upstream: Upstream,
     tunnels: Arc<Semaphore>,
     /// Cancelled when the owning [`ProxySession`] is dropped.
     shutdown: CancellationToken,
@@ -309,7 +305,8 @@ impl ProxyContext {
 
     /// Log a proxy event that is not a request decision.
     fn log(&self, message: &str) {
-        self.ring_buffer
+        self.shared
+            .ring_buffer
             .log(format!("proxy [{}] {message}", self.tool));
     }
 
@@ -317,7 +314,13 @@ impl ProxyContext {
     /// headers arrive. The two generations a refresh leaves behind cover a
     /// swap that lands between this snapshot and the end of the body.
     fn redactor(&self) -> Arc<Redactor> {
-        Arc::clone(&self.redactor.read().unwrap_or_else(|e| e.into_inner()))
+        Arc::clone(
+            &self
+                .shared
+                .redactor
+                .read()
+                .unwrap_or_else(|e| e.into_inner()),
+        )
     }
 }
 
@@ -405,7 +408,7 @@ async fn handle_proxy_request(
 
     // Also before the `200`, for the same reason. The leaf names the CONNECT
     // authority; the client's SNI is never read.
-    let server_config = match ctx.ca.server_config(&host) {
+    let server_config = match ctx.shared.ca.server_config(&host) {
         Ok(config) => config,
         Err(e) => {
             let denial = Denial {
@@ -615,7 +618,7 @@ async fn handle_tunneled_request(
     demand_a_plain_full_response(&mut parts.headers);
 
     if let Some(inject) = &route.inject {
-        match self::inject_credential(&ctx.secrets, inject, &mut parts.headers) {
+        match self::inject_credential(&ctx.shared.secrets, inject, &mut parts.headers) {
             Ok(()) => {}
             Err(reason) => {
                 let denial = deny(StatusCode::BAD_GATEWAY, reason);
@@ -626,6 +629,7 @@ async fn handle_tunneled_request(
 
     let method = parts.method.clone();
     match ctx
+        .shared
         .upstream
         .send(&host, Request::from_parts(parts, body))
         .await
@@ -1057,13 +1061,11 @@ fn auth_required() -> Response<ProxyBody> {
 // ─── Upstream ─────────────────────────────────────────────────────────────────
 
 /// Where an upstream connection goes and how its certificate is checked.
-#[derive(Clone)]
 struct Upstream {
     tls: Arc<rustls::ClientConfig>,
     target: Target,
 }
 
-#[derive(Clone)]
 enum Target {
     /// Resolve the host and refuse anything that is not globally routable.
     PublicDns,
