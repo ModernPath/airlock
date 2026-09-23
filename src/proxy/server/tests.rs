@@ -347,17 +347,16 @@ impl Harness {
         let ca = ca_for(&[UPSTREAM_HOST, "other.test"]);
         let ring_buffer = RingBuffer::new();
         let redactor = live_redactor(&secrets);
-        let session = ProxySession::start_with_upstream(
-            "curl".to_string(),
-            ProxyPolicy { routes },
-            Arc::clone(&ca),
-            PathBuf::from("/nonexistent/airlock-ca.pem"),
-            Arc::clone(&secrets),
-            Arc::clone(&redactor),
-            ring_buffer.clone(),
-            Upstream::fixed(upstream.addr, root_store(&upstream.ca)),
-        )
-        .unwrap();
+        let shared = ProxyShared {
+            ca: Arc::clone(&ca),
+            ca_path: PathBuf::from("/nonexistent/airlock-ca.pem"),
+            secrets: Arc::clone(&secrets),
+            redactor: Arc::clone(&redactor),
+            ring_buffer: ring_buffer.clone(),
+            upstream: Upstream::fixed(upstream.addr, root_store(&upstream.ca)),
+        };
+        let session =
+            ProxySession::start("curl".to_string(), ProxyPolicy { routes }, &shared).unwrap();
         Harness {
             session,
             ca,

@@ -162,41 +162,40 @@ impl Drop for ProxySession {
     }
 }
 
-impl ProxySession {
-    /// Bind a listener and start serving `policy` on it.
-    #[allow(clippy::too_many_arguments)]
-    pub fn start(
-        tool: String,
-        policy: ProxyPolicy,
-        ca: Arc<ProxyCa>,
+/// What every proxy session in one daemon shares. Built once, when the
+/// daemon publishes its CA, so per-exec setup is only a listener and a token.
+pub struct ProxyShared {
+    ca: Arc<ProxyCa>,
+    ca_path: PathBuf,
+    secrets: SecretStore,
+    redactor: Arc<RwLock<Arc<Redactor>>>,
+    ring_buffer: RingBuffer,
+    upstream: Upstream,
+}
+
+impl ProxyShared {
+    /// `ca_path` is where the CA certificate the tools must trust was written.
+    pub fn new(
+        ca: ProxyCa,
         ca_path: PathBuf,
         secrets: SecretStore,
         redactor: Arc<RwLock<Arc<Redactor>>>,
         ring_buffer: RingBuffer,
-    ) -> std::io::Result<Self> {
-        Self::start_with_upstream(
-            tool,
-            policy,
-            ca,
+    ) -> Self {
+        ProxyShared {
+            ca: Arc::new(ca),
             ca_path,
             secrets,
             redactor,
             ring_buffer,
-            Upstream::public(),
-        )
+            upstream: Upstream::public(),
+        }
     }
+}
 
-    #[allow(clippy::too_many_arguments)]
-    fn start_with_upstream(
-        tool: String,
-        policy: ProxyPolicy,
-        ca: Arc<ProxyCa>,
-        ca_path: PathBuf,
-        secrets: SecretStore,
-        redactor: Arc<RwLock<Arc<Redactor>>>,
-        ring_buffer: RingBuffer,
-        upstream: Upstream,
-    ) -> std::io::Result<Self> {
+impl ProxySession {
+    /// Bind a listener and start serving `policy` on it.
+    pub fn start(tool: String, policy: ProxyPolicy, shared: &ProxyShared) -> std::io::Result<Self> {
         let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))?;
         listener.set_nonblocking(true)?;
         // The *bound* port, never a configured one: the listener asked for an
@@ -211,12 +210,12 @@ impl ProxySession {
         let ctx = Arc::new(ProxyContext {
             tool,
             policy,
-            ca,
-            secrets,
-            redactor,
-            ring_buffer,
+            ca: Arc::clone(&shared.ca),
+            secrets: Arc::clone(&shared.secrets),
+            redactor: Arc::clone(&shared.redactor),
+            ring_buffer: shared.ring_buffer.clone(),
             expected_auth: basic_auth_header(&token),
-            upstream,
+            upstream: shared.upstream.clone(),
             tunnels: Arc::new(Semaphore::new(MAX_CONCURRENT_TUNNELS)),
             shutdown: shutdown.clone(),
         });
@@ -224,7 +223,7 @@ impl ProxySession {
         Ok(ProxySession {
             port,
             proxy_url,
-            ca_path,
+            ca_path: shared.ca_path.clone(),
             task: tokio::spawn(accept_loop(listener, ctx)),
             _shutdown: shutdown.drop_guard(),
         })
@@ -1058,11 +1057,13 @@ fn auth_required() -> Response<ProxyBody> {
 // ─── Upstream ─────────────────────────────────────────────────────────────────
 
 /// Where an upstream connection goes and how its certificate is checked.
+#[derive(Clone)]
 struct Upstream {
     tls: Arc<rustls::ClientConfig>,
     target: Target,
 }
 
+#[derive(Clone)]
 enum Target {
     /// Resolve the host and refuse anything that is not globally routable.
     PublicDns,

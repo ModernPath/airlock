@@ -33,7 +33,7 @@ use crate::exec;
 use crate::policy;
 use crate::protocol::{ClientMessage, DaemonMessage, LogEntry};
 use crate::proxy::ca::{CaError, ProxyCa};
-use crate::proxy::server::ProxySession;
+use crate::proxy::server::{ProxySession, ProxyShared};
 use crate::redact::{self, RedactError, Redactor};
 use crate::refresh;
 use crate::sandbox;
@@ -789,7 +789,7 @@ pub(crate) async fn run_embedded(
     let ring_buffer = RingBuffer::new();
     let child_registry = ChildRegistry::new();
 
-    let proxy_ca = publish_proxy_ca(&config, &ring_buffer)?;
+    let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
 
     // Spawn per-secret refresh tasks, identical to async_main.
     let (mut refresh_tasks, refresh_shutdown) = refresh::spawn_all(
@@ -833,15 +833,10 @@ pub(crate) async fn run_embedded(
                         // Snapshot the redactor at accept time so in-flight
                         // connections are not affected by concurrent refreshes.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        // The live handle travels alongside the snapshot: a
-                        // proxy response is redacted with whatever the daemon
-                        // holds *now*, because the proxy injects whatever it
-                        // holds now.
-                        let live = Arc::clone(&redactor);
-                        let ca = proxy_ca.clone();
+                        let proxy = proxy.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, live, rb.clone(), cr, ca).await;
+                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, proxy).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -884,7 +879,8 @@ pub(crate) async fn run_embedded(
     Ok(())
 }
 
-/// Generate the proxy CA and publish its certificate for tools to trust.
+/// Generate the proxy CA, publish its certificate for tools to trust, and
+/// build the state every proxy session shares.
 ///
 /// This runs inside the runtime and nowhere earlier: key generation is pure
 /// CPU, but it must happen after daemonization so that `synchronous_startup`
@@ -893,8 +889,10 @@ pub(crate) async fn run_embedded(
 /// no CA and writes no certificate.
 fn publish_proxy_ca(
     config: &Config,
+    secrets: &SecretStore,
+    redactor: &Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: &RingBuffer,
-) -> Result<Option<Arc<ProxyCa>>, DaemonError> {
+) -> Result<Option<Arc<ProxyShared>>, DaemonError> {
     let Some(ca) = ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))?
     else {
         return Ok(None);
@@ -904,7 +902,13 @@ fn publish_proxy_ca(
         "proxy CA published at {}",
         config.ca_path.display()
     ));
-    Ok(Some(Arc::new(ca)))
+    Ok(Some(Arc::new(ProxyShared::new(
+        ca,
+        config.ca_path.clone(),
+        Arc::clone(secrets),
+        Arc::clone(redactor),
+        ring_buffer.clone(),
+    ))))
 }
 
 // ─── Async runtime entry point ──────────────────────────────────────────────
@@ -994,7 +998,7 @@ async fn async_main_inner(
     };
     let child_registry = ChildRegistry::new();
 
-    let proxy_ca = publish_proxy_ca(&config, &ring_buffer)?;
+    let proxy = publish_proxy_ca(&config, &secrets, &redactor, &ring_buffer)?;
 
     // Spawn one background task per refreshable secret. Tasks live until they
     // observe the shutdown signal or get aborted at SIGTERM.
@@ -1051,15 +1055,10 @@ async fn async_main_inner(
                         // may swap the inner Arc later; this connection keeps
                         // its snapshot for its full lifetime.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
-                        // The live handle travels alongside the snapshot: a
-                        // proxy response is redacted with whatever the daemon
-                        // holds *now*, because the proxy injects whatever it
-                        // holds now.
-                        let live = Arc::clone(&redactor);
-                        let ca = proxy_ca.clone();
+                        let proxy = proxy.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, live, rb.clone(), cr, ca).await;
+                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, proxy).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -1106,16 +1105,14 @@ async fn async_main_inner(
 ///
 /// Reads the first NDJSON line to determine the request type, dispatches to
 /// the appropriate handler, and closes the connection.
-#[allow(clippy::too_many_arguments)]
 async fn handle_connection(
     stream: tokio::net::UnixStream,
     config: Arc<Config>,
     secrets: SecretStore,
     redactor: Arc<Redactor>,
-    live_redactor: Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
-    proxy_ca: Option<Arc<ProxyCa>>,
+    proxy: Option<Arc<ProxyShared>>,
 ) {
     use tokio_stream::StreamExt;
     use tokio_util::codec::{FramedRead, LinesCodec, LinesCodecError};
@@ -1198,10 +1195,9 @@ async fn handle_connection(
                 config,
                 secrets,
                 redactor,
-                live_redactor,
                 ring_buffer,
                 child_registry,
-                proxy_ca,
+                proxy,
             )
             .await;
         }
@@ -1281,10 +1277,9 @@ async fn handle_exec_request(
     config: Arc<Config>,
     secrets: SecretStore,
     redactor: Arc<Redactor>,
-    live_redactor: Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
-    proxy_ca: Option<Arc<ProxyCa>>,
+    proxy: Option<Arc<ProxyShared>>,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
@@ -1385,7 +1380,7 @@ async fn handle_exec_request(
         Some(policy) => {
             // A configured proxy tool is what makes the daemon generate a CA,
             // so the two are present or absent together.
-            let Some(ca) = proxy_ca else {
+            let Some(proxy) = proxy else {
                 log_and_send_error(
                     format!("tool {tool:?} is a proxy tool but the daemon holds no proxy CA"),
                     &ring_buffer,
@@ -1394,15 +1389,7 @@ async fn handle_exec_request(
                 .await;
                 return;
             };
-            match ProxySession::start(
-                tool.clone(),
-                policy.clone(),
-                ca,
-                config.ca_path.clone(),
-                Arc::clone(&secrets),
-                live_redactor,
-                ring_buffer.clone(),
-            ) {
+            match ProxySession::start(tool.clone(), policy.clone(), &proxy) {
                 Ok(session) => {
                     ring_buffer.log(format!(
                         "proxy for tool {:?} listening on 127.0.0.1:{}",
