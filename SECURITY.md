@@ -339,6 +339,7 @@ Egress restriction is the second layer, not the first. It makes the set of hosts
 | Any method other than `CONNECT` (for example a plain `GET http://…`) | `403`. The proxy never attaches the credential to a cleartext request. |
 | CONNECT to a port other than 443 | `403` |
 | CONNECT to a host that no route matches | `403` (deny by default) |
+| CONNECT while 32 tunnels are already open for this exec | `503`, sent before the `200`, so the tool can retry |
 | Inside the tunnel: `Host` header ≠ the CONNECT authority | `400` (no domain fronting) |
 | Inside the tunnel: absolute-form request target | `400` |
 | `Transfer-Encoding` together with `Content-Length`, or two `Content-Length` headers | `400` (request smuggling) |

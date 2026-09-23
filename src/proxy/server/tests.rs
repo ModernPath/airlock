@@ -549,6 +549,31 @@ async fn connect_to_an_unrouted_host_is_refused() {
 }
 
 #[tokio::test]
+async fn connect_beyond_the_tunnel_limit_is_refused_before_upgrading() {
+    let h = Harness::default().await;
+    let mut open = Vec::with_capacity(MAX_CONCURRENT_TUNNELS);
+    for _ in 0..MAX_CONCURRENT_TUNNELS {
+        open.push(h.tunnel(UPSTREAM_HOST).await);
+    }
+    let response = h
+        .connect(&format!("{UPSTREAM_HOST}:443"), Some(&h.auth()))
+        .await;
+    assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    assert!(h.logs().contains("tunnels already open"), "{}", h.logs());
+
+    drop(open);
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    let response = h
+        .connect(&format!("{UPSTREAM_HOST}:443"), Some(&h.auth()))
+        .await;
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "closing a tunnel frees its slot"
+    );
+}
+
+#[tokio::test]
 async fn plain_http_proxying_is_refused() {
     let h = Harness::default().await;
     let mut sender = h.connect_raw().await;

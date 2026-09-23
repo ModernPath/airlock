@@ -389,8 +389,25 @@ async fn handle_proxy_request(
         ));
     }
 
+    // Taken before the `200`: once the tool sees a successful CONNECT, a
+    // refusal can only be a dropped connection, which looks like a TLS
+    // failure instead of a busy proxy it could retry.
+    let Ok(permit) = Arc::clone(&ctx.tunnels).try_acquire_owned() else {
+        ctx.audit(
+            req.method(),
+            &host,
+            "",
+            &format!("denied: {MAX_CONCURRENT_TUNNELS} tunnels already open"),
+        );
+        return Ok(refuse(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "airlock proxy: too many open tunnels, retry later",
+        ));
+    };
+
     let tunnel_ctx = Arc::clone(&ctx);
     tokio::spawn(async move {
+        let _permit = permit;
         let shutdown = tunnel_ctx.shutdown.clone();
         let tunnel = async {
             match hyper::upgrade::on(req).await {
@@ -412,14 +429,6 @@ async fn handle_proxy_request(
 
 /// Terminate TLS for one CONNECT tunnel and serve the requests inside it.
 async fn run_tunnel(upgraded: hyper::upgrade::Upgraded, host: String, ctx: Arc<ProxyContext>) {
-    let Ok(_permit) = Arc::clone(&ctx.tunnels).try_acquire_owned() else {
-        ctx.ring_buffer.log(format!(
-            "proxy [{}] refused a tunnel to {host}: {MAX_CONCURRENT_TUNNELS} already open",
-            ctx.tool
-        ));
-        return;
-    };
-
     // The leaf names the CONNECT authority. The client's SNI is never read.
     let server_config = match ctx.ca.server_config(&host) {
         Ok(config) => config,
