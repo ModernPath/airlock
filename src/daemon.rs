@@ -339,8 +339,9 @@ pub struct StartupState {
     /// Per-secret slots wrapped for shared, in-place mutation by refresh tasks.
     pub secrets: SecretStore,
     /// The shared, swappable redactor. Refresh tasks rebuild it on each
-    /// successful refresh (covering current + previous generations); active
-    /// connections snapshot the inner `Arc<Redactor>` at accept time.
+    /// successful refresh (covering current + previous generations); an exec
+    /// snapshots the inner `Arc<Redactor>` once it has read the tool's
+    /// secrets.
     pub redactor: RedactorSwap,
     /// The bound std UnixListener.
     pub listener: unix_net::UnixListener,
@@ -920,15 +921,10 @@ impl Daemon {
                             let peer_info = format!("{addr:?}");
                             ring_buffer.log(format!("connection accepted from {peer_info}"));
 
-                            // Snapshot the redactor at accept time. Refresh
-                            // tasks may swap the inner Arc later; this
-                            // connection keeps its snapshot for its full
-                            // lifetime.
-                            let redactor = self.shared.redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
                             let shared = Arc::clone(&self.shared);
 
                             tokio::spawn(async move {
-                                handle_connection(stream, &shared, redactor).await;
+                                handle_connection(stream, &shared).await;
                                 shared.ring_buffer.log(format!("connection closed ({peer_info})"));
                             });
                         }
@@ -1064,11 +1060,7 @@ async fn async_main_inner(
 ///
 /// Reads the first NDJSON line to determine the request type, dispatches to
 /// the appropriate handler, and closes the connection.
-async fn handle_connection(
-    stream: tokio::net::UnixStream,
-    shared: &DaemonShared,
-    redactor: Arc<Redactor>,
-) {
+async fn handle_connection(stream: tokio::net::UnixStream, shared: &DaemonShared) {
     use tokio_stream::StreamExt;
 
     let ring_buffer = &shared.ring_buffer;
@@ -1143,7 +1135,7 @@ async fn handle_connection(
             let _ = write_ndjson_message(&mut writer, &response).await;
         }
         ClientMessage::Exec { tool, args, cwd } => {
-            handle_exec_request(tool, args, cwd, framed, writer, shared, redactor).await;
+            handle_exec_request(tool, args, cwd, framed, writer, shared).await;
         }
         other => {
             // Unknown message type for initial request. Log only the variant
@@ -1218,7 +1210,6 @@ async fn handle_exec_request(
     >,
     mut writer: tokio::net::unix::OwnedWriteHalf,
     shared: &DaemonShared,
-    redactor: Arc<Redactor>,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
@@ -1227,10 +1218,10 @@ async fn handle_exec_request(
     let DaemonShared {
         config,
         secrets,
+        redactor,
         ring_buffer,
         child_registry,
         proxy,
-        ..
     } = shared;
 
     // ── 1. Tool validation ──────────────────────────────────────────────────
@@ -1315,6 +1306,13 @@ async fn handle_exec_request(
         }
     };
     let mut env = exec::build_env(&env_pairs);
+
+    // Taken after the secrets are read, never earlier. A refresh swaps the
+    // redactor before it publishes the new value, so a snapshot taken now
+    // knows every value just put into `env`. One taken at accept time would
+    // miss a refresh that lands before the client sends its request, and
+    // the client chooses when that is.
+    let redactor = Arc::clone(&redactor.read().unwrap_or_else(|e| e.into_inner()));
 
     // ── 5. Proxy session ────────────────────────────────────────────────────
     //

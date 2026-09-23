@@ -7,6 +7,10 @@
 
 mod e2e_helpers;
 
+use std::time::Duration;
+
+use airlock::protocol::{ClientMessage, DaemonMessage};
+
 use e2e_helpers::*;
 
 /// The test secret value used by all redaction tests.
@@ -331,6 +335,72 @@ fn secret_env_vars_cleared_from_daemon_environment() {
         result.stdout.contains("[REDACTED:TEST_E2E_SECRET]"),
         "tool should see the secret (via build_env), and it should be redacted in output, got: {:?}",
         result.stdout
+    );
+
+    daemon.shutdown();
+}
+
+// ─── A secret refreshed before the exec request is redacted ────────────────
+
+/// The client chooses when to send its request, so a refresh can land
+/// between accepting the connection and building the tool's environment.
+/// The tool's output must be redacted against the value it was given, not
+/// against whatever the daemon knew when the connection opened.
+#[test]
+fn secret_refreshed_before_the_request_is_redacted() {
+    let tmp = tempfile::tempdir().unwrap();
+    // `$$` differs on every run, so each refresh yields a new value.
+    let config = config_with_sh_secret().replace(
+        "[secrets.TEST_E2E_SECRET]\nsource = \"env\"",
+        "[secrets.TEST_E2E_SECRET]\n\
+         source = \"command\"\n\
+         command = [\"sh\", \"-c\", \"echo refreshed-value-$$\"]\n\
+         timeout = 1\n\
+         refresh = 1",
+    );
+    assert!(config.contains("refresh = 1"), "config template changed");
+    write_config(tmp.path(), &config);
+
+    let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
+    let daemon = start_daemon(tmp.path());
+
+    let mut stream = connect_to_daemon(&daemon.socket_path, 30);
+    // Long enough for two refreshes, so the value the tool gets is newer
+    // than both generations the redactor held when the connection opened.
+    std::thread::sleep(Duration::from_millis(2500));
+
+    let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+    send_message(
+        &mut stream,
+        &ClientMessage::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo \"$TEST_E2E_SECRET\"".to_string()],
+            cwd: cwd.to_str().unwrap().to_string(),
+        },
+    );
+
+    let mut stdout = String::new();
+    let mut reader = std::io::BufReader::new(&mut stream);
+    loop {
+        match try_read_response(&mut reader) {
+            Some(DaemonMessage::Stdout { data }) => stdout.push_str(&data),
+            Some(DaemonMessage::Exit { code }) => {
+                assert_eq!(code, 0);
+                break;
+            }
+            Some(DaemonMessage::Error { message }) => panic!("exec failed: {message}"),
+            Some(_) => {}
+            None => panic!("connection closed before exit"),
+        }
+    }
+
+    assert!(
+        !stdout.contains("refreshed-value-"),
+        "refreshed secret leaked: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("[REDACTED:TEST_E2E_SECRET]"),
+        "expected a redaction placeholder, got: {stdout:?}"
     );
 
     daemon.shutdown();

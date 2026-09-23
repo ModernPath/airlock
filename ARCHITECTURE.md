@@ -108,7 +108,7 @@ The daemon's shared state is one `DaemonShared`, built by `Daemon::start` and he
 |-----------|------|---------|
 | Config | `Config` | Parsed `airlock.toml` (immutable after startup) |
 | Secrets | `SecretStore` = `Arc<HashMap<String, RwLock<SecretSlot>>>` | Per-label slot holding `Arc<Secret<String>>` plus refresh health; the map is fixed at startup, slot contents swap on refresh |
-| Redactor | `RedactorSwap` = `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. A connection snapshots it for the child's stdout/stderr; a proxy session carries the handle itself and snapshots per response |
+| Redactor | `RedactorSwap` = `Arc<RwLock<Arc<Redactor>>>` | Aho-Corasick automaton for output redaction; refresh tasks swap the inner `Arc`. An exec snapshots it for the child's stdout/stderr right after reading the tool's secrets; a proxy session carries the handle itself and snapshots per response |
 | Ring buffer | `RingBuffer` | Last 1000 log entries (`Arc<Mutex<VecDeque<LogEntry>>>`, cloned into refresh tasks and proxy sessions) |
 | Child registry | `ChildRegistry` | PIDs of currently running children |
 | Proxy | `Option<Arc<ProxyShared>>` | The proxy CA and what every proxy session shares; `None` when no tool is a proxy tool |
@@ -254,9 +254,12 @@ makes of the whole input — directly from `poll_frame`. No thread and no channe
 per response: hyper's polling is the backpressure, and dropping the response
 stops the upstream read.
 
-Both paths take their redactor from the same `Arc<RwLock<Arc<Redactor>>>`. A
-connection snapshots it once for the child's stdout and stderr, which are
-framed against the secrets the child was spawned with. A proxy response
+Both paths take their redactor from the same `Arc<RwLock<Arc<Redactor>>>`. An
+exec snapshots it once for the child's stdout and stderr, right after it reads
+the secrets the child is spawned with. A refresh swaps the redactor before it
+publishes a new value, so that snapshot knows every value in the child's
+environment; one taken when the connection opened would miss a refresh that
+lands before the client sends its request. A proxy response
 snapshots it per response, because the proxy injects whatever the store holds
 at that moment and a token refreshed mid-exec must be redacted on the way
 back.

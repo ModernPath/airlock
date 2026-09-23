@@ -117,6 +117,8 @@ Any match is replaced with `[REDACTED:NAME]` where `NAME` is the secret's enviro
 
 The streaming implementation (`aho-corasick`'s `try_stream_replace_all`) correctly handles partial matches that span chunk boundaries — a secret value split across two TCP-level reads is still detected and redacted.
 
+**Refreshed secrets.** The automaton the child's output runs through is taken right after the daemon reads the child's secrets, not when the connection is accepted. A refresh swaps in a redactor that knows the new value before it publishes that value, so the automaton always knows every value in the child's environment. An automaton taken at accept time would not: the client chooses when to send its request, so an agent could open a connection, wait for a refresh, and then run a tool whose output carries a value the automaton has never seen.
+
 **Limitations:** Redaction is best-effort by nature. A tool could transform a secret in ways that don't match any of the four encodings (e.g., reversing the string, encrypting it, splitting it across multiple output lines with interleaving). Airlock's primary defense is that secrets are only injected into specifically allowed tool processes; redaction is a defense-in-depth layer.
 
 ## Filesystem sandboxing

@@ -12,9 +12,9 @@
 //! - Per-secret state lives in `RwLock<SecretSlot>` keyed inside a fixed
 //!   `Arc<HashMap<...>>` ([`SecretStore`]). The lock is held only for the
 //!   microseconds it takes to swap an `Arc` or read/clone health.
-//! - The redactor is shared as `RedactorSwap`. Connection
-//!   handlers snapshot the inner `Arc<Redactor>` once at accept time, so
-//!   in-flight streams keep their old redactor for their lifetime.
+//! - The redactor is shared as [`RedactorSwap`]. An exec snapshots the
+//!   inner `Arc<Redactor>` once, right after it reads the tool's secrets, and
+//!   keeps that snapshot for the child's lifetime.
 //! - On every successful refresh the redactor is rebuilt with two generations
 //!   per refreshed secret (current + previous) and swapped in *before* the
 //!   new value is published to the slot, so no reader can ever hand a secret
