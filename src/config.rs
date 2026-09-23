@@ -691,6 +691,21 @@ pub struct DiscoveredPaths {
     pub ca_path: PathBuf,
 }
 
+impl Config {
+    /// Every file the daemon creates, for cleanup at shutdown or after a
+    /// crash. Kept in step with [`DiscoveredPaths::runtime_files`].
+    pub fn runtime_files(&self) -> [&Path; 3] {
+        [&self.pid_path, &self.socket_path, &self.ca_path]
+    }
+}
+
+impl DiscoveredPaths {
+    /// Every file a running daemon creates, for cleanup after it has gone.
+    pub fn runtime_files(&self) -> [&Path; 3] {
+        [&self.pid_path, &self.socket_path, &self.ca_path]
+    }
+}
+
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
 /// Get the current effective uid of the process.

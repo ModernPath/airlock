@@ -203,9 +203,7 @@ fn read_pid_and_check_liveness(pid_path: &Path) -> Result<PidCheckResult, ExitCo
 
 /// Remove the files a dead daemon left behind, ignoring errors.
 fn cleanup_stale_files(paths: &airlock::config::DiscoveredPaths) {
-    let _ = std::fs::remove_file(&paths.pid_path);
-    let _ = std::fs::remove_file(&paths.socket_path);
-    let _ = std::fs::remove_file(&paths.ca_path);
+    let _ = airlock::daemon::remove_runtime_files(paths.runtime_files());
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────

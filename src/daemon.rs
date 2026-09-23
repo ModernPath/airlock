@@ -474,9 +474,7 @@ fn check_and_cleanup_stale_state(
         }
 
         // Process is dead (ESRCH) — stale state. Clean up.
-        let _ = std::fs::remove_file(pid_path);
-        let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(ca_path);
+        remove_runtime_files([pid_path, socket_path, ca_path]);
     } else if socket_path.exists() {
         // No PID file, but a socket file is present. It is either a live
         // embedded daemon (an `airlock run` session writes no PID file) or a
@@ -489,11 +487,26 @@ fn check_and_cleanup_stale_state(
                 path: socket_path.to_path_buf(),
             });
         }
-        let _ = std::fs::remove_file(socket_path);
-        let _ = std::fs::remove_file(ca_path);
+        remove_runtime_files([pid_path, socket_path, ca_path]);
     }
 
     Ok(())
+}
+
+/// Remove the daemon's runtime files. Returns the ones that exist but could
+/// not be removed; a file that is already gone is not an error, since which
+/// files exist depends on the mode (no PID file for an embedded daemon, no
+/// CA without a proxy tool).
+pub fn remove_runtime_files<'a>(
+    files: impl IntoIterator<Item = &'a Path>,
+) -> Vec<(&'a Path, std::io::Error)> {
+    files
+        .into_iter()
+        .filter_map(|path| match std::fs::remove_file(path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Some((path, e)),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Verify the socket file has owner-only permissions.
@@ -803,11 +816,6 @@ pub(crate) async fn run_embedded(
         ring_buffer.log(format!("spawned {refresh_count} secret refresh task(s)"));
     }
 
-    // Capture paths before moving config into Arc.
-    let socket_path = config.socket_path.clone();
-    let pid_path = config.pid_path.clone();
-    let ca_path = config.ca_path.clone();
-
     ring_buffer.log("embedded daemon started, accepting connections".to_string());
 
     // `oneshot::Receiver<T>` is `Unpin`, so borrowing via `&mut cancel_rx`
@@ -864,17 +872,7 @@ pub(crate) async fn run_embedded(
         refresh_tasks.abort_all();
     }
 
-    // Graceful shutdown: signal/wait for child processes and remove the socket
-    // file. No PID file was written, so pid_path removal will fail silently
-    // (the error is logged to the ring buffer only).
-    graceful_shutdown(
-        &child_registry,
-        &ring_buffer,
-        &socket_path,
-        &pid_path,
-        &ca_path,
-    )
-    .await;
+    graceful_shutdown(&child_registry, &ring_buffer, &config).await;
 
     Ok(())
 }
@@ -1015,11 +1013,7 @@ async fn async_main_inner(
 
     // Write PID file.
     let pid = std::process::id();
-    let pid_path = config.pid_path.clone();
-    let socket_path = config.socket_path.clone();
-    let ca_path = config.ca_path.clone();
-
-    if let Err(e) = write_pid_file(&pid_path, pid) {
+    if let Err(e) = write_pid_file(&config.pid_path, pid) {
         ring_buffer.log(format!("failed to write PID file: {e}"));
         return Err(e);
     }
@@ -1027,7 +1021,7 @@ async fn async_main_inner(
     ring_buffer.log(format!("daemon started (PID: {pid})"));
     ring_buffer.log(format!(
         "listening on {} — ready to accept connections",
-        socket_path.display()
+        config.socket_path.display()
     ));
 
     if let Some(pipe) = readiness.take() {
@@ -1087,14 +1081,7 @@ async fn async_main_inner(
     }
 
     // ── Graceful shutdown ──
-    graceful_shutdown(
-        &child_registry,
-        &ring_buffer,
-        &socket_path,
-        &pid_path,
-        &ca_path,
-    )
-    .await;
+    graceful_shutdown(&child_registry, &ring_buffer, &config).await;
 
     Ok(())
 }
@@ -1930,9 +1917,7 @@ async fn write_ndjson_message<W: tokio::io::AsyncWriteExt + Unpin>(
 async fn graceful_shutdown(
     child_registry: &ChildRegistry,
     ring_buffer: &RingBuffer,
-    socket_path: &Path,
-    pid_path: &Path,
-    ca_path: &Path,
+    config: &Config,
 ) {
     // Signal all active children with SIGTERM.
     let pids = child_registry.all();
@@ -1961,19 +1946,9 @@ async fn graceful_shutdown(
         }
     }
 
-    // Remove socket file.
-    if let Err(e) = std::fs::remove_file(socket_path) {
-        ring_buffer.log(format!("failed to remove socket file: {e}"));
+    for (path, e) in remove_runtime_files(config.runtime_files()) {
+        ring_buffer.log(format!("failed to remove {}: {e}", path.display()));
     }
-
-    // Remove PID file.
-    if let Err(e) = std::fs::remove_file(pid_path) {
-        ring_buffer.log(format!("failed to remove PID file: {e}"));
-    }
-
-    // Remove the proxy CA certificate. Absent when no proxy tool is
-    // configured, so a missing file is not worth logging.
-    let _ = std::fs::remove_file(ca_path);
 
     ring_buffer.log("shutdown complete".to_string());
 }
@@ -2035,6 +2010,18 @@ mod tests {
         assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
         let read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
         (read_end, ReadinessPipe(fds[1]))
+    }
+
+    #[test]
+    fn remove_runtime_files_ignores_missing_files() {
+        let tmp = tempfile::tempdir().unwrap();
+        let present = tmp.path().join("airlock.sock");
+        let missing = tmp.path().join("airlock.pid");
+        std::fs::write(&present, b"").unwrap();
+
+        let failed = remove_runtime_files([present.as_path(), missing.as_path()]);
+        assert!(failed.is_empty(), "{failed:?}");
+        assert!(!present.exists());
     }
 
     #[test]
