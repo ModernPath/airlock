@@ -79,6 +79,15 @@ const MAX_CONCURRENT_TUNNELS: usize = 32;
 /// Proxy-auth username. The password is the per-exec token.
 const PROXY_USER: &str = "airlock";
 
+/// Headers an upstream may route by instead of the request line's method.
+/// Google front ends honor `X-HTTP-Method-Override` on GET and POST alike,
+/// so a rule that permits `GET /x` would also let a DELETE of `/x` through.
+const METHOD_OVERRIDE_HEADERS: &[&str] = &[
+    "x-http-method-override",
+    "x-http-method",
+    "x-method-override",
+];
+
 /// Hop-by-hop headers stripped before forwarding upstream. `Content-Length` is
 /// deliberately *not* in this list: some APIs reject a chunked upload, so a
 /// client-declared length is passed through rather than re-derived.
@@ -538,6 +547,18 @@ pub(crate) fn vet_request(
         return Err(deny(
             StatusCode::BAD_REQUEST,
             "denied: duplicate Content-Length",
+        ));
+    }
+
+    // Refused rather than stripped: stripping would quietly turn the request
+    // into a different one than the tool sent.
+    if METHOD_OVERRIDE_HEADERS
+        .iter()
+        .any(|name| parts.headers.contains_key(*name))
+    {
+        return Err(deny(
+            StatusCode::FORBIDDEN,
+            "denied: method-override headers are not allowed; send the real method",
         ));
     }
 

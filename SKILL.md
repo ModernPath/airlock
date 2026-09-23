@@ -99,6 +99,8 @@ Rules:
   proxy removes it. You also have no token to put there.
 - **Only the hosts that `airlock list` shows are reachable.** Requests to any
   other host fail.
+- **Set the method with `-X`.** The proxy refuses any request with an
+  `X-HTTP-Method-Override`, `X-HTTP-Method` or `X-Method-Override` header.
 - **`403` from the proxy means the host, port, method or path is not
   allowed.** The response body says why. This is a policy decision, not a
   temporary error. Do **not** retry with `--noproxy`, `--insecure`/`-k`, a

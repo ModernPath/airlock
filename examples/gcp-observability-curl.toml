@@ -45,13 +45,11 @@
 #
 # What the rules do and do not enforce
 #
-# The rules see only the host, method and path. The IAM roles above are the
-# real boundary, and they have to be read-only on their own, for three
-# reasons:
+# The rules see only the host, method and path. The proxy refuses
+# `X-HTTP-Method-Override` and its variants, so the method a rule matched is
+# the one Google runs. The IAM roles above are still the real boundary, and
+# they have to be read-only on their own:
 #
-#   * Google front ends honor `X-HTTP-Method-Override`, on GET as well as on
-#     POST. The proxy matches the method on the request line, so a "GET" rule
-#     does not stop a write on that path. Only IAM does.
 #   * `entries:list` names the projects to read in the request *body*, which
 #     the proxy does not inspect. Pinning `my-project` in the paths below
 #     narrows everything else, but not this.

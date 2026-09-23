@@ -182,6 +182,8 @@ CONNECT run.googleapis.com:443
        per request:
          ├─ Host header ≠ CONNECT authority           → 400   (no domain fronting)
          ├─ TE + CL together, obs-fold                → 400   (smuggling)
+         ├─ X-HTTP-Method-Override / X-HTTP-Method /
+         │    X-Method-Override present               → 403   (method the rules saw ≠ method that runs)
          ├─ !route.permits(method, path)              → 403
          ├─ remove any client-supplied copy of inject.header
          ├─ look up secret; slot Stale                → 502
