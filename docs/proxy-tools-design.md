@@ -103,7 +103,7 @@ proxy = true
 [[tools.curl.routes]]
 host   = "*.googleapis.com"
 inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_token" }
-allow  = ["GET /**", "POST /v2/projects/*/locations/*/services"]
+allow  = ["* /v2/projects/my-project/**"]
 deny   = ["DELETE /**"]
 ```
 

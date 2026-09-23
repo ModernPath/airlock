@@ -291,9 +291,17 @@ proxy = true
 [[tools.curl.routes]]
 host   = "*.googleapis.com"
 inject = { header = "Authorization", value = "Bearer {secret}", secret = "gcp_token" }
-allow  = ["GET /**", "POST /v2/projects/*/locations/*/services"]
+allow  = ["* /v2/projects/my-project/**"]
 deny   = ["DELETE /**"]
 ```
+
+Each `allow` and `deny` rule has the form `METHOD /path`. `*` as the method matches any method. In the path, `*` matches exactly one segment, and `**` (last segment only) matches the rest of the path. The proxy checks a request in this order:
+
+1. If the request matches any `deny` rule, the proxy refuses it. This is true even if an `allow` rule also matches.
+2. If `allow` is empty, the proxy allows the request.
+3. Otherwise the request must match at least one `allow` rule. A request that matches neither list is refused.
+
+In the example above, `allow` limits the tool to one project, and `deny` removes `DELETE` from that. Without `deny`, you would have to list each allowed method.
 
 The agent then uses ordinary URLs from the API docs:
 
@@ -311,7 +319,7 @@ For each `airlock exec` of a proxy tool, the daemon:
 For each request, the proxy:
 
 1. Checks the host against the routes. A host with no route is unreachable (deny by default).
-2. Checks the method and path against the route's allow/deny rules.
+2. Checks the method and path against the route's allow/deny rules, in the order above.
 3. Attaches the credential.
 4. Sends the request over a verified TLS connection. The host must resolve to a public address.
 

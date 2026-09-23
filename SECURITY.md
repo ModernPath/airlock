@@ -348,6 +348,8 @@ Egress restriction is the second layer, not the first. It makes the set of hosts
 | The host resolves to a private, loopback, link-local (including `169.254.169.254`), CGNAT, ULA, multicast, documentation or other non-routable address | `502` |
 | The upstream answers with a `Content-Encoding` other than `identity`, a transfer coding other than `chunked`, or a partial response (`206` / `Content-Range`) | `502`, and the proxy drops the body unread. See [Response redaction](#response-redaction). |
 
+The proxy checks the allow/deny rules in this order. A request that matches any `deny` rule is refused, even if an `allow` rule also matches. If `allow` is empty, every request that no `deny` rule matches is allowed. If `allow` is not empty, a request must also match at least one `allow` rule. So with a non-empty `allow`, a request that matches neither list is refused.
+
 The allow/deny rules are matched against the *percent-decoded* path, decoding each segment once, because the upstream routes on the decoded path. For example, GitHub treats `DELETE /%72epos/o/n` as `DELETE /repos/o/n`, so it must match `deny = ["DELETE /repos/**"]` in the same way. For this reason you write rules in decoded form, and a rule may not contain `%`.
 
 Before the proxy attaches the credential, it removes every copy of the injected header that the client sent. It also removes `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The proxy reads the secret from the secret store **for each request**, so a background refresh applies to the next request. The proxy builds the header value in a buffer that is zeroized after use, never with `format!`, and marks the value as sensitive.
