@@ -418,15 +418,10 @@ pub fn synchronous_startup(
     // 6. Socket binding with restrictive permissions (owner-only).
     //    Set umask to 0o077 so the socket is created with mode 0o700.
     //    This prevents other local users from connecting to the daemon.
-    let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
-    let bind_result =
-        unix_net::UnixListener::bind(&config.socket_path).map_err(|e| DaemonError::SocketBind {
-            path: config.socket_path.clone(),
-            source: e,
-        });
-    // Restore the original umask immediately, even if bind failed.
-    rustix::process::umask(old_umask);
-    let listener = bind_result?;
+    let listener = bind_owner_only(&config.socket_path).map_err(|e| DaemonError::SocketBind {
+        path: config.socket_path.clone(),
+        source: e,
+    })?;
 
     // 7. Verify socket permissions are owner-only.
     //    Bail out immediately if the filesystem didn't honor the umask — we
@@ -510,6 +505,24 @@ pub fn remove_runtime_files<'a>(
             _ => None,
         })
         .collect()
+}
+
+/// Serializes the umask swap in [`bind_owner_only`].
+static UMASK_LOCK: Mutex<()> = Mutex::new(());
+
+/// Bind a Unix socket at `path` with mode `0700`.
+///
+/// A socket's mode comes from the umask at `bind` time, and the umask is
+/// process-wide. The daemon binds before any other thread exists, but tests
+/// bind from parallel threads. Without the lock, one thread could restore a
+/// permissive umask between another thread's swap and its `bind`.
+fn bind_owner_only(path: &Path) -> std::io::Result<unix_net::UnixListener> {
+    let _guard = UMASK_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
+    let result = unix_net::UnixListener::bind(path);
+    // Restore the original umask even if bind failed.
+    rustix::process::umask(old_umask);
+    result
 }
 
 /// Verify the socket file has owner-only permissions.
@@ -2354,10 +2367,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("test.sock");
 
-        // Reproduce the same umask pattern used in synchronous_startup().
-        let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
-        let _listener = unix_net::UnixListener::bind(&socket_path).unwrap();
-        rustix::process::umask(old_umask);
+        let _listener = bind_owner_only(&socket_path).unwrap();
 
         let metadata = std::fs::symlink_metadata(&socket_path).unwrap();
         let mode = metadata.permissions().mode() & 0o777;
@@ -2374,9 +2384,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("good.sock");
 
-        let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
-        let _listener = unix_net::UnixListener::bind(&socket_path).unwrap();
-        rustix::process::umask(old_umask);
+        let _listener = bind_owner_only(&socket_path).unwrap();
 
         let result = verify_socket_permissions(&socket_path);
         assert!(result.is_ok(), "owner-only socket should pass: {result:?}");
@@ -2390,9 +2398,7 @@ mod tests {
         let socket_path = tmp.path().join("bad.sock");
 
         // Create socket then widen permissions to simulate a bad filesystem.
-        let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
-        let _listener = unix_net::UnixListener::bind(&socket_path).unwrap();
-        rustix::process::umask(old_umask);
+        let _listener = bind_owner_only(&socket_path).unwrap();
 
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o750)).unwrap();
 
@@ -2419,9 +2425,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let socket_path = tmp.path().join("bad.sock");
 
-        let old_umask = rustix::process::umask(rustix::fs::Mode::RWXG | rustix::fs::Mode::RWXO);
-        let _listener = unix_net::UnixListener::bind(&socket_path).unwrap();
-        rustix::process::umask(old_umask);
+        let _listener = bind_owner_only(&socket_path).unwrap();
 
         std::fs::set_permissions(&socket_path, std::fs::Permissions::from_mode(0o755)).unwrap();
 
