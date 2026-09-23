@@ -293,23 +293,15 @@ fn days_to_date(days: u64) -> (u64, u64, u64) {
 ///
 /// Supports insert, remove, and iterate-all operations. Safe to access from
 /// multiple tokio tasks concurrently.
-#[derive(Clone)]
+#[derive(Default)]
 pub struct ChildRegistry {
-    inner: Arc<Mutex<HashSet<u32>>>,
-}
-
-impl Default for ChildRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
+    inner: Mutex<HashSet<u32>>,
 }
 
 impl ChildRegistry {
     /// Create a new empty registry.
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(Mutex::new(HashSet::new())),
-        }
+        Self::default()
     }
 
     /// Register a child PID. Duplicate insertions are handled gracefully.
@@ -2104,11 +2096,11 @@ mod tests {
 
     #[tokio::test]
     async fn registry_concurrent_access() {
-        let reg = ChildRegistry::new();
+        let reg = Arc::new(ChildRegistry::new());
         let mut handles = Vec::new();
 
         for i in 0..10 {
-            let reg_clone = reg.clone();
+            let reg_clone = Arc::clone(&reg);
             handles.push(tokio::spawn(async move {
                 for j in 0..100 {
                     let pid = (i * 1000 + j) as u32 + 2; // Ensure PIDs >= 2
