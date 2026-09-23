@@ -1435,7 +1435,8 @@ async fn handle_exec_request(
     let timeout = tool_config.timeout.unwrap_or(config.timeout);
 
     // ── 7. Policy and sandbox profile construction ──────────────────────────
-    let mut tool_policy = match policy::build_tool_policy(&tool, &config) {
+    let proxy_port = proxy_session.as_ref().map(ProxySession::port);
+    let mut tool_policy = match policy::build_tool_policy(&tool, &config, proxy_port) {
         Ok(p) => p,
         Err(e) => {
             log_and_send_error(
@@ -1448,9 +1449,6 @@ async fn handle_exec_request(
         }
     };
     tool_policy.binary_path = Some(binary.clone());
-    if let Some(session) = &proxy_session {
-        tool_policy.network = sandbox::NetworkAccess::ProxyOnly(session.port());
-    }
 
     let sandbox_profile = match build_platform_sandbox_profile(&tool_policy) {
         Ok(p) => p,
