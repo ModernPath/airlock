@@ -1180,6 +1180,42 @@ async fn log_and_send_error<W: tokio::io::AsyncWrite + Unpin>(
     let _ = write_ndjson_message(writer, &DaemonMessage::Error { message: msg }).await;
 }
 
+/// The tool's `env` map with every secret reference resolved, in the map's
+/// (alphabetical) order.
+///
+/// A `Stale` slot — left behind by a failed background refresh — is an
+/// error: the exec is refused rather than handing the tool a value known to
+/// be expired. Refs are validated at config load time, so a missing label
+/// here is an internal invariant break.
+fn resolve_tool_env(
+    tool_config: &config::ToolConfig,
+    secrets: &SecretStore,
+) -> Result<Vec<(String, String)>, String> {
+    let mut env_pairs = Vec::with_capacity(tool_config.env.len());
+    for (name, value) in &tool_config.env {
+        match value {
+            config::EnvValue::Static(s) => env_pairs.push((name.clone(), s.clone())),
+            config::EnvValue::SecretRef(label) => {
+                let Some(slot_lock) = secrets.get(label) else {
+                    continue;
+                };
+                let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+                match &slot.health {
+                    Health::Healthy => {
+                        env_pairs.push((name.clone(), slot.value.expose_secret().clone()));
+                    }
+                    Health::Stale { reason, .. } => {
+                        return Err(format!(
+                            "secret {label:?} is stale (last refresh failed): {reason}"
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    Ok(env_pairs)
+}
+
 /// The reason the concurrent I/O loop terminated.
 enum TermReason {
     /// The child process exited with the given status.
@@ -1270,46 +1306,11 @@ async fn handle_exec_request(
     };
 
     // ── 4. Environment construction ─────────────────────────────────────────
-    //
-    // Walk the tool's env map in order (BTreeMap → alphabetical). Static
-    // entries pass through; SecretRef entries take a short-lived read lock on
-    // the slot. A `Stale` slot — left behind by a failed background refresh —
-    // is a hard error: we refuse the exec rather than hand the tool a value
-    // we know to be expired. Refs are validated at config load time, so a
-    // missing label here is an internal invariant break.
     let tool_config = &config.tools[&tool];
-    let env_build_result: Result<Vec<(String, String)>, (String, String)> = (|| {
-        let mut env_pairs: Vec<(String, String)> = Vec::with_capacity(tool_config.env.len());
-        for (name, value) in tool_config.env.iter() {
-            match value {
-                config::EnvValue::Static(s) => env_pairs.push((name.clone(), s.clone())),
-                config::EnvValue::SecretRef(label) => {
-                    let Some(slot_lock) = secrets.get(label) else {
-                        continue;
-                    };
-                    let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
-                    match &slot.health {
-                        Health::Healthy => {
-                            env_pairs.push((name.clone(), slot.value.expose_secret().clone()));
-                        }
-                        Health::Stale { reason, .. } => {
-                            return Err((label.clone(), reason.clone()));
-                        }
-                    }
-                }
-            }
-        }
-        Ok(env_pairs)
-    })();
-    let env_pairs = match env_build_result {
-        Ok(p) => p,
-        Err((label, reason)) => {
-            log_and_send_error(
-                format!("secret {label:?} is stale (last refresh failed): {reason}"),
-                ring_buffer,
-                &mut writer,
-            )
-            .await;
+    let env_pairs = match resolve_tool_env(tool_config, secrets) {
+        Ok(pairs) => pairs,
+        Err(msg) => {
+            log_and_send_error(msg, ring_buffer, &mut writer).await;
             return;
         }
     };
@@ -1476,36 +1477,16 @@ async fn handle_exec_request(
             // Stdout redacted output.
             data = stdout_rx.recv(), if !stdout_done => {
                 match data {
-                    Some(bytes) => {
-                        let text = redact::bytes_to_lossy_utf8(&bytes);
-                        if !text.is_empty() {
-                            let _ = write_ndjson_message(
-                                &mut writer,
-                                &DaemonMessage::Stdout { data: text },
-                            ).await;
-                        }
-                    }
-                    None => {
-                        stdout_done = true;
-                    }
+                    Some(bytes) => send_output(&mut writer, &bytes, stdout_message).await,
+                    None => stdout_done = true,
                 }
             }
 
             // Stderr redacted output.
             data = stderr_rx.recv(), if !stderr_done => {
                 match data {
-                    Some(bytes) => {
-                        let text = redact::bytes_to_lossy_utf8(&bytes);
-                        if !text.is_empty() {
-                            let _ = write_ndjson_message(
-                                &mut writer,
-                                &DaemonMessage::Stderr { data: text },
-                            ).await;
-                        }
-                    }
-                    None => {
-                        stderr_done = true;
-                    }
+                    Some(bytes) => send_output(&mut writer, &bytes, stderr_message).await,
+                    None => stderr_done = true,
                 }
             }
 
@@ -1581,15 +1562,13 @@ async fn handle_exec_request(
             let _ = stderr_task.await;
 
             // Drain remaining output from channels.
-            drain_channel_to_client(&mut stdout_rx, &mut writer, true).await;
-            drain_channel_to_client(&mut stderr_rx, &mut writer, false).await;
+            drain_channel_to_client(&mut stdout_rx, &mut writer, stdout_message).await;
+            drain_channel_to_client(&mut stderr_rx, &mut writer, stderr_message).await;
 
             // Send exit message.
             let code = exit_code_from_status(status);
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code }).await;
 
-            // Clean up.
-            child_registry.remove(pid);
             ring_buffer.log(format!("tool {:?} exited (PID: {pid}, code: {code})", tool));
         }
 
@@ -1598,7 +1577,6 @@ async fn handle_exec_request(
             let _ = exec::kill_process_group(pid, libc::SIGKILL);
             let code = -1;
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code }).await;
-            child_registry.remove(pid);
             ring_buffer.log(format!("tool {:?} wait error (PID: {pid}): {e}", tool));
         }
 
@@ -1617,8 +1595,6 @@ async fn handle_exec_request(
                 timeout.as_secs()
             );
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Error { message: msg }).await;
-
-            child_registry.remove(pid);
         }
 
         TermReason::ClientDisconnect => {
@@ -1628,8 +1604,6 @@ async fn handle_exec_request(
             ));
 
             sigterm_then_sigkill(&mut child, pid).await;
-
-            child_registry.remove(pid);
             // No message to client — already disconnected.
         }
 
@@ -1651,10 +1625,10 @@ async fn handle_exec_request(
             )
             .await;
             let _ = write_ndjson_message(&mut writer, &DaemonMessage::Exit { code: -1 }).await;
-
-            child_registry.remove(pid);
         }
     }
+
+    child_registry.remove(pid);
 }
 
 // ─── Child lifecycle helpers ─────────────────────────────────────────────────
@@ -1683,25 +1657,34 @@ async fn sigterm_then_sigkill(child: &mut tokio::process::Child, pid: u32) {
 }
 
 /// Drain all remaining redacted output from a channel and send it to the client.
-///
-/// `is_stdout` selects whether to wrap each chunk as a `Stdout` or `Stderr`
-/// NDJSON message.
 async fn drain_channel_to_client<W: tokio::io::AsyncWriteExt + Unpin>(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
     writer: &mut W,
-    is_stdout: bool,
+    message: fn(String) -> DaemonMessage,
 ) {
     while let Ok(bytes) = rx.try_recv() {
-        let text = redact::bytes_to_lossy_utf8(&bytes);
-        if !text.is_empty() {
-            let msg = if is_stdout {
-                DaemonMessage::Stdout { data: text }
-            } else {
-                DaemonMessage::Stderr { data: text }
-            };
-            let _ = write_ndjson_message(writer, &msg).await;
-        }
+        send_output(writer, &bytes, message).await;
     }
+}
+
+/// Send one redacted chunk to the client, wrapped by `message`.
+async fn send_output<W: tokio::io::AsyncWriteExt + Unpin>(
+    writer: &mut W,
+    bytes: &[u8],
+    message: fn(String) -> DaemonMessage,
+) {
+    let text = redact::bytes_to_lossy_utf8(bytes);
+    if !text.is_empty() {
+        let _ = write_ndjson_message(writer, &message(text)).await;
+    }
+}
+
+fn stdout_message(data: String) -> DaemonMessage {
+    DaemonMessage::Stdout { data }
+}
+
+fn stderr_message(data: String) -> DaemonMessage {
+    DaemonMessage::Stderr { data }
 }
 
 /// Set up an async reader -> sync channel -> blocking redact -> tokio mpsc pipeline
@@ -2179,6 +2162,70 @@ mod tests {
 
         let pids = reg.all();
         assert_eq!(pids.len(), 1000);
+    }
+
+    // ── Tool env resolution tests ──────────────────────────────────────────
+
+    fn tool_with_env(env: &[(&str, config::EnvValue)]) -> config::ToolConfig {
+        config::ToolConfig {
+            env: env
+                .iter()
+                .map(|(name, value)| (name.to_string(), value.clone()))
+                .collect(),
+            extra_read: Vec::new(),
+            extra_write: Vec::new(),
+            timeout: None,
+            description: None,
+            proxy: None,
+        }
+    }
+
+    fn store_with(label: &str, value: &str, health: Health) -> SecretStore {
+        let slot = secrets::SecretSlot {
+            value: Arc::new(secrets::Secret::new(value.to_string())),
+            health,
+        };
+        Arc::new(
+            [(label.to_string(), RwLock::new(slot))]
+                .into_iter()
+                .collect(),
+        )
+    }
+
+    #[test]
+    fn resolve_tool_env_fills_in_secret_references() {
+        let tool = tool_with_env(&[
+            ("MODE", config::EnvValue::Static("ci".to_string())),
+            ("TOKEN", config::EnvValue::SecretRef("tok".to_string())),
+        ]);
+        let store = store_with("tok", "s3cret-value", Health::Healthy);
+
+        let env = resolve_tool_env(&tool, &store).unwrap();
+        assert_eq!(
+            env,
+            [
+                ("MODE".to_string(), "ci".to_string()),
+                ("TOKEN".to_string(), "s3cret-value".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn resolve_tool_env_refuses_a_stale_secret_without_naming_its_value() {
+        let tool = tool_with_env(&[("TOKEN", config::EnvValue::SecretRef("tok".to_string()))]);
+        let store = store_with(
+            "tok",
+            "s3cret-value",
+            Health::Stale {
+                reason: "command exited 1".to_string(),
+                since: std::time::Instant::now(),
+            },
+        );
+
+        let err = resolve_tool_env(&tool, &store).unwrap_err();
+        assert!(err.contains("\"tok\" is stale"), "{err}");
+        assert!(err.contains("command exited 1"), "{err}");
+        assert!(!err.contains("s3cret-value"), "{err}");
     }
 
     // ── Stale state detection tests ────────────────────────────────────────
