@@ -333,7 +333,11 @@ When a `command` secret declares `refresh = N`, a dedicated tokio task is
 spawned in the async runtime to re-run the command every `N` seconds and swap
 the in-memory value. The redactor is rebuilt on each successful refresh and
 keeps both the new and previous-generation values for one cycle, so output
-captured just before the swap is still redacted. On failure, the slot's
+captured just before the swap is still redacted. The rebuilt redactor is
+swapped in *before* the new value is published to the slot: the proxy reads
+the slot per request, so any other order would let an echoing upstream hand
+the fresh credential back through a redactor that has never seen it. On
+failure, the slot's
 health flips to `Stale`, the previous value is retained but the exec path
 refuses to inject it, and the task retries with exponential backoff capped
 at `refresh_max_backoff` until the upstream recovers.

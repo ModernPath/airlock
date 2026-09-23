@@ -16,7 +16,9 @@
 //!   handlers snapshot the inner `Arc<Redactor>` once at accept time, so
 //!   in-flight streams keep their old redactor for their lifetime.
 //! - On every successful refresh the redactor is rebuilt with two generations
-//!   per refreshable secret (current + previous). The retired previous value
+//!   per refreshable secret (current + previous) and swapped in *before* the
+//!   new value is published to the slot, so no reader can ever hand a secret
+//!   upstream that the live redactor doesn't know. The retired previous value
 //!   drops one cycle later — this is a deliberate trade-off against
 //!   `Secret<T>`'s eager-zeroize guarantee, in exchange for closing the
 //!   redaction gap during a swap.
@@ -148,11 +150,18 @@ impl RefreshTask {
     }
 }
 
-/// Run one refresh attempt synchronously. On success, swap the slot's value
-/// to the freshly-fetched one, mark `Healthy`, and rebuild the redactor with
-/// two generations per refreshable secret. On failure, mark the slot
-/// `Stale`, leave the value alone (so its bytes still feed the redactor),
-/// and log to the ring buffer.
+/// Run one refresh attempt synchronously. On success, rebuild the redactor
+/// with two generations for this secret and swap it in, then publish the
+/// freshly-fetched value to the slot and mark it `Healthy`. On failure, mark
+/// the slot `Stale`, leave the value alone (so its bytes still feed the
+/// redactor), and log to the ring buffer.
+///
+/// The redactor must be swapped *before* the slot is published: anything
+/// that reads the slot (the proxy's credential injection, exec's env
+/// building) may send the new value upstream immediately, and the redactor
+/// snapshot taken for that response has to already know it. Publishing
+/// first would open a window where an echoing upstream returns the new
+/// secret to the tool in plaintext.
 pub(crate) fn refresh_once(
     label: &str,
     argv: &[String],
@@ -165,16 +174,12 @@ pub(crate) fn refresh_once(
     match run_command_secret(argv, timeout, env) {
         Ok(value) => {
             let new_value = Arc::new(Secret::new(value));
-            let (previous_value, was_stale) = {
-                let slot_lock = store
-                    .get(label)
-                    .ok_or_else(|| format!("secret label {label:?} missing from store"))?;
-                let mut slot = slot_lock.write().unwrap_or_else(|e| e.into_inner());
-                let prev = Arc::clone(&slot.value);
-                let was_stale = matches!(slot.health, Health::Stale { .. });
-                slot.value = Arc::clone(&new_value);
-                slot.health = Health::Healthy;
-                (prev, was_stale)
+            let slot_lock = store
+                .get(label)
+                .ok_or_else(|| format!("secret label {label:?} missing from store"))?;
+            let previous_value = {
+                let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
+                Arc::clone(&slot.value)
             };
 
             rebuild_redactor(
@@ -184,6 +189,14 @@ pub(crate) fn refresh_once(
                 Some(&previous_value),
                 redactor_swap,
             )?;
+
+            let was_stale = {
+                let mut slot = slot_lock.write().unwrap_or_else(|e| e.into_inner());
+                let was_stale = matches!(slot.health, Health::Stale { .. });
+                slot.value = new_value;
+                slot.health = Health::Healthy;
+                was_stale
+            };
             if was_stale {
                 ring.log(format!(
                     "secret refresh recovered for {label} (now healthy)"
