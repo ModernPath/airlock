@@ -341,8 +341,34 @@ Egress restriction is the second layer, not the first. It is what makes the tool
 | Path contains `.`/`..` segments, `//`, a backslash, or an encoded `/`, `.`, `\` or NUL | `403` — refused rather than normalized, because the upstream's normalization may differ from the matcher's |
 | The injected secret's slot is `Stale` | `502` |
 | Host resolves to any private, loopback, link-local (incl. `169.254.169.254`), CGNAT, ULA, multicast, documentation or otherwise non-routable address | `502` |
+| The upstream answers with a `Content-Encoding` other than `identity`, a transfer coding other than `chunked`, or a partial representation (`206` / `Content-Range`) | `502`, body dropped unread — see [Response redaction](#response-redaction) |
 
 On the way through, every client-supplied copy of the injected header is removed before the credential is attached, as are `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The secret is read from the secret store **per request**, so a background refresh applies to the next one. The header value is assembled into a buffer that is zeroized, never through `format!`, and is marked sensitive.
+
+The request is also rewritten so that the response is something the redactor can read: `Accept-Encoding` is forced to `identity` whatever the tool asked for, and `Range` / `If-Range` are removed.
+
+### Response redaction
+
+Everything the upstream sends back is redacted before it reaches the tool, with the same automaton and the same secret set (raw, base64, URL-encoded and hex variants of *every* declared secret, not just this route's) that the tool's stdout goes through:
+
+- **All response header values** — every one of them, including `Location`, `Set-Cookie` and `WWW-Authenticate`. A value that will not rebuild after replacement is dropped rather than forwarded.
+- **The body**, streamed. Nothing is buffered beyond the partial match at the end of a frame, so a multi-gigabyte download costs what a small one costs, and the tool's own read rate is what drives the upstream read. A secret split across two upstream writes is still caught.
+- **Trailers are dropped**, not forwarded.
+- **The upstream's reason phrase is dropped.** `HTTP/1.1 200 <anything>` is a legal status line and sits outside the header map, so the tool sees the status code with the standard phrase, never the upstream's text.
+
+The redactor is taken per response from the daemon's live handle, not snapshotted when the exec started: a tool runs for minutes, the proxy injects whatever the store holds *now*, and the two generations a refresh leaves behind cover a swap that lands mid-response.
+
+Because a `[REDACTED:name]` placeholder is not the length of the secret it replaced, an upstream `Content-Length` is wrong whenever anything matches — and which it is cannot be known before the body has been read. The proxy therefore drops it for any response that has a body and lets hyper frame the response as chunked (HTTP/1.1 always supports it). A bodiless response — HEAD, `1xx`, `204`, `304` — keeps its length, which describes the representation rather than bytes on the wire, so `curl -I` still reports one.
+
+Three things fail closed rather than being handled, all for the same reason — the redactor reads bytes, not formats, and Airlock adds no decoder to the response path:
+
+- **Compressed responses.** `gzip`, `br`, `zstd` and `deflate` are opaque to a byte-pattern scanner. The request demands `identity`; an upstream that compresses anyway gets a `502` and its body is dropped unread.
+- **Unknown transfer codings**, for the same reason.
+- **Byte ranges.** A range may begin in the middle of a secret, which would split the pattern across two responses the proxy never sees together while the tool reassembles the plaintext in a file. `Range` and `If-Range` are stripped from the request so the upstream sends the whole representation, and a `206` or `Content-Range` that arrives anyway is refused. Resumed and parallel-chunked downloads therefore do not work through a proxy tool.
+
+There is no configuration that turns any of this off. Redaction on the output path is mandatory in Airlock, and the proxy is an output path.
+
+When a response had anything replaced, the audit line says so: a count of header values on the line written when the headers arrive, and a second line when the body ends carrying the body's count. Counts only — never the matched bytes.
 
 The CONNECT authority is the single source of truth: it selects the route, names the leaf certificate the tool is shown, is the name resolved and dialled, and is the name the upstream certificate is verified against (TLS ≥ 1.2, public roots). The client's SNI is ignored entirely, so `curl --resolve`, `--connect-to`, a forged `Host` and a forged SNI cannot make any two of those disagree. DNS is resolved once and the concrete `SocketAddr` that passed the address check is the one dialled, so rebinding cannot slip between check and use.
 
@@ -361,7 +387,7 @@ Each request is logged to the ring buffer: tool, method, host, path, decision an
 - **Misuse, not leakage.** The agent gets the credential's full API authority on routed hosts — broader than a purpose-built CLI. Mitigate with a narrowly scoped service account first and method/path rules second.
 - **Data exfiltration to co-tenants.** Anything the tool can read can be uploaded to an attacker's project on an allowed multi-tenant host (`storage.googleapis.com` serves every GCP customer). The credential cannot.
 - **Path rules are a convenience layer, not an authorization system.** They see the path, not the body; a `POST` allowed for one purpose may do another (`:batchUpdate`, GraphQL). IAM is the authority boundary.
-- **`-o` and friends bypass the stdout redactor.** Response bodies reach the agent through the tool's stdout, which passes through the Aho-Corasick redactor — so an API that echoes the bearer token back is covered there. A body written to a file (`curl -o`, `--dump-header`, `--trace`) is not. This gap exists for every Airlock tool, but it is more reachable here.
+- **An upstream that *transforms* the secret is not caught.** [Response redaction](#response-redaction) closes the `curl -o` / `--dump-header` / `--trace` path for response bytes: what the tool writes to a file was already redacted, so the plaintext credential never exists inside the sandbox. What it does not catch is an upstream that reflects the secret reversed, re-chunked, or encoded in a scheme the redactor does not know — the same limitation the stdout path has always had. It also says nothing about the agent's own request data: a query string or request body the agent chose is forwarded as sent.
 - **Linux egress pinning is port-scoped and TCP-only** — see [Linux — Landlock LSM](#linux--landlock-lsm).
 - **HTTP/1.1 only.** ALPN offers `http/1.1` and nothing else; gRPC and HTTP/2-only endpoints will not work.
 - **Certificate-pinned clients break** under interception. By design.

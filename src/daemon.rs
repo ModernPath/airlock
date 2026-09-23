@@ -791,10 +791,15 @@ pub(crate) async fn run_embedded(
                         // Snapshot the redactor at accept time so in-flight
                         // connections are not affected by concurrent refreshes.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        // The live handle travels alongside the snapshot: a
+                        // proxy response is redacted with whatever the daemon
+                        // holds *now*, because the proxy injects whatever it
+                        // holds now.
+                        let live = Arc::clone(&redactor);
                         let ca = proxy_ca.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, ca).await;
+                            handle_connection(stream, cfg, sec, red, live, rb.clone(), cr, ca).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -976,10 +981,15 @@ async fn async_main(
                         // may swap the inner Arc later; this connection keeps
                         // its snapshot for its full lifetime.
                         let red = redactor.read().unwrap_or_else(|e| e.into_inner()).clone();
+                        // The live handle travels alongside the snapshot: a
+                        // proxy response is redacted with whatever the daemon
+                        // holds *now*, because the proxy injects whatever it
+                        // holds now.
+                        let live = Arc::clone(&redactor);
                         let ca = proxy_ca.clone();
 
                         tokio::spawn(async move {
-                            handle_connection(stream, cfg, sec, red, rb.clone(), cr, ca).await;
+                            handle_connection(stream, cfg, sec, red, live, rb.clone(), cr, ca).await;
                             rb.log(format!("connection closed ({peer_info})"));
                         });
                     }
@@ -1032,6 +1042,7 @@ async fn handle_connection(
     config: Arc<Config>,
     secrets: SecretStore,
     redactor: Arc<Redactor>,
+    live_redactor: Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
     proxy_ca: Option<Arc<ProxyCa>>,
@@ -1117,6 +1128,7 @@ async fn handle_connection(
                 config,
                 secrets,
                 redactor,
+                live_redactor,
                 ring_buffer,
                 child_registry,
                 proxy_ca,
@@ -1199,6 +1211,7 @@ async fn handle_exec_request(
     config: Arc<Config>,
     secrets: SecretStore,
     redactor: Arc<Redactor>,
+    live_redactor: Arc<RwLock<Arc<Redactor>>>,
     ring_buffer: RingBuffer,
     child_registry: ChildRegistry,
     proxy_ca: Option<Arc<ProxyCa>>,
@@ -1317,6 +1330,7 @@ async fn handle_exec_request(
                 ca,
                 config.ca_path.clone(),
                 Arc::clone(&secrets),
+                live_redactor,
                 ring_buffer.clone(),
             ) {
                 Ok(session) => {
