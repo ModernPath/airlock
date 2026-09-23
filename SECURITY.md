@@ -338,10 +338,12 @@ Egress restriction is the second layer, not the first. It is what makes the tool
 | Absolute-form request target inside the tunnel | `400` |
 | `Transfer-Encoding` with `Content-Length`, or a duplicated `Content-Length` | `400` — request smuggling |
 | Method/path not permitted by the route's `allow` / `deny` | `403` |
-| Path contains `.`/`..` segments, `//`, a backslash, or an encoded `/`, `.`, `\` or NUL | `403` — refused rather than normalized, because the upstream's normalization may differ from the matcher's |
+| Path contains `.`/`..` segments, `//`, a backslash, a malformed percent-escape, or an escape that decodes to `/`, `\`, `%` or NUL | `403` — refused rather than normalized, because the upstream's normalization may differ from the matcher's |
 | The injected secret's slot is `Stale` | `502` |
 | Host resolves to any private, loopback, link-local (incl. `169.254.169.254`), CGNAT, ULA, multicast, documentation or otherwise non-routable address | `502` |
 | The upstream answers with a `Content-Encoding` other than `identity`, a transfer coding other than `chunked`, or a partial representation (`206` / `Content-Range`) | `502`, body dropped unread — see [Response redaction](#response-redaction) |
+
+Rules are matched against the *percent-decoded* path, one decode per segment, because that is what the upstream routes on: `DELETE /%72epos/o/n` is `DELETE /repos/o/n` to GitHub and must hit a `deny = ["DELETE /repos/**"]` the same way. Rule literals are therefore written in decoded form and may not contain `%` themselves.
 
 On the way through, every client-supplied copy of the injected header is removed before the credential is attached, as are `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The secret is read from the secret store **per request**, so a background refresh applies to the next one. The header value is assembled into a buffer that is zeroized, never through `format!`, and is marked sensitive.
 

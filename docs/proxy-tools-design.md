@@ -133,11 +133,13 @@ Validation (all at config load, all covered by tests):
 - Rules match the path only, never the query string.
 
 **Path ambiguity is refused, not normalized.** Rules are matched against the
-path as sent, but an upstream may collapse `//`, resolve `..`, or decode
-`%2F` before routing. Any of those lets a request match `allow` as one path
-and be served as another. Requests whose path contains `.`/`..` segments,
-empty inner segments, a backslash, or an encoded `/`, `.`, `\` or NUL are
-refused regardless of rules.
+percent-decoded path (one decode per segment), because that is what the
+upstream routes on — `/%72epos` must hit a `deny` on `/repos`. Rule literals
+are written in decoded form and may not contain `%`. Anything whose meaning
+still depends on the upstream's normalization is refused regardless of rules:
+`.`/`..` segments, empty inner segments, a backslash, a malformed escape, or
+an escape that decodes to `/`, `\`, `%` (double encoding) or NUL. Any of
+those would let a request match `allow` as one path and be served as another.
 
 ## Runtime design
 

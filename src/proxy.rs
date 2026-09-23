@@ -232,6 +232,14 @@ impl PathRule {
                 s if s.contains('*') => {
                     return Err(err("'*' must be a whole segment (\"*\" or \"**\")"));
                 }
+                // Request paths are percent-decoded before matching, so a
+                // rule is always written in decoded form; an escape here
+                // could never match anything.
+                s if s.contains('%') => {
+                    return Err(err(
+                        "path must not contain percent-escapes (write the decoded form)",
+                    ));
+                }
                 s => Segment::Literal(s.to_string()),
             });
         }
@@ -239,7 +247,7 @@ impl PathRule {
         Ok(PathRule { method, segments })
     }
 
-    fn matches(&self, method: &str, path_segments: &[&str]) -> bool {
+    fn matches(&self, method: &str, path_segments: &[Vec<u8>]) -> bool {
         if let Some(m) = &self.method {
             // Case-insensitive so a `deny = ["DELETE /**"]` still bites if the
             // client sends `delete` and the upstream happens to accept it.
@@ -257,7 +265,7 @@ impl PathRule {
                     _ => return false,
                 },
                 Segment::Literal(lit) => match rest.split_first() {
-                    Some((s, tail)) if s == lit => rest = tail,
+                    Some((s, tail)) if s == lit.as_bytes() => rest = tail,
                     _ => return false,
                 },
             }
@@ -266,35 +274,55 @@ impl PathRule {
     }
 }
 
-/// Split a request path into segments for rule matching, or `None` if the
-/// path is one the rules cannot be evaluated against safely.
+/// Split a request path into percent-decoded segments for rule matching, or
+/// `None` if the path is one the rules cannot be evaluated against safely.
 ///
-/// Rules are matched against the path exactly as the client sent it, but the
-/// upstream is free to normalize it first — collapse `//`, resolve `..`,
-/// decode `%2F`. Any of those would let a request match `allow` as one path
-/// and be served as another. Rather than guess at the upstream's
-/// normalization, such paths are refused outright.
-fn split_request_path(path: &str) -> Option<Vec<&str>> {
+/// The upstream will decode the path before routing it, so rules have to be
+/// matched against the decoded form — otherwise `/%72epos` slips past a
+/// `deny = ["DELETE /repos/**"]` and is served as `/repos`. Decoding is done
+/// exactly once per segment. Anything whose meaning still depends on how
+/// the upstream normalizes — an escape that yields a `/`, `\`, NUL or a
+/// second-round `%`, a `.` / `..` segment, an empty segment, a malformed
+/// escape — is refused rather than guessed at, since matching `allow` as one
+/// path and being served as another is exactly the bypass the rules exist
+/// to prevent.
+fn split_request_path(path: &str) -> Option<Vec<Vec<u8>>> {
     let path = path.strip_prefix('/')?;
     if path.contains('\\') {
         return None;
     }
-    let lowered = path.to_ascii_lowercase();
-    if ["%2f", "%2e", "%5c", "%00"]
-        .iter()
-        .any(|enc| lowered.contains(enc))
-    {
-        return None;
-    }
 
-    let segments: Vec<&str> = path.split('/').collect();
-    let last = segments.len() - 1;
-    for (i, seg) in segments.iter().enumerate() {
-        if *seg == "." || *seg == ".." || (seg.is_empty() && i != last) {
+    let raw: Vec<&str> = path.split('/').collect();
+    let last = raw.len() - 1;
+    let mut segments = Vec::with_capacity(raw.len());
+    for (i, seg) in raw.iter().enumerate() {
+        let decoded = decode_segment(seg)?;
+        if decoded.iter().any(|b| matches!(b, b'/' | b'\\' | b'%' | 0)) {
             return None;
         }
+        if decoded == b"." || decoded == b".." || (decoded.is_empty() && i != last) {
+            return None;
+        }
+        segments.push(decoded);
     }
     Some(segments)
+}
+
+/// Percent-decode one path segment, or `None` on a malformed escape (`%` not
+/// followed by two hex digits).
+fn decode_segment(seg: &str) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(seg.len());
+    let mut bytes = seg.bytes();
+    while let Some(b) = bytes.next() {
+        if b != b'%' {
+            out.push(b);
+            continue;
+        }
+        let hi = (bytes.next()? as char).to_digit(16)?;
+        let lo = (bytes.next()? as char).to_digit(16)?;
+        out.push((hi * 16 + lo) as u8);
+    }
+    Some(out)
 }
 
 // ─── Credential injection ─────────────────────────────────────────────────────
@@ -633,13 +661,51 @@ mod tests {
             "//a",
             "/a/%2e%2e/b",
             "/a/%2E%2E/b",
+            "/a/%2e/b",
             "/a%2Fb",
             "/a%5cb",
             "/a\\b",
             "/a%00",
+            "/a%25b",
+            "/a%252e%252e/b",
+            "/a/%2",
+            "/a/%zz",
+            "/a/%",
+            "/a/%2e%2",
         ] {
             assert!(!r.permits("GET", bad), "{bad:?} should be refused");
         }
+    }
+
+    #[test]
+    fn percent_encoded_segments_match_their_decoded_form() {
+        let r = route("api.github.com", &[], &["DELETE /repos/**"]);
+        assert!(!r.permits("DELETE", "/repos/o/n"));
+        assert!(
+            !r.permits("DELETE", "/%72epos/o/n"),
+            "encoded unreserved char"
+        );
+        assert!(
+            !r.permits("DELETE", "/%72%65%70%6F%73/o/n"),
+            "fully encoded"
+        );
+        assert!(
+            !r.permits("DELETE", "/repos/o%20x/n"),
+            "escape in a wildcard segment"
+        );
+        assert!(r.permits("GET", "/%72epos/o/n"));
+
+        let r = route("example.com", &["GET /a-b/*"], &[]);
+        assert!(r.permits("GET", "/a%2Db/x"));
+        assert!(r.permits("GET", "/a-b/x%20y"));
+        assert!(!r.permits("GET", "/a%2Db/x%2Fy"));
+        assert!(!r.permits("GET", "/ab/x"));
+    }
+
+    #[test]
+    fn rule_literals_refuse_percent_escapes() {
+        let err = PathRule::parse("GET /a%20b").unwrap_err();
+        assert!(matches!(err, RouteError::InvalidRule { .. }), "{err:?}");
     }
 
     #[test]
