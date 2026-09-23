@@ -27,7 +27,7 @@ discover which tools are available before attempting to execute them.
 The daemon does NOT need to be running for this command — it reads the config
 file directly.
 
-A tool listed with `proxy tool; reachable hosts:` is a proxy tool — see
+If a tool shows `proxy tool; reachable hosts:`, it is a proxy tool. See
 [Proxy tools](#proxy-tools) for how to use one.
 
 Example output:
@@ -72,39 +72,51 @@ working.
 
 ### Proxy tools
 
-A proxy tool is an HTTP client (typically `curl`) that reaches an API through
-Airlock instead of holding its credential. Use it exactly like any other tool,
-with ordinary `https://` URLs copied from the API docs:
+A proxy tool is an HTTP client (usually `curl`) that does not hold a
+credential. Airlock adds the credential to each request after the request
+leaves the tool. Use a proxy tool like any other tool, with normal `https://`
+URLs from the API docs:
 
 ```
 airlock exec -- curl -s https://run.googleapis.com/v2/projects/my-project/locations/-/services
 airlock exec -- curl -s 'https://storage.googleapis.com/storage/v1/b?project=my-project'
 ```
 
-Things to know:
+`airlock list` shows the hosts a proxy tool can reach:
 
-- **Do not pass authentication headers.** Airlock attaches the credential
-  itself. An `-H 'Authorization: ...'` you supply is removed before the request
-  leaves the daemon, so it has no effect — and there is no token available to
-  you to put there anyway.
-- **Only the hosts `airlock list` shows are reachable.** Everything else fails.
-- **`403` from the proxy means the host, method or path is not permitted.**
-  The response body says which. This is policy, not a transient failure: do
-  **not** retry with `--noproxy`, `--insecure`/`-k`, a different port, or a
-  rewritten URL. Those either fail the same way or fail harder — the sandbox
-  blocks direct connections and DNS outright. Report the refusal to the user.
-- **Responses are redacted, including to a file.** Header values and body are
-  redacted inside the daemon, so `-o file`, `--dump-header` and `-D` write
-  bytes that already have `[REDACTED:NAME]` in place of any credential. Seeing
-  that in a downloaded file is expected — the API echoed a secret, and Airlock
-  replaced it.
-- **Compressed transfer is not available.** The request always asks the API for
-  an uncompressed response, so `--compressed` gets you plain bytes, and an API
-  that compresses anyway produces `502 ... content-encoded`. Nothing to work
-  around; just read the plain response.
-- **Range requests and resumed downloads do not work.** `--range` / `-r` and
-  `-C -` are stripped, so the API sends the whole resource. A resume attempt
-  will fail or re-download from the start. Download in one go.
+```
+curl
+  HTTP client for Google Cloud REST APIs (authenticated automatically)
+  (no environment)
+  proxy tool; reachable hosts:
+    *.googleapis.com (Authorization injected from <secret "gcp_token">)
+```
+
+Rules:
+
+- **Do not pass authentication headers.** Airlock adds the credential. If you
+  pass the same header yourself (for example `-H 'Authorization: ...'`), the
+  proxy removes it. You also have no token to put there.
+- **Only the hosts that `airlock list` shows are reachable.** Requests to any
+  other host fail.
+- **`403` from the proxy means the host, port, method or path is not
+  allowed.** The response body says why. This is a policy decision, not a
+  temporary error. Do **not** retry with `--noproxy`, `--insecure`/`-k`, a
+  different port, or a changed URL. The sandbox blocks direct connections, so
+  these retries also fail. Tell the user about the refusal.
+- **Responses are redacted, also when saved to a file.** The daemon redacts
+  header values and body before the tool gets them. So `-o file` and
+  `-D`/`--dump-header` write `[REDACTED:NAME]` in place of any credential. If
+  you see this in a downloaded file, the API sent back a secret and Airlock
+  replaced it. This is expected.
+- **Compression is not available.** The proxy always asks the API for an
+  uncompressed response, so `--compressed` gets plain bytes. If an API
+  compresses the response anyway, the proxy returns
+  `502 ... content-encoded`. You do not need to work around this.
+- **Range requests and resumed downloads do not work.** The proxy removes the
+  `Range` header that `--range`/`-r` and `-C -` send, so the API returns the
+  whole resource. A resumed download fails or starts again from the
+  beginning. Download each file in one request.
 
 ### Check daemon status
 
