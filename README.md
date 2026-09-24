@@ -384,7 +384,7 @@ airlock run --no-daemon -- claude                  # sandbox only; airlock exec 
 Profiles bundle sandbox rules for a known agent:
 
 - **`claude`** — read/write to `~/.claude/`, `~/.claude.json`, `~/.local/share/claude/`. The macOS keychain is unreachable, so Claude Code stores its OAuth token in `~/.claude/.credentials.json` (mode `0600`). Also disables Claude Code's own `sandbox-exec` wrapper, which cannot nest inside Airlock's profile.
-- **`claude-relaxed`** — `claude` plus keychain access, clipboard, `open <url>`, and read access to shell dotfiles. Each widens the data-leak surface; see [SECURITY.md](SECURITY.md#built-in-agent-profiles).
+- **`claude-relaxed`** — `claude` plus keychain access, clipboard, `open <url>`, read access to shell dotfiles, and what Claude Code's background daemon (`claude --bg`, `claude agents`) needs to start. Each widens the data-leak surface; see [SECURITY.md](SECURITY.md#built-in-agent-profiles).
 
 ## Troubleshooting
 

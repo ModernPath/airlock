@@ -1053,6 +1053,35 @@ pub mod macos {
             }
         }
 
+        emit_claude_daemon_rules(out)
+    }
+
+    /// Rules for Claude Code's background daemon (`claude --bg`,
+    /// `claude agents`), which the client spawns detached via
+    /// `launchctl asuser <uid>` with its working directory set to `$HOME`.
+    fn emit_claude_daemon_rules(out: &mut String) -> Result<(), SandboxError> {
+        // Bun resolves the cwd at startup. libc `getcwd` opens "." to ask the
+        // kernel for its path; when that open is denied it falls back to
+        // walking up the tree with `readdir`, which is denied too, and Bun
+        // aborts with "An unknown error occurred (Unexpected)". A literal
+        // rule lists the names directly under `$HOME` but grants nothing
+        // below it.
+        if let Ok(home) = std::env::var("HOME") {
+            let escaped = escape_path(std::path::Path::new(&home))?;
+            out.push_str(&format!("(allow file-read-data (literal \"{escaped}\"))\n"));
+        }
+
+        // The daemon's control socket lives at
+        // `/tmp/cc-daemon-<uid>/<hash>/control.sock`. This path is hardcoded,
+        // so `$TMPDIR` does not cover it. The subpath is per-uid, so the grant
+        // does not open the rest of `/tmp`.
+        let uid = unsafe { libc::getuid() };
+        for tmp in ["/private/tmp", "/tmp"] {
+            out.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{tmp}/cc-daemon-{uid}\"))\n"
+            ));
+        }
+
         Ok(())
     }
 
@@ -2305,6 +2334,45 @@ pub mod macos {
                 assert!(
                     sbpl.contains(&expected),
                     "ClaudeRelaxed SBPL should allow {rc}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn agent_profile_claude_relaxed_allows_claude_daemon_startup() {
+            // The background daemon starts with cwd = $HOME and binds its
+            // control socket under the hardcoded `/tmp/cc-daemon-<uid>/`.
+            // It needs both rules or it exits before the socket is reachable.
+            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
+            let home = std::env::var("HOME").expect("HOME should be set in test env");
+            let uid = unsafe { libc::getuid() };
+            let expected = [
+                format!("(allow file-read-data (literal \"{home}\"))"),
+                format!(
+                    "(allow file-read* file-write* (subpath \"/private/tmp/cc-daemon-{uid}\"))"
+                ),
+                format!("(allow file-read* file-write* (subpath \"/tmp/cc-daemon-{uid}\"))"),
+            ];
+
+            let relaxed = sbpl_from_agent_profile_with_kind(
+                &agent_policy_empty(),
+                Some(super::super::AgentProfileKind::ClaudeRelaxed),
+            );
+            for line in &expected {
+                assert!(
+                    relaxed.contains(line),
+                    "ClaudeRelaxed SBPL should contain {line}, got:\n{relaxed}"
+                );
+            }
+
+            let strict = sbpl_from_agent_profile_with_kind(
+                &agent_policy_empty(),
+                Some(super::super::AgentProfileKind::Claude),
+            );
+            for line in &expected {
+                assert!(
+                    !strict.contains(line),
+                    "plain Claude profile must NOT contain {line}, got:\n{strict}"
                 );
             }
         }
