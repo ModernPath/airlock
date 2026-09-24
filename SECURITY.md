@@ -183,6 +183,7 @@ The directory containing `airlock.toml` is always included as a read-write path 
 - Adds Launch Services Mach services + the `lsopen` operation class (so `open <url>` works from inside the sandbox).
 - Adds read access to `~/Library/Preferences/.GlobalPreferences*.plist` (default browser lookup).
 - Adds read access to shell init dotfiles: `.bashrc`, `.bash_profile`, `.bash_login`, `.profile`, `.zshrc`, `.zprofile`, `.zshenv`, `.zlogin`, `.inputrc`.
+- Adds what Claude Code's background daemon (`claude --bg`, `claude agents`) needs to start. The daemon runs with `$HOME` as its working directory, so the profile grants a `file-read-data` literal on `$HOME` (the directory listing only, nothing beneath it); without it, Bun's startup `getcwd` fails. The profile also grants read/write on `/tmp/cc-daemon-<uid>/`, where the daemon binds its control socket. The daemon stays inside the sandbox: `launchctl asuser` only execs it. Because `/bin/ps` is setuid, the daemon cannot probe its own start time and writes a lock without one. `claude daemon stop` then refuses to signal it, but the daemon still exits when its last client disconnects.
 
 Each `claude-relaxed` extension is a deliberate widening. The keychain DB at rest is encrypted (AES, master key derived from the user's login password and held only in `securityd`'s memory), so a sandboxed agent with this access *cannot* decrypt or forge keychain items. What it *can* do:
 
