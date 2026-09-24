@@ -391,8 +391,10 @@ Profiles bundle sandbox rules for a known agent:
 If a sandboxed tool or agent misbehaves — "Operation not permitted", garbled interactive output, TLS failing silently — the cause is usually a sandbox rule that's too narrow. On macOS, Seatbelt logs every denial:
 
 ```bash
-log stream --predicate 'sender == "Sandbox" OR subsystem == "com.apple.sandbox"' --info --style compact
+/usr/bin/log stream --predicate 'sender == "Sandbox" OR subsystem == "com.apple.sandbox"' --info --style compact
 ```
+
+Use the full path: zsh has a `log` builtin that shadows `/usr/bin/log` and fails with "too many arguments".
 
 Each line names the operation and the path or Mach service it hit — that's what to add to `[filesystem]`, `extra_read`/`extra_write`, or `[agent.filesystem]`.
 
