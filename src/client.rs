@@ -19,6 +19,7 @@ use crate::protocol::{
     SessionRequest, SessionToken, StdinFrame, WireLayer,
 };
 use crate::runtime_dir;
+use crate::trust::escape_for_terminal as esc;
 
 /// No `AIRLOCK_SESSION` (or `AIRLOCK_ADDR`) is set — this process was not
 /// started under a session. `pub(crate)`: `agent.rs`'s `check`/`hook`
@@ -422,31 +423,43 @@ async fn tools_list_by_id(id: String) -> i32 {
     }
 }
 
-fn print_tools(tools: &[crate::protocol::ToolInfo]) {
+/// Renders `airlock tools list`'s output — every piece of text here comes
+/// from the daemon's merged config, which may include an unapproved file,
+/// so it goes through [`esc`] before it ever reaches the terminal.
+fn format_tools(tools: &[crate::protocol::ToolInfo]) -> String {
     let mut sorted: Vec<&crate::protocol::ToolInfo> = tools.iter().collect();
     sorted.sort_by(|a, b| a.name.cmp(&b.name));
 
+    let mut out = String::new();
     for tool in sorted {
-        println!("{}", tool.name);
+        out.push_str(&esc(&tool.name));
+        out.push('\n');
         if let Some(desc) = &tool.description {
-            println!("  {desc}");
+            out.push_str(&format!("  {}\n", esc(desc)));
         }
         if tool.env.is_empty() {
-            println!("  (no environment)");
+            out.push_str("  (no environment)\n");
         } else {
             for (var, value) in &tool.env {
                 match value {
-                    crate::protocol::EnvDisplay::Static(s) => println!("  {var} = {s:?}"),
+                    crate::protocol::EnvDisplay::Static(s) => {
+                        out.push_str(&format!("  {} = {:?}\n", esc(var), esc(s)))
+                    }
                     crate::protocol::EnvDisplay::Secret(label) => {
-                        println!("  {var} = <secret {label:?}>")
+                        out.push_str(&format!("  {} = <secret {:?}>\n", esc(var), esc(label)))
                     }
                 }
             }
         }
         if tool.proxy {
-            println!("  proxy tool");
+            out.push_str("  proxy tool\n");
         }
     }
+    out
+}
+
+fn print_tools(tools: &[crate::protocol::ToolInfo]) {
+    print!("{}", format_tools(tools));
 }
 
 #[cfg(test)]
@@ -458,6 +471,24 @@ mod tests {
     use super::*;
     use std::sync::MutexGuard;
     use tokio::io::AsyncBufReadExt;
+
+    #[test]
+    fn format_tools_escapes_untrusted_control_characters() {
+        // A tool description comes from the daemon's merged config, which
+        // may include an unapproved file — a bidi override or an ESC byte
+        // must not reach the terminal raw.
+        let tools = vec![crate::protocol::ToolInfo {
+            name: "gh".to_string(),
+            description: Some("evil\u{202e}desc\x1b[31m".to_string()),
+            env: Vec::new(),
+            proxy: false,
+        }];
+        let out = format_tools(&tools);
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\x1b'));
+        assert!(out.contains("\\u{202e}"));
+        assert!(out.contains("\\u{1b}"));
+    }
 
     /// RAII guard for a batch of temporary environment variable overrides,
     /// serialized against every other test in the crate that touches the
