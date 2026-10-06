@@ -2909,7 +2909,7 @@ pub mod macos {
         // ── Ignored: needs a real nested sandbox (see module docs) ──────────
 
         #[test]
-        #[ignore = "needs a nestable sandbox; run outside Airlock with: cargo test -- --ignored"]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
         fn agent_profile_isolates_runtime_base_from_tmpdir_grant() {
             use std::os::unix::net::UnixListener;
             use std::os::unix::process::CommandExt;
@@ -3681,7 +3681,7 @@ pub mod linux {
         /// inside it — the real layout, since the anchor check refuses any
         /// config that would put a write grant over or inside the base.
         #[tokio::test]
-        #[ignore = "needs a nestable sandbox; run outside Airlock with: cargo test -- --ignored"]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
         async fn agent_profile_isolates_runtime_base_from_a_sibling_write_grant() {
             use std::collections::HashMap;
             use std::os::unix::net::UnixListener;
