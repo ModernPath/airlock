@@ -39,8 +39,8 @@ Example output:
 ```
 gh
   GitHub CLI
-  GH_TOKEN = <secret "GH_TOKEN">
   GH_CONFIG_DIR = "/home/me/.cache/airlock/3f9a1c2b7d4e8a60/gh"
+  GH_TOKEN = <secret "GH_TOKEN">
 ```
 
 ### Execute a tool

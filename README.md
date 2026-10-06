@@ -293,6 +293,8 @@ $ claude --sandbox
 
 `session start` prints `export AIRLOCK_ADDR=...` / `export AIRLOCK_SESSION=...` on stdout (so `eval` picks them up) and the note above on stderr. Everything started from that shell inherits the session — every extension, every integrated terminal in an editor launched from it. It lasts 12 hours by default (`--ttl`, `0` for until revoked); `airlock session renew` restarts the clock without changing the token.
 
+Run `eval "$(airlock session start)"` directly in the shell that will use the session — that shell is the token's anchor. Piping the output through another command, as in `eval "$(airlock session start | cat)"`, anchors the session to that pipeline's own short-lived subshell instead; the subshell exits the moment the pipe finishes, so every later `exec` fails with "this process was not started from the session's agent or shell" even though the token looks valid. See [Token binding](SECURITY.md#token-binding).
+
 | Command | Does |
 |---|---|
 | `airlock session start` | Registers a session, prints the exports. |
@@ -305,7 +307,7 @@ A token is bound to the process tree it was issued to, so copying it out of anot
 
 ## Harness hooks
 
-`airlock run --profile claude` installs a Claude Code `SessionStart` hook that tells the agent, in its own context, that Airlock is active and which tools to use — on every start, resume, `/clear` and compaction, not only when it happens to read [SKILL.md](SKILL.md). Starting Claude another way, add it to `~/.claude/settings.json` or the project's `.claude/settings.json` yourself:
+`airlock run --profile claude` installs a Claude Code `SessionStart` hook that tells the agent, in its own context, that Airlock is active and which tools to use — on every start, resume, `/clear` and compaction, not only when it happens to read [SKILL.md](SKILL.md). To do this, the profile's default command passes `claude --dangerously-skip-permissions --settings '<hook JSON>'`: `--settings` carries the hook plus `"sandbox":{"enabled":false}`, since Claude Code's own `sandbox-exec` wrapper can't nest inside Airlock's — the outer Seatbelt profile already confines the agent, and `--dangerously-skip-permissions` is safe here for the same reason: Airlock's sandbox, not Claude's own permission prompts, is the boundary. Starting Claude another way, add the hook to `~/.claude/settings.json` or the project's `.claude/settings.json` yourself:
 
 ```bash
 airlock agent hook claude-code --print-settings

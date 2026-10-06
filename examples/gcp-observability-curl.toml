@@ -85,8 +85,8 @@ refresh_max_backoff = 600
 #
 # `proxy = true` means: no secrets in `env`, network only through the proxy,
 # and only to the hosts routed below. Any other host gets a 403 from the
-# proxy. The description is what the agent sees in `airlock list`, so say
-# which APIs are reachable and that auth is automatic.
+# proxy. The description is what the agent sees in `airlock tools list`, so
+# say which APIs are reachable and that auth is automatic.
 [tools.curl]
 description = "curl for Google Cloud Trace / Monitoring / Logging REST APIs in my-project, read-only. Auth is injected by airlock; do not pass tokens."
 proxy = true
