@@ -12,9 +12,9 @@ described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
 This document is the design record: what changes, why, and which
 alternatives were rejected. The user-facing surface (commands, help text,
 messages, harness hooks, and drafts of the doc changes) is in
-[airlock-v2-ux.md](airlock-v2-ux.md), which also proposes changes U1–U16
-to this design. When it ships, the user-facing reference will
-be [README.md](../README.md) and [SKILL.md](../SKILL.md).
+[airlock-v2-ux.md](airlock-v2-ux.md). Its changes U1–U16 to this design are
+accepted and incorporated here. When it ships, the user-facing reference
+will be [README.md](../README.md) and [SKILL.md](../SKILL.md).
 
 ## Problem
 
@@ -62,9 +62,9 @@ and by the agent itself. Today Airlock simply trusts whatever
 
 - Backwards compatibility. Airlock is pre-1.0. Old in-project runtime files
   are not migrated; users delete them.
-- Reloading a running session. An approved config change applies to
-  sessions started after the approval. Running sessions keep the config
-  they started with.
+- Applying config changes to a running session on their own. A running
+  session keeps its config until the user reloads it with
+  [`session reload`](#reloading-a-session).
 - Protecting against an agent that runs outside `airlock run`. Such an agent
   is the user, as far as the OS is concerned.
 - Protecting against agent-written code that the user runs outside the
@@ -80,9 +80,9 @@ and by the agent itself. Today Airlock simply trusts whatever
 
 - **One daemon per user**, serving every project through
   [sessions](#sessions). A launcher in the user's terminal (`airlock run`,
-  `airlock session`) loads and approves a project's config, resolves its
-  secrets, and registers a session. The agent gets a session token, and the
-  daemon serves it only that project.
+  `airlock session start`) loads and approves a project's config, resolves
+  its secrets, and registers a session. The agent gets a session token, and
+  the daemon serves it only that project.
 - **Runtime dir:** `/run/user/<uid>/airlock/` on Linux, the per-user temp
   dir from `confstr` on macOS. Neither comes from the environment. The
   directory is owned by the user and has mode 0700.
@@ -150,7 +150,7 @@ it must not fall under any sandbox write grant.
 
 | Who | Needs |
 |---|---|
-| Agent (`airlock exec`, `airlock list` inside `airlock run`) | connect to `airlock.sock`; never read `admin.token` |
+| Agent (`airlock exec`, `airlock tools list`, `airlock agent check` inside `airlock run`) | connect to `airlock.sock`; never read `admin.token` |
 | Proxy tools | read their own session's `ca/<session-id>.pem`, a new entry in their `read_paths` |
 | Ordinary tools | nothing |
 
@@ -208,14 +208,19 @@ config exists.
 Exactly that one file: no global layer and no local layer. The project root
 is the file's parent directory, as today. The file still has to be approved.
 
+`--config` is not a global option. It exists only on the commands that
+discover config: `run`, `trust`, `config`, `status`, `session start` and
+`session reload`. `exec` and `tools list` use their session and read no
+files, so a `--config` there would be a silent no-op.
+
 ### `--no-project-config`
 
 This replaces `airlock run --no-config` and `AIRLOCK_SANDBOX_ROOT`. The
 empty-config mode those provided is removed.
 
-- Valid wherever discovery runs: `run`, `session exec`, `session start`
-  and `status`. `exec` and `list` do no discovery, since they use their
-  session.
+- Valid wherever discovery runs: `run`, `config`, `status`,
+  `session start` and `session reload`. `exec` and `tools list` do no
+  discovery, since they use their session.
 - Ignores `airlock.toml` and `airlock.local.toml` even if present.
 - The project root is the canonical working directory. The config is the
   global layer alone, which may be absent (an empty config).
@@ -231,7 +236,7 @@ must not hold a secret" is checked against the merged tools.
 
 | Item | Rule |
 |---|---|
-| `[tools.<name>]` | Must be defined in exactly one layer. A duplicate is a config error naming both files, so a personal tool cannot silently shadow a team tool, or the reverse. |
+| `[tools.<name>]` | See [Tools across layers](#tools-across-layers). |
 | `[secrets.<label>]` | See [Secret labels across layers](#secret-labels-across-layers). |
 | `filesystem.read`, `filesystem.write` | union |
 | `agent.passthrough_env` | union |
@@ -239,6 +244,25 @@ must not hold a secret" is checked against the merged tools.
 | `agent.env.<VAR>` | per key, highest layer wins |
 | `timeout`, `agent.timeout` | highest layer that sets it |
 | `allow_home_root` | Honored in global or local. In the repo layer it is a config error. |
+
+### Tools across layers
+
+A tool replaces another only where an approved file says so, or where the
+user's own global tool gives way to the project.
+
+- **Global and project.** A project tool (repo or local) replaces a global
+  tool of the same name. The global layer is the user's default for every
+  project, and a project that declares the same tool knows what it needs.
+  The replacement is not silent: `airlock config` shows the global tool as
+  `replaced by repo`, and `run -v` prints it.
+- **Repo and local.** A duplicate is a config error naming both files,
+  unless the local tool says `override = true`. Then the local tool
+  replaces the repo's whole, and the user approves that line with the local
+  file. `override = true` on a tool the repo does not define is a config
+  error, so a stale override cannot linger unnoticed.
+- **Never the reverse.** The global layer cannot replace a project tool,
+  and the repo layer cannot replace a local one. A personal tool must not
+  silently shadow a team tool, and the global file is not approved.
 
 ### Secret labels across layers
 
@@ -259,7 +283,26 @@ approved file.
   `[secrets.GH_TOKEN]` and a repo `[secrets.GH_TOKEN]` are two separate
   bindings until the local file links them.
 - A repo label with no source and no local binding is a startup error that
-  names the label and suggests `from = "global"` or a `source`.
+  lists each such label and points to `airlock init --local`.
+- `[secrets.<label>]` takes an optional `description` in every layer. A
+  repo label without a source is a request to each user, and the
+  description tells them what to supply. The startup error and
+  `init --local` show it.
+
+`airlock init --local` writes `airlock.local.toml` with a stub per repo
+label that has no source. A label the global layer binds gets
+`from = "global"`; any other gets commented `command` and `env` examples
+under its description. In a repo without an `airlock.toml`, whose team has
+not adopted Airlock, it writes a standalone skeleton instead: a commented
+secret and tool, as `init` writes for `airlock.toml`. The stub is an
+ordinary local file: the user approves it like any other.
+
+`init --local` warns if git does not ignore the file. The warning suggests
+adding `airlock.local.toml` to git's global excludes file
+(`~/.config/git/ignore`, or `core.excludesFile`) once, which covers every
+repo, including those whose `.gitignore` the user does not own. This only
+prevents an accidental commit; it is not a control, and the file holds
+references, not secret values.
 
 The opt-in is what the user approves. A PR that adds a tool taking
 `OPENAI_API_KEY` gets the repo's own binding, or none. It gets the user's
@@ -274,7 +317,30 @@ from = "global"
 **Relative paths.** Paths in the repo and local layers resolve against the
 project root, as today. A relative path in the global layer is a config
 error: the file applies to every project, so a relative path would mean
-something different in each. `~` and `{sandbox_root}` work in all layers.
+something different in each. `~`, `{sandbox_root}` and `{tool_state}` work
+in all layers.
+
+### Tool state outside the project
+
+Many tools need a writable config directory (`GH_CONFIG_DIR`,
+`CLOUDSDK_CONFIG`, `KUBECONFIG`). Pointing it at `{sandbox_root}/.config/…`
+keeps the user's real config out of the tool sandbox, but puts tool state
+in the project, where the agent can read it and git sees it.
+
+`{tool_state}` in a tool's static `env` resolves to
+`$XDG_CACHE_HOME/airlock/<id>/<tool>` (default
+`~/.cache/airlock/<id>/<tool>`), where `<id>` is the project id from the
+[trust store](#trust-store). The daemon creates it with mode 0700 on first
+use and adds it to that tool's write paths. No other tool and no agent
+sandbox is granted it. Like an anchor, it is refused if it resolves inside
+the project root, so a redirected `XDG_CACHE_HOME` cannot move it there. It
+must not overlap an anchor either.
+
+```toml
+[tools.gh.env]
+GH_TOKEN      = { secret = "GH_TOKEN" }
+GH_CONFIG_DIR = "{tool_state}"
+```
 
 ## Trust
 
@@ -314,32 +380,62 @@ again.
 
 ### When approval is checked
 
-Wherever config is loaded, and that is only when a session starts: `airlock
-run`, `session exec` and `session start`. The daemon itself never reads
-project config.
+Wherever config is loaded for a session, and that is only in a launcher:
+`airlock run`, `session start` and `session reload`. The daemon itself
+never reads project config.
 
 - **In the user's terminal.** The launcher checks approval before it
-  registers the session, so the refusal and diff print straight to the
-  user.
+  registers the session, so the prompt or refusal and the diff reach the
+  user directly.
 - **No gap between check and use.** Each file is read once with
   `read_config_securely`. The same bytes are hashed, compared and parsed,
   and the parsed result is what the launcher registers.
+- **Validation first.** The launcher parses and validates the merged
+  config before it asks about any file, so the user is never asked to
+  approve a file that would fail anyway.
 
-`exec` and `list` use a session whose config was approved when it started,
-so they do not check again.
+`exec` and `tools list` use a session whose config was approved when it
+started or was last reloaded, so they do not check again.
 
-### Refusal
+### Unapproved files at session start
 
-If any layer is unapproved, startup refuses and exits non-zero. For each
-unapproved file it prints either a unified diff against the approved copy or,
-for a file never approved, its full contents. It ends by pointing to
-`airlock trust`.
+If any layer is unapproved, the launcher shows, for each such file, either a
+unified diff against the approved copy or, for a file never approved, its
+full contents. Then:
+
+- **On a terminal**, it asks `Trust this version and continue? [y/N]`, one
+  file at a time. `y` records the approval exactly as `airlock trust` does
+  and continues. `n` on any file stops the launcher before anything
+  starts, and it exits 125 with `not trusted; nothing started`, as for
+  any other reason Airlock did not start the agent.
+- **On a non-terminal**, it refuses, exits 125 and points to
+  `airlock trust`. Startup stays non-interactive for scripts.
+
+The prompt is exactly as safe as `airlock trust`. The control is that no
+sandbox can write the trust store and no sandbox can run a launcher, not
+the terminal: an agent with a pty can answer a prompt too. Without the
+prompt, refuse, `trust`, run again would be three commands for one
+decision, on the most common path: every edit of the user's own local file
+goes through it.
 
 The printed text is escaped before output: control characters, ANSI escapes,
 bidirectional overrides (U+202A–U+202E, U+2066–U+2069) and zero-width
 characters are shown as `\u{…}`. TOML accepts bidi and zero-width characters
 in strings and comments. Without escaping, an agent could write a diff that
 reads differently from what it does.
+
+A `from = "global"` line approves a link to a binding the prompt does not
+otherwise show. So the prompt annotates each such line with the global
+source it resolves to at that moment:
+
+```
+ [secrets.GH_TOKEN]
+ from = "global"       # → global: command op read op://Private/GitHub/token
+```
+
+The annotation is display only. It is not part of the approved bytes, so a
+later change to the global binding needs no new approval: the global file
+is the user's own.
 
 ### `airlock trust`
 
@@ -349,41 +445,91 @@ reads differently from what it does.
    the escaped diff (or the full file) and asks `Trust <path>? [y/N]`.
 3. On `y`, writes the exact bytes it showed to the trust store: a temp file
    and `rename` in the same directory.
-4. If sessions for this project are running, prints a note that they keep
-   the previous config and that new sessions use the approved one.
+4. If sessions for this project are running, names them and says that
+   they keep the previous config until `airlock session reload`.
 
-On a non-terminal, it refuses unless `--yes` is given. `--yes` approves
-without prompting, for scripted setup.
+On a non-terminal, it refuses unless `--yes` or `--expect-sha256` is
+given.
+
+- `--yes` approves every changed file without prompting, for scripted
+  setup.
+- `--expect-sha256 <hash>` (repeatable) approves a changed file only if
+  its SHA-256 equals one of the given hashes, and fails otherwise. This
+  pins the exact content a script or workflow expects.
+
+In CI the trust store is usually empty on every run, so each run is a
+first approval. `trust --yes` there means the review of the commit under
+test is the approval, and it must run before any agent starts in the job,
+so an agent's edit in the same job is never approved. `--expect-sha256`
+removes even that window.
+
+`trust` exists to approve ahead of time and from scripts. Launchers ask the
+same question when they need to.
 
 ### After approval
 
-A running session keeps the config it started with. The session records the
+A running session keeps the config it had. The session records the
 SHA-256 of every layer it loaded, including the global file. `airlock status`
 and `session list` compare those with the files on disk and mark a session
-`config changed since the session started` when they differ. Starting a new
-session picks up the approved config. The daemon does not restart.
+`config changed` when they differ. So does `exec` when it refuses an
+undeclared tool, and `agent check`, so the agent can tell the user. Starting
+a new session picks up the approved config, and so does reloading a running
+one. The daemon does not restart.
+
+### Reloading a session
+
+`airlock session reload [ID…]` applies approved config to running sessions,
+so an agent that added a tool can use it without being restarted and losing
+its context. Without IDs it reloads every session for the project in the
+current directory.
+
+The reload is a launcher: it discovers, validates and approves the config,
+prompting as at session start, and resolves the secrets in the user's
+terminal. It then sends a `Reload` request with the admin credential. The
+daemon builds the new redactor, policy and proxy, and swaps them into the
+session in one step. The session keeps its id and token, so the agent keeps
+working. It prints what changed per session, such as `tools +psql`.
+
+- **Discovery comes from the session, not the current directory.** Each
+  session records its root and mode (default, `--config <path>`,
+  `--no-project-config`), and the reload loads exactly that again. IDs
+  select sessions; the current directory only picks the default set.
+- **The agent's own settings do not change.** The agent's sandbox profile,
+  `agent.env`, `agent.passthrough_env`, `agent.filesystem` and
+  `agent.timeout` were applied when the agent process started, and a
+  running process cannot get a new sandbox. The reload applies everything
+  else (tools, secrets, filesystem grants for tools, proxy routes,
+  timeouts) and prints `agent settings changed; restart the agent to apply
+  them` for a session whose `[agent]` differs.
+- **An `exec` in flight finishes on the config it started with.** Each
+  request takes its own reference to the session's state, so a swap never
+  changes a running tool.
+
+Tools change only when the user asks: the reason running sessions keep
+their config holds.
 
 ## Sessions
 
 One daemon per user serves every project. A session binds a client to one
 project: its root, its approved config and the secrets resolved for it. The
 daemon authenticates clients by uid, and the agent runs as the user, so the
-socket alone proves nothing ([B4](#blocking)). `exec` and `list` are served
-only with a session token, and only a process outside every sandbox can
-register a session.
+socket alone proves nothing ([B4](#blocking)). `exec`, `tools list` and
+`agent check` are served only with a session token, and only a process
+outside every sandbox can register a session.
 
 ### Admin credential
 
 At start, before the readiness signal, the daemon writes 32 random bytes to
 `<base>/admin.token` with mode 0600. A restart replaces it. No sandbox can
 read it: Landlock never grants the runtime dir, and every Seatbelt profile
-denies it (see [Sandbox access](#sandbox-access)). Session registration,
-`session list`, `session revoke`, `status`, `logs` and `daemon stop` need it.
-`exec` and `list` never read it.
+denies it (see [Sandbox access](#sandbox-access)). Session registration and
+reload, `session list`, `session revoke`, `tools list --session`, `status`,
+`daemon logs`, `daemon stop` and `daemon restart` need it. `exec`,
+`tools list` without `--session` and `agent check` never read it.
 
 ### Registering a session
 
-The launcher (`airlock run`, `session exec` or `session start`) does
+The launcher (`airlock run` or `session start`) does
 everything that needs the user's terminal or the project's environment, and
 then hands the result to the daemon:
 
@@ -397,9 +543,21 @@ then hands the result to the daemon:
    of the launcher, without the variables consumed by `source = "env"`.
 4. Starts the daemon if none is running (see [Lifecycle](#lifecycle)).
 5. Sends a `Register` request with the admin credential: the root, the
-   merged config, the layer hashes, the secret values, the snapshot and the
-   filtered `PATH`. The daemon builds the session's redactor, policy and
-   proxy, and answers with a session id and a 32-byte random token.
+   merged config, the layer hashes, the secret values, the snapshot, the
+   filtered `PATH`, a name, and the agent's sandbox kind. The daemon builds
+   the session's redactor, policy and proxy, and answers with a session id
+   and a 32-byte random token.
+
+The name is what `session list`, `trust` and `reload` show. `--name` sets
+it; the default is the harness command's base name, or `shell` for
+`session start`. The sandbox kind is `airlock` for `airlock run` and
+`external` for `session start`. It decides what the
+[harness hook](#agent-integration) tests.
+
+The daemon also records the session's [anchor process](#token-binding):
+the peer PID of the `Register` connection for `run`, and that process's
+parent, the user's shell, for `session start`. It takes the PID from the
+socket, not from the request.
 
 The launcher holds secret values in `Secret<T>` and drops them once
 `Register` succeeds. Refresh commands run later in the daemon, with the
@@ -409,14 +567,29 @@ session's snapshot and filtered `PATH`, never the daemon's own environment.
 
 | Command | Does |
 |---|---|
-| `airlock session exec -- <harness…>` | Registers a session, runs the harness with `AIRLOCK_ADDR` and `AIRLOCK_SESSION` set, and revokes the session when the harness exits. |
-| `airlock session start` | Registers a session and prints the `export` lines, for harnesses that cannot be wrapped, such as an IDE extension. |
-| `airlock session list` | Lists sessions: id, root, start time, number of `exec`s, and whether the config changed since the session started. |
-| `airlock session revoke <id>` / `--all` | Ends sessions without restarting the daemon. |
+| `airlock run [-- <harness…>]` | Registers a session, runs the harness in Airlock's agent sandbox with `AIRLOCK_ADDR` and `AIRLOCK_SESSION` set, and holds the session's [lease](#lifetime) until the harness exits. |
+| `airlock run --no-session -- <harness…>` | Airlock's sandbox only. No session and no daemon; `exec` and `tools list` fail inside it as they do anywhere without a session. |
+| `airlock session start` | Registers a session and prints the `export` lines, for a harness that `run` cannot start: an IDE extension, or a harness with its own sandbox. Ends after `--ttl` (default 12h; `0` means until revoked). |
+| `airlock session renew <ID> [--ttl]` | Restarts a `session start` session's TTL. The token stays the same, so the harness keeps working. |
+| `airlock session list` | Lists sessions: id, name, root, start time, number of `exec`s, whether the config changed, and what ends it (`held by airlock run, PID 4821` or `expires in 6h`). |
+| `airlock session reload [ID…]` | Applies approved config to running sessions. See [Reloading a session](#reloading-a-session). |
+| `airlock session revoke <ID…>` / `--here` / `--all` | Ends sessions without restarting the daemon. |
 
-`airlock run` registers and revokes its session the same way as
-`session exec`. It no longer embeds a daemon of its own, so any number of
-agents can run in one project at the same time.
+Sessions are addressed by id, unique id prefix or unique name.
+
+`run` always runs the harness in Airlock's sandbox. A harness with its own
+sandbox, such as Claude Code with `--sandbox`, gets its session from
+`session start` like an IDE. Airlock's and Claude Code's Seatbelt profiles
+cannot nest, and a `run` mode without any sandbox would be one flag away
+from `claude --dangerously-skip-permissions` running bare. `run` no longer
+embeds a daemon of its own, so any number of agents can run in one project
+at the same time.
+
+`session start` prints, on stderr, that the harness's own sandbox must meet
+the [external sandbox requirements](#under-another-harness) (`-q` drops
+the note). Everything started from that shell inherits the token: in an
+editor, every extension and integrated terminal. An editor started from
+the Dock or a launcher, not from that shell, gets no session.
 
 ### Scope
 
@@ -432,16 +605,94 @@ today.
 Sessions are independent. Two sessions for the same project resolve their
 own secrets and can run different approved configs, for example an old
 session next to a new one started after an approval, or a `--config` file
-next to the default one. Sharing secrets between sessions of one project
-may come later as an optimization.
+next to the default one. The user notices one cost: a second session runs
+the secret commands again, so 1Password or `gcloud` prompts appear again,
+and a minted token is minted and refreshed once per session. Sharing
+secrets between sessions of one project may come later as an
+optimization.
 
 ### Lifetime
 
-Sessions live in daemon memory only. A session ends when it is revoked, when
-`session exec` or `run` sees its harness exit, or when the daemon stops.
-A token that the agent stashed, or that a leftover background process
-still holds, stops working with it. Its secrets, redactor and proxy are
-dropped, and its CA file is deleted.
+Sessions live in daemon memory only. A session ends when its owner goes
+away, when it is revoked, or when the daemon stops. A token that the agent
+stashed, or that a leftover background process still holds, stops working
+with it. Its secrets, redactor and proxy are dropped, and its CA file is
+deleted.
+
+Any number of processes use a session at once: every `exec` is its own
+connection, and the harness, its parallel tool calls and its subagents all
+hold the same token. The session is the unit of permission, not of
+identity, so the daemon keeps no list of attached clients. It keeps only
+what ends the session:
+
+| Started by | Ends when |
+|---|---|
+| `airlock run` | its lease closes |
+| `airlock session start` | its TTL runs out |
+
+**The lease.** `airlock run` keeps the connection it sent `Register` on
+open for as long as the harness runs. The daemon holds a task per lease
+that waits for EOF and then revokes the session. The kernel closes a
+process's descriptors however it dies, by exit, panic, SIGKILL or the OOM
+killer, so a launcher cannot die and leave its session behind, and a local
+socket needs no heartbeat.
+
+- The descriptor is close-on-exec, so the harness does not inherit it.
+  Otherwise the lease would last as long as any descendant of the harness,
+  and the agent would hold a connection admitted with `admin.token`.
+- The daemon accepts no further request on a lease connection. Reload and
+  revoke come over their own connections. A second request on a lease is a
+  protocol error and ends the session.
+- The launcher outlives the harness. It forwards SIGHUP, SIGINT and SIGTERM
+  to the harness, waits for it to exit, and only then closes. A closed
+  terminal sends SIGHUP to both, so the order holds.
+- Lease connections have no idle timeout.
+- The launcher sees EOF when the daemon stops, and prints that the
+  agent's session has ended in the user's terminal.
+
+A harness that outlives a SIGKILLed launcher loses its session. That is
+rare, and the harness is then an orphan nobody manages.
+
+**The TTL.** A `session start` launcher exits once it has printed the
+exports, so nothing holds a lease. The TTL is what ends a forgotten
+session; without it, the token would stay valid, and the automatic daemon
+would keep running, indefinitely. The default of 12 hours is one working
+day. `session renew` restarts it without changing the token, so an editor
+started from that shell keeps working. An `exec` on an expired session
+exits 125 with a message saying it expired and that the user can renew it
+with `airlock session renew`.
+
+### Token binding
+
+A session token is in the environment of every process the harness starts.
+A process of the same uid outside Airlock's sandbox can read another
+process's environment: through `KERN_PROCARGS2` (`ps eww`) on macOS, and
+`/proc/<pid>/environ` on Linux. So an agent under an external sandbox that
+allows process inspection, or any unsandboxed process of the user, can
+copy another agent's token. Airlock's agent profile allows `process-info*`
+only for `same-sandbox`, so its own agents cannot read each other's.
+
+The daemon therefore binds each token to a process tree. On every
+connection that presents a token, it takes the peer PID from the socket
+(`LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux) and walks the parent
+chain (`proc_pidinfo` on macOS, `/proc/<pid>/stat` on Linux). The request
+is served only if the session's anchor process is an ancestor. The anchor
+is recorded with its start time, so a reused PID does not match.
+
+- For `run`, the anchor is the launcher, which lives exactly as long as the
+  lease.
+- For `session start`, the anchor is the shell that ran it. Everything
+  started from that shell matches.
+- A process that detaches from the tree (a double fork, `setsid` with a
+  reparent to init or launchd) loses access. An agent's tool calls do not
+  do that.
+- The binding is a check on the Unix transport only, like peer uid. A
+  network transport needs tokens bound to the client's TLS identity
+  instead ([F11](#follow-ups)).
+
+A stolen token is then useless outside the tree it was issued to. The
+binding does not help against a process inside the tree, which already
+holds the token legitimately.
 
 ### Lifecycle
 
@@ -452,12 +703,24 @@ Two modes, with the same daemon:
   launcher creates any tokio runtime. An automatically started daemon
   exits after a short grace period with no sessions.
 - **Service.** `airlock daemon install` writes a launchd agent or a systemd
-  user unit that runs `airlock daemon run` in the foreground. A service
+  user unit that runs `airlock daemon start --foreground`. A service
   daemon stays up with no sessions. `airlock daemon uninstall` removes it.
 
 The daemon's own environment does not matter in either mode, because
-everything a session needs comes with `Register`. `daemon start`, `daemon
-stop` and `daemon status` stay for manual control.
+everything a session needs comes with `Register`. `daemon start`
+(`--foreground` for service managers and debugging), `daemon stop`,
+`daemon restart` and `daemon logs` stay for manual control. `stop` and
+`restart` end every session, so on a terminal they name the sessions and
+ask first; on a non-terminal they refuse while sessions exist unless
+`--yes` is given. `airlock status` reports whether the daemon runs, so
+there is no `daemon status`.
+
+**Versions.** An automatic daemon outlives the binary that started it, so
+every connection starts with a version handshake. A launcher that finds an
+idle daemon of another version restarts it. A busy one keeps serving its
+sessions, with a note to the user, and is replaced once idle, unless the
+protocol is incompatible. Then the launcher refuses and points to
+`airlock daemon restart`.
 
 ### Session isolation
 
@@ -495,20 +758,38 @@ one. Moving each session's proxy to its own process is [F10](#follow-ups).
 
 ### Clients
 
-`exec` and `list` take the address and token from `AIRLOCK_ADDR` and
-`AIRLOCK_SESSION` and nothing else. They do not fall back to `admin.token`
-or to discovery. A user who wants to run `exec` by hand starts a shell
-with `airlock session exec -- $SHELL`. Every `exec` is logged with its
-session id.
+`exec`, `tools list` and `agent check` take the address and token from
+`AIRLOCK_ADDR` and `AIRLOCK_SESSION` and nothing else. They do not fall
+back to `admin.token` or to discovery. A user who wants to run `exec` by
+hand starts a shell with `airlock run -- $SHELL` (sandboxed), or runs
+`eval "$(airlock session start)"` in an unsandboxed one. Every `exec` is
+logged with its session id.
+
+`tools list --session <ID>` is the one exception: run from the user's
+terminal, it reads `admin.token` to show what another session serves.
+
+**Exit status.** `exec` exits with the tool's status, and with 125, 126 or
+127 when Airlock itself fails, as `docker run`, `env` and `chroot` do. Exit
+1 is the most common tool failure, so it cannot also mean "Airlock failed".
+
+| Exit | Meaning |
+|---|---|
+| 125 | Airlock could not run the tool: no session, session ended, daemon unreachable, stale secret, working directory outside the root |
+| 126 | The tool is declared, but its binary cannot be used: not on the session's `PATH`, or inside the root or a write grant. The message names the `PATH` entries that were dropped and why, and suggests installing the tool outside the project (Homebrew, mise, Nix). There is no override: approving the config does not approve a binary the agent can rewrite ([B2](#blocking)). |
+| 127 | No tool by that name in this session |
+
+`run` exits with the agent's status, or 125 when Airlock cannot start it.
+Airlock's own messages start with `airlock:` on stderr, which tells them
+apart from a tool that exits 125–127 itself.
 
 ### Transport
 
 `AIRLOCK_ADDR` is a URI. This proposal implements `unix://<path>` only. The
 design keeps a TCP transport open:
 
-- **Authorization is the session token, not the uid.** Peer uid and the
-  socket's mode 0700 stay as a check on the Unix transport, but no decision
-  depends on them.
+- **Authorization starts from the session token, not the uid.** Peer uid,
+  the socket's mode 0700 and the [token binding](#token-binding) to a
+  process tree are extra checks that only the Unix transport can make.
 - **Requests carry no file descriptors.** They carry no other host-local
   handles either, so any byte stream can carry the protocol.
 - **Registration stays local.** `admin.token` is read from the daemon's
@@ -522,20 +803,51 @@ project root and working directory on that host. See [F11](#follow-ups).
 
 ### Under another harness
 
-The session token reaches the agent through its environment, so a
-harness can deny reads of the whole runtime base without breaking Airlock.
-It has to: `admin.token` is protected from Airlock's own sandboxes only. A
-harness that lets the agent read `<base>` lets it register sessions for any
-project. SECURITY.md states this, with the path to deny.
+A harness started from a `session start` shell runs in its own sandbox, or
+in none. Airlock's protections for the agent then depend on that sandbox,
+which must:
+
+| Must | Why |
+|---|---|
+| Deny reads of the runtime base | `admin.token` is protected from Airlock's own sandboxes only. A harness that lets the agent read it lets the agent register sessions for any project. The token reaches the agent through its environment, so denying the whole base breaks nothing. |
+| Deny writes to the runtime base, the trust store and the global config | The agent must not replace the socket or CA, approve its own config, or edit the unapproved global layer. |
+| Deny reads of the user's credential stores (`~/.config/gh`, `~/.config/gcloud`, `~/.aws`, `~/.kube`, the keychain) | Otherwise the agent reads the credentials Airlock brokers, directly. |
+| Deny inspecting other processes | Otherwise the agent can read other processes' environments. [Token binding](#token-binding) makes a copied session token useless, but other secrets in other environments are not covered. |
+
+The harness also inherits the whole environment of the shell it started
+from, unlike under `run`, which passes an allowlist. Start it from a shell
+without secrets in its environment, not from inside `op run`.
+
+SECURITY.md carries this list, with a Claude Code sandbox configuration
+that meets it. `airlock config --paths` prints the exact paths on this
+machine. `session start` points to the list each time (`-q` drops it), and
+[`agent check`](#agent-integration) tests it from the agent's shell.
 
 ### Commands refused inside the sandbox
 
-`trust`, `session`, `daemon` and `run` refuse when `AIRLOCK_SANDBOX=1`, with
-a clear error. The agent can unset the variable, so this is a convenience
+`run`, `trust`, `status`, `session` and `daemon` refuse when
+`AIRLOCK_SANDBOX=1`, with an error that says they need the user's terminal.
+For `status`, the error points to `agent check`, which shows the agent its
+own session. The agent can unset the variable, so this is a convenience
 only. What actually stops the agent is that it cannot write the trust store
 (see below) or read `admin.token`. A daemon the agent starts itself cannot
 create its socket in the runtime base, and anywhere else it runs with the
 agent's own access, so it gains nothing.
+
+With `AIRLOCK_SANDBOX=1`, `airlock --help` and shell completion list only
+the commands that work there. The help says so and names the hidden
+commands, so a user in a sandboxed shell sees why one is missing. A hidden
+command's own `--help` still works and starts by saying it needs the
+user's terminal. In a `session start` shell the variable is not set, and
+help is complete.
+
+`init` and `config` work inside the sandbox. `init` writes a project file
+that still needs approval, so an agent can draft a config for the user to
+review. `init --global` is refused there like `trust`, and hidden from
+help: the global file needs no approval, so nothing would review what the
+agent wrote. The sandbox cannot write it anyway, but the refusal says why.
+`config` shows the global layer as unreadable when the sandbox cannot read
+it.
 
 ## Protecting the anchors
 
@@ -586,24 +898,111 @@ With these checks, a redirected XDG variable can only point somewhere the
 agent cannot write. Nothing it controls ends up in the trust store or the
 global layer.
 
-## `airlock list` through the daemon
+## Inspecting config and sessions
 
-`list` stops reading config files. It sends a new `List` request over the
-socket, and the daemon answers from the session's merged, approved
-config. The output format stays the same.
+Three layers and several sessions raise two different questions: what do
+the files say, and what does a running agent get. Each has its own command,
+and the agent's view of its own session is a third.
+
+| Command | Answers | Reads |
+|---|---|---|
+| `airlock config` | What the next session start would load: the merged config from the current files, the layer each secret, tool and setting comes from, and each file's approval state. Items from a file that is not approved are marked `(unapproved)`; a global tool a project tool replaces is marked `replaced by repo`. `--paths` prints the layer, trust store, runtime and tool state paths. | The files. No daemon or session. Secret values never appear. Inside the sandbox, a global layer it cannot read shows as `not readable from this sandbox`. |
+| `airlock tools list` | What a session serves. Inside a session, its own tools; from the user's terminal, `--session <ID>` names one. | The daemon, through a `List` request. |
+| `airlock status` | The daemon (running, PID, version, how it started), this project's layers and approval state, and the sessions here and in total. Exits 0 when the daemon runs, 3 when it does not. | Both, with `admin.token`. User's terminal only. |
+
+`tools list` replaces `list`, which stops reading config files. The daemon
+answers from the session's merged, approved config, in today's output
+format.
 
 - The agent sandbox never needs read access to the global config or the
   trust store.
 - The list matches what `exec` will accept.
-- `list` now requires a running daemon and a [session](#sessions), and
-  without either it fails with the usual connection hint. [SKILL.md](../SKILL.md) currently says the
-  opposite and changes with this.
+- `tools list` needs a running daemon and a [session](#sessions), and
+  without either it fails with the usual message. [SKILL.md](../SKILL.md)
+  currently says the opposite and changes with this.
+- Under `run --no-session` there is no session, so it fails there with the
+  same message as anywhere else.
+
+The commands are grouped by who runs them. The user's commands sit at the
+top level. What the agent and its harness run sits under `airlock agent`.
+`exec` and `tools list` serve both.
+
+## Agent integration
+
+Whether the agent uses `airlock exec` should not depend on it reading
+SKILL.md. An agent that never loads the skill, or loses it in a
+compaction, runs `gh` directly, gets "not logged in", and works around it.
+Two commands put the facts in the agent's context through its harness:
+
+- **`airlock agent check`** verifies the session and self-tests the
+  sandbox of the process that runs it. Each probe is a single `open` that
+  is expected to fail; nothing is read.
+
+  | Check | Passes when |
+  |---|---|
+  | Session | `AIRLOCK_SESSION` is set and the daemon accepts it |
+  | Daemon | it answers on `AIRLOCK_ADDR`, at a compatible version |
+  | `admin.token` | opening it for reading fails |
+  | Runtime dir, trust store, global config dir | creating a file in each fails |
+  | Environment | no variable named as a secret in any tool's `env` is set; the daemon supplies the names through `List`, never the values |
+  | Credential stores | opening each tool's `extra_read` paths and the well-known stores (`~/.config/gh`, `~/.config/gcloud`, `~/.aws`, `~/.kube`) for reading fails; a warning, not a failure, since `claude-relaxed` opens some on purpose. A path that does not exist is skipped. |
+  | Config | the project files' hashes match the session's; reported, not a failure |
+
+  The client computes the runtime base and anchor paths the way the
+  launcher does. Exit 0 if every check passes, 1 if one fails, 125 without
+  a session.
+- **`airlock agent hook <harness>`** adapts `check` and `tools list` to
+  one harness's hook protocol. It reads the hook event from stdin, always
+  exits 0, and prints nothing in a project without Airlock config, so it
+  can sit in a user-wide harness config. `claude-code` answers Claude
+  Code's SessionStart event, which fires on start, resume, `/clear` and
+  compaction. `text` prints the same context as plain text for any harness
+  that shows a start command's output to the agent.
+  `--print-settings` prints the hook configuration, so docs and binary
+  cannot drift. `run --profile claude` passes it to Claude Code with
+  `--settings`.
+
+A pass catches a misconfigured sandbox. It proves nothing against a
+hostile agent, which could fake the output, and the guarantees still come
+from the sandbox. Under `airlock run` the harness and its hooks run inside
+Airlock's sandbox, so the hook's self-test tests the agent's sandbox. For an
+`external` session a hook may run outside the harness's sandbox, so the
+hook skips the probes, lists the tools, and asks the agent to run
+`agent check` once with its own, sandboxed, shell tool.
+
+The agent can remove a hook from a project's `.claude/settings.json`. That
+is acceptable: the hook is guidance, and no security property depends on
+it.
+
+A PreToolUse hook that denies a direct `gh` and suggests the `airlock exec`
+form is left out. It costs a daemon round trip per shell command and needs
+a command parser that is never complete.
+
+## Shell completion
+
+`airlock completions <bash|zsh>` prints a script that calls back into
+`airlock` on each TAB (clap_complete's `CompleteEnv`). The candidates for
+`exec -- <TAB>` come from the session's `List`, and session ids from the
+daemon with `admin.token`, outside the sandbox only. After
+`exec -- <tool>` and `run --`, it hands off to the tool's own completion.
+
+The completer runs on every keypress, inside `main()` before anything else:
+
+- It never starts the daemon, resolves secrets, prompts or checks
+  approval. It only asks a running daemon.
+- It uses a blocking `std` socket, not a tokio runtime, with a 300 ms
+  timeout. On any error it offers nothing and prints nothing.
+- A `List` from completion is not logged as an `exec`.
+
+Delegated completion runs the tool's completer from the shell's `PATH`,
+without credentials and outside the tool sandbox. It runs nothing that
+typing the tool's name in the same shell would not, so it adds no exposure.
 
 ## Threat walkthrough
 
 | Attack | Outcome |
 |---|---|
-| Agent edits `airlock.toml` or `airlock.local.toml` | The next session start refuses with a diff. The user approves or reverts. Running sessions are unaffected. |
+| Agent edits `airlock.toml` or `airlock.local.toml` | The next session start or reload shows the diff in the user's terminal and asks, or refuses on a non-terminal. The user approves or reverts. Running sessions are unaffected until reloaded. |
 | A PR changes `airlock.toml`, and the user pulls it | Same. |
 | Agent hides a change with ANSI or bidi tricks | The diff is escaped, so the hidden characters are visible. |
 | Agent runs `airlock trust` | Refused by the `AIRLOCK_SANDBOX` check. If the agent unsets the variable, writing the trust store fails because no sandbox has a write grant covering it. |
@@ -612,10 +1011,13 @@ config. The output format stays the same.
 | Agent redirects `XDG_STATE_HOME` or `XDG_CONFIG_HOME` through repo-level env tooling | The anchor is inside the project or under a write grant, so it is refused. |
 | Agent in project A tries to use project B's tools | Its session is bound to A's root and config. Registering a session for B needs `admin.token`, which no sandbox can read. |
 | A daemon bug lets session A reach session B's state | The session handle is the only path to secrets, and process-env reads are linted out. If B's secret still reaches A's output, the global redactor masks it. |
-| Agent stashes its session token for later | The token stops working when the harness exits or the session is revoked. |
+| Agent stashes its session token for later | The token stops working when the harness exits, the session's TTL runs out, or the session is revoked. |
+| A process outside the agent's tree copies its token (an agent under a lax external sandbox reads another's environment) | Not served: the [token binding](#token-binding) requires the caller to descend from the session's anchor process. Unix transport only. |
+| The launcher is killed | The lease connection closes and the daemon revokes the session. |
 | Agent replaces the socket, PID file or CA certificate | The runtime dir is not writable: Linux never grants it, and macOS denies it explicitly. |
 | Agent starts its own daemon, session or `airlock run` | Refused (convenience only). If forced, the daemon cannot create its socket in the runtime base, and a session cannot be registered without `admin.token`. |
-| Agent stops the user's daemon or revokes sessions | Refused (convenience only), and `daemon stop` and `session revoke` need `admin.token`. |
+| Agent stops the user's daemon, or revokes or reloads sessions | Refused (convenience only), and `daemon stop`, `session revoke` and `session reload` need `admin.token`. |
+| Agent removes the harness hook | Allowed. The hook is guidance; nothing depends on it for security. |
 | Agent plants code the user later runs outside the sandbox (hook, `.envrc`, build script) | Not prevented; a [non-goal](#non-goals). That code can rewrite the anchors, and it can also read the user's credentials directly. |
 
 ## Worked examples
@@ -694,17 +1096,27 @@ it, here with its own `command`; `from = "global"` would have used the
 
 ### Duplicate tool
 
+A global `gh` gives way to the repo's, and `airlock config` says so:
+
 ```
-$ airlock session start
-error: tool "gh" is defined in both ~/.config/airlock/airlock.toml and ~/src/app/airlock.toml;
-       a tool may be defined in only one layer
+tools
+  gh    repo    GitHub CLI       (replaces global)
 ```
 
-### Refusal after an edit
+A local `gh` next to the repo's is an error until the local file says it
+means it:
 
 ```
 $ airlock run --profile claude
-error: ~/src/app/airlock.toml has changed since you last trusted it
+error: tool "gh" is defined in both ~/src/app/airlock.toml and ~/src/app/airlock.local.toml;
+       add `override = true` to the tool in airlock.local.toml to replace the repo's
+```
+
+### A changed file at session start
+
+```
+$ airlock run --profile claude
+~/src/app/airlock.toml has changed since you last trusted it:
 
 --- trusted
 +++ ~/src/app/airlock.toml
@@ -715,10 +1127,14 @@ error: ~/src/app/airlock.toml has changed since you last trusted it
  read = ["/opt/homebrew/share"]
 +write = ["~/.ssh"]
 
-Review the change, then run `airlock trust`.
+Trust this version and continue? [y/N] n
+not trusted; nothing started
 ```
 
-### Approving
+On a non-terminal the launcher prints the same diff, then
+`run \`airlock trust\` in a terminal to approve it`, and exits 125.
+
+### Approving ahead of time, and reloading
 
 ```
 $ airlock trust
@@ -726,12 +1142,17 @@ $ airlock trust
 
 --- trusted
 +++ ~/src/app/airlock.toml
-@@ -10,5 +10,6 @@
+@@ -14,3 +14,8 @@
  ...
 
 Trust this version? [y/N] y
 trusted ~/src/app/airlock.toml
-note: 1 running session for ~/src/app keeps the previous config; new sessions use this one
+2 sessions for ~/src/app use the previous config: 7f3a9c "claude", b20e51 "codex"
+run `airlock session reload` to apply it to them
+
+$ airlock session reload
+reloaded 7f3a9c "claude": tools +psql
+reloaded b20e51 "codex": tools +psql
 ```
 
 The first approval of a file shows its full contents:
@@ -789,10 +1210,10 @@ whole config.
 | Personal config location | Global and per-project local | Global only; local only | Global for bindings shared across projects, local for per-project overrides. |
 | Local file location | In the project, approved | Outside the project (`~/.config/airlock/projects/<id>.toml`); in the project with sandbox write denied | Kept next to the repo file where users expect it. Approval handles the agent being able to write it. |
 | Precedence | global < repo < local | repo < global < local | Same order as git config. |
-| Tool collision | Error | Higher layer replaces it; field merge | A silently shadowed tool is a security surprise. |
+| Tool collision | A project tool replaces a global one, shown in `config`; repo against local is an error unless the local tool says `override = true` | Always an error; highest layer wins; field merge | A silently shadowed team tool is a security surprise, but an error with no way out breaks every repo that declares the user's global `gh`. Each replacement is either the user's own default giving way, or an approved line. |
 | Secret collision | Local replaces a repo label's spec whole; global reaches a repo label only through local `from = "global"` | Highest layer wins; global rebinds repo labels automatically; approve the cross-layer binding map | A repo label must not resolve to a personal secret without an approved opt-in. Rebinding stays one line per label. |
 | Everything else | Lists union, maps per key, scalars highest | Whole-section replace; additive only | Predictable, and a personal layer can still override a value. |
-| Unapproved file | Refuse, show diff against a stored copy | Refuse with no diff; interactive prompt at start | The user reviews exactly what changed, and startup stays non-interactive. |
+| Unapproved file | Show the diff against a stored copy; on a terminal ask and continue, on a non-terminal refuse | Refuse with no diff; always refuse and point to `trust` | The user reviews exactly what changed. Refuse, `trust`, run again is three commands for the most common decision, and the prompt is as safe as `trust`'s. Scripts stay non-interactive. |
 | `airlock trust` UX | Diff, then y/N; `--yes` for scripts | Approve silently; no `--yes` | Review happens where the approval happens. |
 | Protecting approval | Sandbox cannot write the trust store; `trust` refuses in the sandbox | Terminal confirmation as the control | An agent with a pty can answer a prompt, so only the sandbox is a real control. |
 | Global file approval | None, protected by the anchor checks | Approve it like the repo file | It is the user's own file, outside every project. |
@@ -800,9 +1221,20 @@ whole config.
 | Project without config | Requires `airlock.toml` or `airlock.local.toml`; `--no-project-config` opts out | Global-only by default | Using Airlock in an arbitrary directory is explicit. |
 | `--no-config` | Becomes `--no-project-config` (global layer only) | Keep both | An empty config has no real use. |
 | `--config <path>` | That file only, still approved | Replaces only the repo layer; skips approval too | An explicit file means exactly that file. Skipping approval would reopen the hole. |
-| `list` | Asks the daemon | Reads the files; daemon with file fallback | Shows what is actually served, and keeps config dirs out of the agent sandbox. |
-| After approval | New sessions use it; running sessions keep theirs, and `status` marks them | `trust` reloads running sessions | A running agent's tools do not change under it, and a new session costs little. |
-| Commands refused in the sandbox | `trust`, `session`, `daemon`, `run` | `trust` only | Clear errors for things an agent has no business doing. |
+| `tools list` | Asks the daemon | Reads the files; daemon with file fallback | Shows what is actually served, and keeps config dirs out of the agent sandbox. |
+| Inspecting the files | `airlock config`, with the layer behind each item | `tools list` only | `tools list` shows what a session serves, not what the files say. Three layers raise "where does this come from?", as `git config --show-origin` answers. |
+| Command grouping | User's commands at the top level; the agent's under `airlock agent`; `exec` and `tools list` for both | Everything at the top level | The agent's plumbing does not sit next to the user's commands. |
+| After approval | New sessions use it; running sessions keep theirs until the user runs `session reload`, and `status` marks them | `trust` reloads running sessions; no reload at all | A running agent's tools change only when the user asks, and an agent that added a tool does not lose its context to a restart. |
+| Commands refused in the sandbox | `run`, `trust`, `status`, `session`, `daemon`; help inside the sandbox hides them and says so | `trust` only; same help everywhere | Clear errors for things an agent has no business doing, and an agent reading the help is not shown commands it cannot use. |
+| Wrapping a harness | `airlock run` always sandboxes; a harness with its own sandbox uses `session start` | A separate `session exec`; `run --no-sandbox` | One verb starts an agent, and no flag runs one with no sandbox at all. `session exec` would give `exec` two meanings. |
+| Exit status | 125 Airlock failed, 126 binary unusable, 127 no such tool | Exit 1 for every Airlock error | 1 is also the most common tool failure. Same convention as `docker run`, `env` and `chroot`. |
+| Session lifetime | `run`: a lease on the `Register` connection; `session start`: `--ttl`, default 12h, with `session renew` | Ends only when `run` sees the harness exit; daemon watches the harness PID; until revoked | The kernel closes a dead launcher's socket, so nothing outlives it, with no platform-specific process watching. A forgotten `session start` would otherwise keep a token valid indefinitely; renew keeps an editor working past a day. |
+| Copied tokens | Bound to the anchor process's tree by peer PID | Acknowledge only | An external sandbox that allows process inspection exposes every token in reach. The binding makes a copy useless outside its tree. |
+| Tool state | `{tool_state}` under `$XDG_CACHE_HOME/airlock` | `{sandbox_root}/.config/…` | Keeps tool state out of the project, the agent's reach and `git status`. |
+| Approving in CI | `trust --yes`, or `--expect-sha256` to pin content | `--yes` only | A pinned hash approves exactly what the workflow expects. |
+| Daemon version skew | Handshake; restart an idle daemon, note on a busy one, refuse if incompatible | Not handled | An automatic daemon outlives the binary that started it. |
+| Agent learns its tools | SessionStart hook through `airlock agent hook`, installed by `--profile claude` | SKILL.md alone; a PreToolUse hook | The hook delivers the facts on every start and compaction. A PreToolUse hook costs a round trip per command and needs a complete command parser. |
+| `--config` scope | Only on commands that discover config | A global option | On `exec` and `tools list` it would be a silent no-op. |
 | Client authentication | Sessions registered with a 0600 `admin.token` no sandbox can read; scoped by the directory they start in; `AIRLOCK_ADDR` is a URI | Uid only; one token per daemon in the agent's environment; per-session tool allowlist | The agent is the same uid. A per-daemon token lives too long and cannot tell agents apart. A subset of one project's tools is rarely needed. |
 | Migration | None | A transition release that checks both locations | Pre-1.0. |
 
@@ -858,10 +1290,10 @@ implementation, or be decided during it.
 | F2 | The global config under home-manager | follow-up |
 | F3 | Review a policy diff, not only a byte diff | follow-up |
 | F4 | Precedence for secret sources | resolved by B3 |
-| F5 | Tool collisions have no way out | follow-up |
+| F5 | Tool collisions have no way out | resolved: global yields; local `override = true` |
 | F6 | Every worktree needs its own first approval | follow-up |
 | F7 | Runtime dir lifetime | follow-up |
-| F8 | `list` under `airlock run --no-daemon` | follow-up |
+| F8 | `list` under `airlock run --no-daemon` | resolved: `--no-session` has no session, so `tools list` fails as anywhere else |
 | F9 | Deny agent writes to `.git/hooks/` on macOS | follow-up |
 | F10 | Run each session's proxy in its own process | follow-up |
 | F11 | Network transport | follow-up |
@@ -1083,6 +1515,10 @@ breaks startup in the first repo that also defines `gh`, and the user
 can only remove their own. Decide whether the local layer may explicitly
 replace a repo tool, or the global tool yields to the project.
 
+**Resolved: both.** See [Tools across layers](#tools-across-layers). A
+global tool yields to a project tool, visibly; a local tool replaces a repo
+tool only with `override = true`.
+
 **F6. Every worktree needs its own first approval.** Agent workflows create
 worktrees often, and each is a new root and a new id. Consider accepting a
 file whose bytes match a copy already approved for the same git common dir.
@@ -1095,6 +1531,10 @@ periodic temp cleanup removes a long-running daemon's PID file.
 **F8. `list` under `airlock run --no-daemon`.** `list` now needs a daemon,
 and this mode has none. Decide whether `list` fails there or `run` answers it
 another way.
+
+**Resolved.** `--no-daemon` is renamed `--no-session`. There is no session
+under it, so `tools list` fails with the same message as anywhere else
+without one.
 
 **F9. Deny agent writes to `.git/hooks/` on macOS.** Hooks fire on commit
 with no review step, and agents rarely need to write them. Seatbelt can deny
@@ -1144,37 +1584,63 @@ The costs, and how the design answers them:
   `Register`.
 - **Loading has to happen in the user's terminal.** It happens at session
   registration, in the launcher, and never on an agent's first `exec`.
-- **A crash or upgrade ends every session.** This is accepted. Sessions are
-  cheap to start again.
+- **A crash or restart ends every session.** This is accepted. Sessions are
+  cheap to start again. An upgrade does not force a restart: a busy daemon
+  keeps serving until it is idle, unless the protocol changed (see
+  [Lifecycle](#lifecycle)).
 
 ## To verify during implementation
 
 - The agent can connect to `airlock.sock` in a directory it has no file
   grants for: under Seatbelt with the agent's network rules, and under
   Landlock, which does not mediate `connect` on pathname sockets.
+- Seatbelt's `process-info*` with `(target same-sandbox)` means the same
+  sandbox instance, not every process with the same profile text. If not,
+  two Airlock-sandboxed agents can read each other's environment; the
+  [token binding](#token-binding) still holds, but other variables do not.
+- Editors started from a `session start` shell descend from it. `code .`
+  may hand off to a running instance or start through launchd, which
+  breaks the [token binding](#token-binding). If so, document which
+  editors work and how to start them.
 
 ## Docs to update when this ships
 
-- **SKILL.md:**
-  - `airlock trust`
-  - `airlock session`; `exec` and `list` need `AIRLOCK_ADDR` and `AIRLOCK_SESSION`
-  - `airlock daemon install/uninstall`; the daemon starts automatically
-  - `airlock list` needs the daemon
+- **SKILL.md:** the drafts in [the UX doc](airlock-v2-ux.md#agent-facing-guide-skillmd):
+  - `airlock tools list` replaces `airlock list` and needs a session
+  - `exec`, `tools list` and `agent check` need `AIRLOCK_ADDR` and
+    `AIRLOCK_SESSION`; the session section
+  - exit codes 125, 126 and 127 and what to do with each
+  - `airlock agent check`
+  - after editing the config: ask the user to run `airlock trust` and
+    `airlock session reload`; never run the user's commands
+  - the daemon starts on demand; `airlock daemon install/uninstall`
   - `--no-project-config` replaces `--no-config`
   - `airlock.local.toml` and the global file
-  - secret labels across layers, `from = "global"`, optional repo `source`
-- **README.md:** quick start without runtime `.gitignore` entries; personal
-  config.
+  - secret labels across layers, `from = "global"`, optional repo `source`,
+    `description`
+- **README.md:** the sections drafted in [the UX doc](airlock-v2-ux.md#readmemd):
+  how it works with the launcher, quick start without `daemon start` or
+  runtime `.gitignore` entries, supplying secrets through `airlock run`,
+  team and personal config (`airlock.local.toml`, the global file,
+  `from = "global"`, `init --local`), approving config, harness hooks,
+  the command reference, shell completion, troubleshooting. `{tool_state}`
+  in the quick start and examples, and the global git excludes line for
+  `airlock.local.toml`.
 - **ARCHITECTURE.md:** one daemon per user and sessions, registration by
   the launcher (config load, approval, secret resolution), session
-  isolation, lifecycle modes, runtime dir, config layering and merge,
-  `Register` and `List` requests.
+  isolation, lifecycle modes and the version handshake, runtime dir,
+  config layering and merge, `Register`, `Reload` and `List` requests,
+  the session lease and token binding, the completer's fast path in
+  `main()`.
 - **SECURITY.md:** the trust model, the anchors and their validation, and
   the runtime dir replacing sandbox-root runtime files. Config safety: the
   filtered `PATH`, the binary location check, and interpreter arguments
   that name project files. Sessions replace uid-only socket authentication;
-  other harnesses must deny reads of the runtime base. A "does not protect
-  against" entry for agent-written code run outside the sandbox.
+  token binding to the anchor process's tree; the external sandbox
+  requirements from [Under another harness](#under-another-harness), with
+  a Claude Code sandbox configuration that meets them, and `agent check`
+  that tests them. A "does not protect against" entry for agent-written
+  code run outside the sandbox.
 - **CLAUDE.md:** the trust boundary invariant (session token, not the
   socket alone), the session isolation rules, and the socket invariant's
   file references.
