@@ -37,6 +37,11 @@ pub struct Anchors {
     pub global_config_source: Option<String>,
     /// `$XDG_CACHE_HOME/airlock`, default `~/.cache/airlock`.
     pub tool_state_base: PathBuf,
+    /// The XDG variable and value that produced `tool_state_base`, when it
+    /// was not the default. Used only to name the variable in
+    /// [`validate_tool_state_dir`]'s error — `tool_state_base` itself is not
+    /// one of the three anchors `validate` checks.
+    pub tool_state_base_source: Option<String>,
     /// The daemon's runtime directory base.
     pub runtime_base: PathBuf,
 }
@@ -69,7 +74,7 @@ impl Anchors {
 pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home: &Path, runtime: &RuntimeDir) -> Anchors {
     let (state_dir, trust_store_source) = xdg_dir(env, home, "XDG_STATE_HOME", ".local/state");
     let (config_dir, global_config_source) = xdg_dir(env, home, "XDG_CONFIG_HOME", ".config");
-    let (cache_dir, _) = xdg_dir(env, home, "XDG_CACHE_HOME", ".cache");
+    let (cache_dir, tool_state_base_source) = xdg_dir(env, home, "XDG_CACHE_HOME", ".cache");
 
     Anchors {
         trust_store: state_dir.join("airlock").join("trust"),
@@ -77,6 +82,7 @@ pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home: &Path, runtime: &Runt
         global_config: config_dir.join("airlock").join("airlock.toml"),
         global_config_source,
         tool_state_base: cache_dir.join("airlock"),
+        tool_state_base_source,
         runtime_base: runtime.base().to_path_buf(),
     }
 }
@@ -122,6 +128,36 @@ pub fn validate(
         check_not_granted(path, label, write_grants)?;
     }
 
+    Ok(())
+}
+
+/// Validates one tool's `{tool_state}` directory (design doc, "Tool state
+/// outside the project"): like the three true anchors, it is refused if it
+/// resolves inside the project root, so a redirected `XDG_CACHE_HOME`
+/// cannot move it there, and it must not overlap an anchor either — that
+/// would hand a sandboxed tool write access to Airlock's own files.
+/// `tool_state_base` itself is not one of [`Anchors::named`]'s three
+/// anchors, so this is a separate check from [`validate`].
+pub fn validate_tool_state_dir(
+    anchors: &Anchors,
+    project_root: &Path,
+    dir: &Path,
+) -> Result<(), AnchorError> {
+    check_outside_root(
+        dir,
+        "tool state",
+        anchors.tool_state_base_source.as_deref(),
+        Some(project_root),
+    )?;
+    for (anchor_path, anchor_label, _source) in anchors.named() {
+        if overlaps(dir, anchor_path) {
+            return Err(AnchorError::ToolStateOverlapsAnchor {
+                path: dir.to_path_buf(),
+                anchor: anchor_label.to_string(),
+                anchor_path: anchor_path.to_path_buf(),
+            });
+        }
+    }
     Ok(())
 }
 
@@ -458,6 +494,17 @@ pub enum AnchorError {
         path: PathBuf,
         anchor: String,
     },
+
+    #[error(
+        "tool state {} overlaps the {anchor} {}; refusing to use it",
+        path.display(),
+        anchor_path.display()
+    )]
+    ToolStateOverlapsAnchor {
+        path: PathBuf,
+        anchor: String,
+        anchor_path: PathBuf,
+    },
 }
 
 #[cfg(test)]
@@ -650,6 +697,7 @@ mod tests {
             global_config,
             global_config_source: None,
             tool_state_base: dir.path().join("cache/airlock"),
+            tool_state_base_source: None,
             runtime_base,
         };
         Fixture { _dir: dir, anchors }
@@ -785,6 +833,41 @@ mod tests {
             validate(&f.anchors, None, &[grant]),
             Err(AnchorError::Covered { .. })
         ));
+    }
+
+    // ─── validate_tool_state_dir ────────────────────────────────────────
+
+    #[test]
+    fn validate_tool_state_dir_accepts_dir_outside_everything() {
+        let f = fixture();
+        let root = f.anchors.trust_store.parent().unwrap().parent().unwrap();
+        let dir = f.anchors.tool_state_base.join("proj123").join("gh");
+
+        validate_tool_state_dir(&f.anchors, root, &dir).expect("disjoint tool state dir");
+    }
+
+    #[test]
+    fn validate_tool_state_dir_rejects_dir_inside_project_root() {
+        let f = fixture();
+        let root = f.anchors.trust_store.parent().unwrap().parent().unwrap();
+        // A redirected XDG_CACHE_HOME moving {tool_state} into the project.
+        let dir = root.join(".cache/airlock/proj123/gh");
+
+        let err = validate_tool_state_dir(&f.anchors, root, &dir).unwrap_err();
+        assert!(matches!(err, AnchorError::InsideRoot { .. }));
+        assert!(err.to_string().contains("tool state"));
+        assert!(err.to_string().contains("is inside the project root"));
+    }
+
+    #[test]
+    fn validate_tool_state_dir_rejects_overlap_with_an_anchor() {
+        let f = fixture();
+        let root = f.anchors.trust_store.parent().unwrap().parent().unwrap();
+        let dir = f.anchors.runtime_base.join("gh");
+
+        let err = validate_tool_state_dir(&f.anchors, root, &dir).unwrap_err();
+        assert!(matches!(err, AnchorError::ToolStateOverlapsAnchor { .. }));
+        assert!(err.to_string().contains("overlaps the runtime dir"));
     }
 
     // ─── check_grants_against_anchors ──────────────────────────────────
