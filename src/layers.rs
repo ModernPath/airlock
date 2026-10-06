@@ -47,13 +47,7 @@ pub enum DiscoveryMode {
 /// tools and secret labels), but is tracked separately because it has its
 /// own trust-store slot (keyed by file name, not always `airlock.toml`) and
 /// its own display name.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
-pub enum LayerKind {
-    Global,
-    Repo,
-    Local,
-    ConfigFile,
-}
+pub use crate::protocol::LayerKind;
 
 /// One config file, read once. The same bytes are hashed (for the trust
 /// store) and parsed (for merging) — there is no separate read between the
@@ -226,13 +220,7 @@ fn discover_project_root(
     })
 }
 
-/// A project's id: see [`config::project_id`]. Re-exported here because the
-/// trust module keys its store by it, and reaches it through `layers`
-/// rather than `config` to keep the "which module owns project identity"
-/// story in one place for callers that already depend on `layers`.
-pub fn project_id(root: &Path) -> String {
-    config::project_id(root)
-}
+pub use crate::config::project_id;
 
 // ─── Merge ──────────────────────────────────────────────────────────────────
 

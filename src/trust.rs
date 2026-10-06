@@ -42,18 +42,7 @@ use thiserror::Error;
 
 // ─── Trust store ────────────────────────────────────────────────────────────
 
-/// The first 16 hex characters of the SHA-256 of the canonical project root
-/// path. Identifies a project's slot in the trust store; a project that
-/// moves to a new path gets a new id and needs approval again.
-pub fn project_id(root: &Path) -> String {
-    sha256_hex(root.as_os_str().as_bytes())[..16].to_string()
-}
-
-/// SHA-256 of `bytes`, as lowercase hex.
-pub fn sha256_hex(bytes: &[u8]) -> String {
-    let digest = ring::digest::digest(&ring::digest::SHA256, bytes);
-    digest.as_ref().iter().map(|b| format!("{b:02x}")).collect()
-}
+pub use crate::config::{project_id, sha256_hex};
 
 /// Errors from reading or writing the trust store.
 #[derive(Debug, Error)]

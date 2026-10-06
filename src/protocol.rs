@@ -60,18 +60,14 @@ pub const MAX_SESSION_LINE_BYTES: usize = 1024 * 1024;
 /// frames have their own size limit").
 pub const MAX_ADMIN_LINE_BYTES: usize = 16 * 1024 * 1024;
 
-// ─── Wire config placeholder ─────────────────────────────────────────────────
+// ─── Wire config ──────────────────────────────────────────────────────────────
 
-/// Placeholder for the merged config carried by `Register`/`Reload`.
-///
-/// The real type is `config::RawConfig` (the TOML raw types), which another
-/// phase-1 agent is making `Serialize`/`Deserialize` with `deny_unknown_fields`
-/// at every level, in parallel, in a different worktree. Depending on it here
-/// would couple this module to work in flight on another branch. The
-/// coordinator replaces this alias with `config::RawConfig` at merge; nothing
-/// else in this module needs to change, since every type that embeds it only
-/// ever treats it as an opaque, serializable blob.
-pub type WireConfig = serde_json::Value;
+/// The merged config carried by `Register`/`Reload`: the TOML raw types,
+/// normalized by the launcher (absolute paths, concrete secret sources). They
+/// deny unknown fields at every level, so a daemon that does not know a field
+/// rejects the request instead of ignoring a policy the launcher expected
+/// enforced.
+pub type WireConfig = crate::config::RawConfig;
 
 // ─── NDJSON line encoding ─────────────────────────────────────────────────────
 
@@ -563,7 +559,7 @@ pub enum WireMode {
 }
 
 /// Which config layer a file belongs to.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum LayerKind {
     /// `$XDG_CONFIG_HOME/airlock/airlock.toml`.
@@ -1893,7 +1889,7 @@ mod tests {
                 path: PathBuf::from("/home/user/project/airlock.toml"),
                 sha256: "f".repeat(64),
             }],
-            config: serde_json::json!({"tools": {}}),
+            config: crate::config::RawConfig::default(),
             secrets: vec![WireSecret {
                 label: "GH_TOKEN".to_string(),
                 value: Zeroizing::new("s3cret".to_string()),
