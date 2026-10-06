@@ -73,7 +73,7 @@ closure to bound the blast radius of a misbehaving or malicious tool.
   - `RLIMIT_NOFILE` — max open fds.
 
 **Constraints.** The child's pre-exec closure must use raw `libc::setrlimit`
-(async-signal-safe). See [src/exec.rs:402-435](src/exec.rs#L402-L435) for the
+(async-signal-safe). See [src/exec.rs:585-622](src/exec.rs#L585-L622) for the
 existing pre-exec blocks on Linux and macOS.
 
 **Config schema.** Likely a `[tools.X.limits]` table in `airlock.toml`; see
@@ -83,10 +83,10 @@ existing pre-exec blocks on Linux and macOS.
 
 **What.** Add `prctl(PR_SET_DUMPABLE, 0)` to the child's pre-exec closure on
 Linux, alongside the existing `PR_SET_NO_NEW_PRIVS` and landlock calls in
-[src/exec.rs:413-433](src/exec.rs#L413-L433).
+[src/exec.rs:596-605](src/exec.rs#L596-L605).
 
 **Why.** The daemon already sets `DUMPABLE=0` on itself
-([src/daemon.rs:549](src/daemon.rs#L549)), but the child inherits dumpable
+([src/daemon.rs:496](src/daemon.rs#L496)), but the child inherits dumpable
 across fork and execve resets it to `/proc/sys/fs/suid_dumpable` (typically
 1). The running tool therefore has `/proc/<pid>/environ`, `/proc/<pid>/mem`,
 and `/proc/<pid>/maps` readable by any same-UID process for its lifetime —
@@ -114,10 +114,10 @@ language-server IPC sockets) without routing that intent through the
 generic `extra_read` filesystem list.
 
 **Why.** Today the macOS profile unconditionally emits `(allow
-network-outbound)` and `(allow network-bind (local unix-socket))` when
-`requires_network` is true ([src/sandbox.rs:634-672](src/sandbox.rs#L634-L672)),
-and `requires_network` itself is hardcoded to `true` for every tool
-([src/policy.rs:156](src/policy.rs#L156)). So AF_UNIX `connect()` is
+network-outbound)` and `(allow network-bind (local unix-socket))` for
+`NetworkAccess::Full` ([src/sandbox.rs:889](src/sandbox.rs#L889)), and a
+non-proxy tool's `network` is hardcoded to `NetworkAccess::Full`
+([src/policy.rs:171-180](src/policy.rs#L171-L180)). So AF_UNIX `connect()` is
 wide open at the syscall layer — the only gate is file-read on the
 socket inode, which users currently have to express via `extra_read`.
 That works as ergonomics but is cosmetic as isolation: a tool asking
@@ -146,16 +146,16 @@ documented as macOS-only.
 **Proposed shape for Airlock.**
 
 - Add `sockets = ["/var/run/..."]` to `[tools.X]` in `airlock.toml`
-  ([src/config.rs:397](src/config.rs#L397)) and a matching
-  `Vec<PathBuf>` on [`ToolConfig`](src/config.rs#L518) and
-  [`ToolPolicy`](src/sandbox.rs#L36).
+  (next to `extra_write` on the raw type, [src/config.rs:684](src/config.rs#L684))
+  and a matching `Vec<PathBuf>` on [`ToolConfig`](src/config.rs#L859) and
+  [`ToolPolicy`](src/sandbox.rs#L51).
 - On macOS, replace the blanket `(allow network-outbound)` and
   `(allow network-bind (local unix-socket))` in
-  [`emit_network_rules`](src/sandbox.rs#L634) with per-path
+  [`emit_network_rules`](src/sandbox.rs#L741) with per-path
   `(remote unix-socket (subpath ...))` / `(local unix-socket (subpath ...))`
   rules, and scope `system-socket` to `(socket-domain AF_UNIX)` only
   when the list is non-empty. Inet outbound stays under the existing
-  `requires_network` gate.
+  `NetworkAccess::Full` gate.
 - On Linux, document it as macOS-only (matching sandbox-runtime) and
   treat the field as a no-op under Landlock. Revisit if we ever add a
   seccomp layer with BPF socket filtering.
