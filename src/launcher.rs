@@ -174,6 +174,10 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
 
     anchors::validate(&anchors, Some(&root), &write_grants)?;
 
+    if opts.verbose {
+        print_verbose_project_line(&anchors, &loaded, &root, &home)?;
+    }
+
     review_and_trust(&anchors, &loaded, &root, &raw_config, &merged)?;
 
     for dir in merged.tool_state_dirs() {
@@ -332,6 +336,49 @@ fn resolve_secrets(
         }
     }
     result.map_err(LauncherError::Secrets)
+}
+
+/// Builds the verbose first line's text (UX "First run", `-v`): `project
+/// <path> (repo: trusted)`, one `<layer>: <state>` entry per repo/local
+/// layer actually present, in the state each had when checked here —
+/// before `review_and_trust` runs, so a file this same invocation ends up
+/// prompting for still shows the state that triggered the prompt, not the
+/// approval it's about to get. Split from [`print_verbose_project_line`]
+/// so the formatting is testable without a trust store on disk.
+fn verbose_project_line(
+    root_display: &str,
+    layers: &[(crate::protocol::LayerKind, &str)],
+) -> String {
+    let parts: Vec<String> = layers
+        .iter()
+        .map(|(kind, state)| format!("{}: {state}", crate::inspect::layer_label(*kind)))
+        .collect();
+    format!("airlock: project {root_display} ({})", parts.join(", "))
+}
+
+fn print_verbose_project_line(
+    anchors: &Anchors,
+    loaded: &LoadedLayers,
+    root: &Path,
+    home: &Path,
+) -> Result<(), LauncherError> {
+    let store = TrustStore::open(&anchors.trust_store)?;
+    let mut layers = Vec::new();
+    for file in [&loaded.repo, &loaded.local].into_iter().flatten() {
+        let file_name = trust_file_name(file.kind, &file.path);
+        let approval = store.state(root, &file_name, &file.bytes)?;
+        let state = match approval {
+            Approval::Approved => "trusted",
+            Approval::Changed { .. } => "changed since trusted",
+            Approval::New => "not trusted yet",
+        };
+        layers.push((file.kind, state));
+    }
+    eprintln!(
+        "{}",
+        verbose_project_line(&crate::inspect::display_path(root, home), &layers)
+    );
+    Ok(())
 }
 
 // ─── Trust review ─────────────────────────────────────────────────────────────
@@ -806,6 +853,31 @@ pub fn format_duration_short(secs: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn verbose_project_line_matches_the_ux_doc_first_run_transcript() {
+        assert_eq!(
+            verbose_project_line(
+                "~/src/app",
+                &[(crate::protocol::LayerKind::Repo, "trusted")]
+            ),
+            "airlock: project ~/src/app (repo: trusted)"
+        );
+    }
+
+    #[test]
+    fn verbose_project_line_lists_every_present_layer() {
+        assert_eq!(
+            verbose_project_line(
+                "~/src/app",
+                &[
+                    (crate::protocol::LayerKind::Repo, "trusted"),
+                    (crate::protocol::LayerKind::Local, "not trusted yet"),
+                ]
+            ),
+            "airlock: project ~/src/app (repo: trusted, local: not trusted yet)"
+        );
+    }
 
     #[test]
     fn parse_ttl_zero_means_never() {
