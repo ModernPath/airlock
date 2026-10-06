@@ -11,13 +11,15 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 use std::time::Duration;
 
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
 use airlock::admin::{self, AdminError};
 use airlock::daemon;
+use airlock::inspect;
 use airlock::launcher::{self, DiscoverOpts, LauncherError, PrepareOptions};
 use airlock::protocol::{
-    AdminRequest, DaemonMessage, DaemonMode, SandboxKind, SessionEnds, WireMode,
+    AdminRequest, DaemonMessage, DaemonMode, EndsInfo, SandboxKind, SessionEnds, SessionInfo,
+    WireMode,
 };
 use airlock::run::{self, RunOptions};
 use airlock::runtime_dir::RuntimeDir;
@@ -43,7 +45,13 @@ fn long_version() -> &'static str {
 
 /// Airlock — sandboxed tool execution with secret injection and output redaction.
 #[derive(Parser)]
-#[command(name = "airlock", version = long_version(), about)]
+#[command(
+    name = "airlock",
+    version = long_version(),
+    about,
+    help_template = HELP_TEMPLATE,
+    arg_required_else_help = true
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -311,6 +319,120 @@ fn sandbox_refusal(command: &Commands) -> Option<ExitCode> {
     })
 }
 
+// ─── Help grouping (U5) and sandboxed help restriction (U16) ────────────────
+
+/// Top-level command groups, by who runs them (U5), in the order shown in
+/// `airlock --help`. Each name must be a subcommand of [`Commands`].
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Start an agent",
+        &["run", "init", "trust", "config", "status"],
+    ),
+    ("Use tools", &["exec", "tools"]),
+    ("Manage", &["session", "daemon"]),
+    ("For the agent and its harness", &["agent"]),
+];
+
+/// Visible with `AIRLOCK_SANDBOX=1` (U16): the commands that work from
+/// inside an Airlock sandbox. Everything else is hidden from `--help` and a
+/// bare `airlock`, though each hidden command's own `--help` still works.
+const SANDBOX_VISIBLE: &[&str] = &["exec", "tools", "agent", "init", "config"];
+
+/// Every top-level command name in [`HELP_GROUPS`] that is not in
+/// [`SANDBOX_VISIBLE`] — hidden from help under `AIRLOCK_SANDBOX=1`.
+fn hidden_in_sandbox() -> impl Iterator<Item = &'static str> {
+    HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter().copied())
+        .filter(|n| !SANDBOX_VISIBLE.contains(n))
+}
+
+/// The line a hidden command's own `--help` starts with (U16): "a hidden
+/// command's own `--help` still works and starts with a line saying it
+/// needs the user's terminal."
+fn hidden_command_notice(name: &str) -> String {
+    let why = match name {
+        "status" => {
+            "needs your own terminal. Inside a session, `airlock agent check` shows this session."
+        }
+        _ => "needs your own terminal; it cannot run inside an Airlock sandbox.",
+    };
+    format!("`airlock {name}` {why}\n")
+}
+
+/// Leaves out `{subcommands}`/`{options}`: [`build_after_help`] renders both
+/// itself, grouped (clap has no notion of subcommand headings), so the
+/// listing can differ between a normal and a sandboxed invocation (U16).
+const HELP_TEMPLATE: &str = "{about-with-newline}\n{usage-heading} {usage}{after-help}";
+
+/// One line per name in `names`, padded to the widest, with the one-line
+/// description read back off `cmd` (each variant's doc comment, which clap
+/// already turned into its `about`) so this can never drift from the real
+/// subcommand list.
+fn render_command_list(cmd: &clap::Command, names: &[&str]) -> String {
+    let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for name in names {
+        let about = cmd
+            .find_subcommand(name)
+            .and_then(|c| c.get_about())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        out.push_str(&format!("  {name:<width$}  {about}\n"));
+    }
+    out
+}
+
+/// The body `--help` prints below the usage line: the command groups (or,
+/// inside the sandbox, the restricted list and which commands are hidden),
+/// a static `Options:` block (every top-level flag besides the subcommand
+/// is `-h`/`-V`, which clap adds itself, so this can't drift), and the
+/// footer pointing a new user at `init` then `run`.
+fn build_after_help(cmd: &clap::Command, sandboxed: bool) -> String {
+    let mut out = String::new();
+    if sandboxed {
+        let hidden: Vec<&str> = hidden_in_sandbox().collect();
+        out.push_str("Running inside an Airlock sandbox: only the commands below work here.\n");
+        out.push_str(&format!(
+            "Hidden (run these from your own terminal): {}.\n\n",
+            hidden.join(", ")
+        ));
+        out.push_str(&render_command_list(cmd, SANDBOX_VISIBLE));
+    } else {
+        for (title, names) in HELP_GROUPS {
+            out.push_str(title);
+            out.push_str(":\n");
+            out.push_str(&render_command_list(cmd, names));
+            out.push('\n');
+        }
+    }
+    out.push_str("Options:\n  -h, --help     Print help\n  -V, --version  Print version\n\n");
+    out.push_str("Start with `airlock init`, then `airlock run --profile claude`.\n");
+    out
+}
+
+/// Applies the help grouping (U5) and, with `AIRLOCK_SANDBOX=1`, the help
+/// restriction (U16) to a freshly built [`Cli::command`]: hides the
+/// commands that need the user's own terminal and gives each a
+/// `before_help` line saying so, gives `daemon --help` its lifecycle note,
+/// and replaces the flat subcommand listing with the grouped one.
+fn customize_help(mut cmd: clap::Command, sandboxed: bool) -> clap::Command {
+    if sandboxed {
+        for name in hidden_in_sandbox() {
+            let notice = hidden_command_notice(name);
+            cmd = cmd.mut_subcommand(name, |c| c.hide(true).before_help(notice));
+        }
+    }
+    cmd = cmd.mut_subcommand("daemon", |c| {
+        c.after_help(
+            "`run` and `session start` start the daemon when it is not running; a daemon \
+             started that way exits after 5 minutes with no sessions.\n",
+        )
+    });
+    let after_help = build_after_help(&cmd, sandboxed);
+    cmd.after_help(after_help)
+}
+
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
 fn current_dir_or_fail() -> Result<PathBuf, ExitCode> {
@@ -318,6 +440,20 @@ fn current_dir_or_fail() -> Result<PathBuf, ExitCode> {
         eprintln!("error: failed to determine current directory: {e}");
         ExitCode::from(125)
     })
+}
+
+fn home_dir_or_fail() -> Result<PathBuf, ExitCode> {
+    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
+        eprintln!("error: HOME is not set");
+        ExitCode::from(125)
+    })
+}
+
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
 fn tokio_runtime_or_fail() -> Result<tokio::runtime::Runtime, ExitCode> {
@@ -345,7 +481,13 @@ fn discover_opts(config: Option<PathBuf>, no_project_config: bool) -> DiscoverOp
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let sandboxed = in_sandbox();
+    let cmd = customize_help(Cli::command(), sandboxed);
+    let matches = cmd.get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
     if let Some(code) = sandbox_refusal(&cli.command) {
         return code;
@@ -384,8 +526,15 @@ fn main() -> ExitCode {
             yes,
             expect_sha256,
         } => cmd_trust(config, yes, expect_sha256),
-        Commands::Config { .. } => not_implemented(),
-        Commands::Status { .. } => not_implemented(),
+        Commands::Config {
+            config,
+            no_project_config,
+            paths,
+        } => cmd_config(config, no_project_config, paths),
+        Commands::Status {
+            config,
+            no_project_config,
+        } => cmd_status(config, no_project_config),
         Commands::Exec { args } => cmd_exec(args),
         Commands::Tools { action } => cmd_tools(action),
         Commands::Agent { action } => cmd_agent(action),
@@ -394,10 +543,8 @@ fn main() -> ExitCode {
     }
 }
 
-/// Phase-3 commands (`config`, `status`, `agent check`, `agent hook`, `init
-/// --local`/`--global`, `daemon install`/`uninstall`) get their clap
-/// definitions now; phase 3 fills in their behavior in `src/agent.rs`,
-/// `src/inspect.rs` and `src/service.rs`.
+/// `agent check`/`agent hook` get their clap definitions now; another agent
+/// fills in their behavior in `src/agent.rs`.
 fn not_implemented() -> ExitCode {
     eprintln!("airlock: not implemented yet");
     ExitCode::from(125)
@@ -441,37 +588,186 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
 
 // ─── Command: init ───────────────────────────────────────────────────────────
 
+/// `main.rs`'s own inputs for [`inspect::init_cmd`]: `cwd`/`HOME` from the
+/// process, `XDG_CONFIG_HOME` for `--global`'s directory, and the real
+/// `git check-ignore` for `--local`'s ignore-file note. `--global` inside
+/// the sandbox is already refused by `sandbox_refusal` before this runs.
 fn cmd_init(local: bool, global: bool) -> ExitCode {
-    if local || global {
-        return not_implemented();
-    }
-
     let cwd = match current_dir_or_fail() {
         Ok(d) => d,
         Err(code) => return code,
     };
-    let config_path = cwd.join(airlock::config::config_filename());
+    let home = match home_dir_or_fail() {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let kind = if global {
+        inspect::InitKind::Global
+    } else if local {
+        inspect::InitKind::Local
+    } else {
+        inspect::InitKind::Plain
+    };
+    let mut stdout = std::io::stdout();
+    inspect::init_cmd(
+        kind,
+        &cwd,
+        &home,
+        xdg_config_home.as_deref(),
+        &inspect::RealGitRunner,
+        &mut stdout,
+    )
+}
 
-    if config_path.exists() {
-        eprintln!(
-            "error: {} already exists in {}",
-            airlock::config::config_filename(),
-            cwd.display()
-        );
-        return ExitCode::from(125);
-    }
+// ─── Command: config ─────────────────────────────────────────────────────────
 
-    match std::fs::write(&config_path, airlock::config::default_config_template()) {
-        Ok(()) => {
-            println!("created {}", config_path.display());
-            println!("edit it to declare your tools, then run `airlock run --profile claude`");
-            ExitCode::SUCCESS
-        }
+/// `airlock config [--config] [--no-project-config] [--paths]`: gathers the
+/// real `cwd`, `HOME`, anchors (`anchors::resolve` over the real
+/// environment) and runtime dir, then hands them to [`inspect::config_cmd`],
+/// which does the actual file reading and rendering.
+fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> ExitCode {
+    let cwd = match current_dir_or_fail() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let home = match home_dir_or_fail() {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let runtime = match RuntimeDir::locate() {
+        Ok(r) => r,
         Err(e) => {
-            eprintln!("error: failed to write {}: {e}", config_path.display());
-            ExitCode::from(125)
+            eprintln!("error: {e}");
+            return ExitCode::from(125);
+        }
+    };
+    let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
+
+    let opts = inspect::ConfigOptions {
+        config,
+        no_project_config,
+        paths,
+    };
+    let paths_report = inspect::ConfigPaths {
+        global_config: anchors.global_config.clone(),
+        trust_store: anchors.trust_store.clone(),
+        runtime_dir: runtime.base().to_path_buf(),
+        socket: runtime.socket_path(),
+        tool_state_base: anchors.tool_state_base.clone(),
+    };
+
+    let mut stdout = std::io::stdout();
+    inspect::config_cmd(
+        &opts,
+        &cwd,
+        &home,
+        &anchors.global_config,
+        &anchors.tool_state_base,
+        &paths_report,
+        in_sandbox(),
+        &mut stdout,
+    )
+}
+
+// ─── Command: status ─────────────────────────────────────────────────────────
+
+/// Reads the daemon's admin family (`Hello`, then `ListSessions`) for
+/// [`inspect::status_cmd`]'s [`inspect::DaemonProbe`]. The daemon's `Hello`
+/// carries no start time, so an automatic daemon's age is read off the
+/// runtime dir's PID file mtime instead — written once, at startup, by the
+/// same process `Hello.pid` names.
+struct AdminProbe {
+    runtime: RuntimeDir,
+    conn: Option<admin::Connection>,
+    token: Option<airlock::protocol::AdminToken>,
+}
+
+impl AdminProbe {
+    fn new(runtime: RuntimeDir) -> Self {
+        Self {
+            runtime,
+            conn: None,
+            token: None,
         }
     }
+}
+
+fn pid_file_started_unix(pid_path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(pid_path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+impl inspect::DaemonProbe for AdminProbe {
+    fn hello(&mut self) -> Option<inspect::DaemonStatus> {
+        let conn = admin::Connection::connect(&self.runtime.socket_path()).ok()?;
+        let started_unix = (conn.hello.mode == DaemonMode::Automatic)
+            .then(|| pid_file_started_unix(&self.runtime.pid_path()))
+            .flatten();
+        let status = inspect::DaemonStatus {
+            pid: conn.hello.pid,
+            version: conn.hello.version.clone(),
+            mode: conn.hello.mode,
+            started_unix,
+            addr: self.runtime.addr(),
+        };
+        self.token = launcher::read_admin_token(&self.runtime).ok();
+        self.conn = Some(conn);
+        Some(status)
+    }
+
+    fn list_sessions(&mut self) -> Vec<SessionInfo> {
+        let (Some(conn), Some(token)) = (self.conn.as_mut(), self.token.as_ref()) else {
+            return Vec::new();
+        };
+        match conn.admin_request(token, AdminRequest::ListSessions) {
+            Ok(DaemonMessage::Sessions { sessions }) => sessions,
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// `airlock status [--config] [--no-project-config]`. Refused inside the
+/// sandbox before this runs (`sandbox_refusal`, with a hint to `agent
+/// check`).
+fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> ExitCode {
+    let cwd = match current_dir_or_fail() {
+        Ok(d) => d,
+        Err(code) => return code,
+    };
+    let home = match home_dir_or_fail() {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
+    let runtime = match RuntimeDir::locate() {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("error: {e}");
+            return ExitCode::from(125);
+        }
+    };
+    let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
+
+    let opts = inspect::StatusOptions {
+        config,
+        no_project_config,
+    };
+    let mut probe = AdminProbe::new(runtime);
+    let mut stdout = std::io::stdout();
+    inspect::status_cmd(
+        &opts,
+        &cwd,
+        &home,
+        &anchors.global_config,
+        &anchors.trust_store,
+        &mut probe,
+        now_unix(),
+        &mut stdout,
+    )
 }
 
 // ─── Command: trust ──────────────────────────────────────────────────────────
@@ -738,7 +1034,25 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
     ExitCode::SUCCESS
 }
 
+/// What ends a session, per "Options" in `docs/airlock-v2-ux.md`
+/// (`session list`'s "what ends it" column): `"held by airlock run, PID
+/// 4821"`, `"expires in 6h"`, or `"never expires"`.
+fn ends_text(ends: &EndsInfo, now: u64) -> String {
+    match ends {
+        EndsInfo::Lease { pid } => format!("held by airlock run, PID {pid}"),
+        EndsInfo::Ttl { expires_unix } => format!(
+            "expires in {}",
+            launcher::format_duration_short(expires_unix.saturating_sub(now))
+        ),
+        EndsInfo::Never => "never expires".to_string(),
+    }
+}
+
 fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
+    let home = match home_dir_or_fail() {
+        Ok(h) => h,
+        Err(code) => return code,
+    };
     let (mut conn, token, _runtime) = match connect_admin() {
         Ok(v) => v,
         Err(code) => return code,
@@ -756,37 +1070,27 @@ fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
     };
 
     let project_root = discover_root_quietly(cwd);
-    for s in &sessions {
-        if here && project_root.as_deref() != Some(s.root.as_path()) {
-            continue;
-        }
-        let ends = match &s.ends {
-            airlock::protocol::EndsInfo::Lease { pid } => format!("lease (pid {pid})"),
-            airlock::protocol::EndsInfo::Ttl { expires_unix } => {
-                let now = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .map(|d| d.as_secs())
-                    .unwrap_or(0);
-                format!(
-                    "ttl ({} left)",
-                    launcher::format_duration_short(expires_unix.saturating_sub(now))
-                )
-            }
-            airlock::protocol::EndsInfo::Never => "never".to_string(),
-        };
-        let changed = if layers_changed_on_disk(&s.layers) {
-            " (config changed)"
-        } else {
-            ""
-        };
-        println!(
-            "{}  {:<10}  {}  {} execs  {ends}{changed}",
-            s.id,
-            s.name,
-            s.root.display(),
-            s.execs
-        );
-    }
+    let now = now_unix();
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .filter(|s| !here || project_root.as_deref() == Some(s.root.as_path()))
+        .map(|s| {
+            vec![
+                s.id.to_string(),
+                s.name.clone(),
+                inspect::display_path(&s.root, &home),
+                inspect::format_hhmm_local(s.started_unix),
+                format!("{} execs", s.execs),
+                ends_text(&s.ends, now),
+                if layers_changed_on_disk(&s.layers) {
+                    "config changed".to_string()
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    print!("{}", inspect::table(&rows));
     ExitCode::SUCCESS
 }
 
@@ -972,8 +1276,20 @@ fn cmd_daemon(action: DaemonAction) -> ExitCode {
             }
         }
         DaemonAction::Logs { session } => cmd_daemon_logs(session),
-        DaemonAction::Install | DaemonAction::Uninstall => not_implemented(),
+        DaemonAction::Install => cmd_daemon_install(),
+        DaemonAction::Uninstall => airlock::service::uninstall_cmd(),
     }
+}
+
+/// Probes the socket (`docs/airlock-v2-design.md`'s "Commands refused..."
+/// wording aside, this is the one place `daemon install` needs to know
+/// whether a daemon is already up, per `install_cmd`'s doc comment) and
+/// hands the result to [`airlock::service::install_cmd`].
+fn cmd_daemon_install() -> ExitCode {
+    let daemon_running = RuntimeDir::locate()
+        .map(|runtime| admin::Connection::connect(&runtime.socket_path()).is_ok())
+        .unwrap_or(false);
+    airlock::service::install_cmd(daemon_running)
 }
 
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
