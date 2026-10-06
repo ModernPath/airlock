@@ -1,4 +1,7 @@
-# Runtime directory and layered config — design proposal
+# Airlock v2 — design proposal
+
+One daemon per user with sessions, a runtime directory outside the
+project, layered config, and approval of project config.
 
 **Status:** proposal. The blocking items in [Open questions and
 follow-ups](#open-questions-and-follow-ups) are resolved. Nothing here is
