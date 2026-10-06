@@ -1,10 +1,7 @@
-//! `airlock daemon` integration tests.
-//!
-//! `daemon start` calls into `daemon::start`, which in this worktree is
-//! P2-G's temporary `unimplemented!()` shim (the real v2 daemon lands at
-//! the phase-2 merge) — so every test that needs a daemon to actually come
-//! up is `#[ignore = "needs the v2 daemon (phase 2 merge)"]`. What's left
-//! is the CLI behavior that holds with no daemon running at all.
+//! `airlock daemon` integration tests: `start`/`stop`/`logs`/`uninstall`
+//! against the real v2 daemon and a throwaway runtime dir. `install` is
+//! deliberately not exercised here; see the note on
+//! `uninstall_when_nothing_installed_is_a_success_no_op`.
 
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
@@ -59,14 +56,21 @@ fn logs_when_not_running_is_an_error() {
     assert_eq!(output.status.code(), Some(125));
 }
 
+// `daemon install` is deliberately not exercised here: on a fresh `HOME`
+// it always calls through to the real `launchctl bootstrap`/`systemctl
+// enable` (`service::install`'s `RealCommandRunner`, which this binary
+// always uses — there is no test seam at the CLI layer), which would
+// register a `RunAtLoad`+`KeepAlive` service against the *developer's*
+// real session pointing at this test run's throwaway `target/debug`
+// binary. `service::macos::tests`/`service::linux::tests` already cover
+// `install`'s logic in full with a `RecordingRunner`; this suite only
+// checks the one path that can never touch the real service manager.
 #[test]
-fn install_and_uninstall_are_phase_three_stubs() {
+fn uninstall_when_nothing_installed_is_a_success_no_op() {
     let fx = Fixture::new();
-    for sub in ["install", "uninstall"] {
-        let output = fx.cmd().args(["daemon", sub]).output().unwrap();
-        assert_eq!(output.status.code(), Some(125), "daemon {sub}: {output:?}");
-        assert!(String::from_utf8_lossy(&output.stderr).contains("not implemented yet"));
-    }
+    let output = fx.cmd().args(["daemon", "uninstall"]).output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(String::from_utf8_lossy(&output.stdout).contains("not installed"));
 }
 
 #[test]
