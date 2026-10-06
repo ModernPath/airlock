@@ -151,8 +151,8 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
     );
     let error = result.error.unwrap();
     assert!(
-        error.contains("CWD") || error.contains("cwd") || error.contains("sandbox"),
-        "error should mention CWD validation failure, got: {error}"
+        error.contains("is outside this session's project"),
+        "error should say the working directory is outside the project, got: {error}"
     );
 
     daemon.shutdown();

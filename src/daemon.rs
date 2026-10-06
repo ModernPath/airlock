@@ -1714,7 +1714,7 @@ fn start_tool(
         return Err(ExecStartError {
             kind: ErrorKind::OutsideRoot,
             message: format!(
-                "working directory {} is outside the session's root {}",
+                "{} is outside this session's project {}",
                 cwd.display(),
                 session.root.display()
             ),
