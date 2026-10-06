@@ -6,11 +6,11 @@
 
 mod e2e_helpers;
 
-use airlock::protocol::{ClientMessage, DaemonMessage};
+use airlock::protocol::v1::{ClientMessage, DaemonMessage};
 use e2e_helpers::*;
 
 /// Helper: send a logs request and return the entries.
-fn fetch_logs(socket_path: &std::path::Path) -> Vec<airlock::protocol::LogEntry> {
+fn fetch_logs(socket_path: &std::path::Path) -> Vec<airlock::protocol::v1::LogEntry> {
     let mut stream = connect_to_daemon(socket_path, 10);
     send_message(&mut stream, &ClientMessage::Logs);
 

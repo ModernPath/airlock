@@ -20,7 +20,7 @@ anyhow = "1"
 thiserror = "2"
 base64 = "0.22"
 percent-encoding = "2"
-zeroize = "1"
+zeroize = { version = "1", features = ["serde"] }
 leon = "3"
 # Proxy-tool runtime. One rustls crypto provider (ring) is selected explicitly
 # here and installed by name at CA construction, so nothing depends on

@@ -6,7 +6,7 @@
 
 mod e2e_helpers;
 
-use airlock::protocol::{ClientMessage, DaemonMessage};
+use airlock::protocol::v1::{ClientMessage, DaemonMessage};
 use e2e_helpers::*;
 
 // ─── Piped stdin data flows through the daemon to the tool ──────────────────
