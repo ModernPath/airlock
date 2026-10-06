@@ -176,16 +176,10 @@ enum AgentAction {
     /// protocol.
     Hook {
         #[arg(value_enum)]
-        harness: HookHarness,
+        harness: airlock::agent::Harness,
         #[arg(long)]
         print_settings: bool,
     },
-}
-
-#[derive(ValueEnum, Clone, Copy)]
-enum HookHarness {
-    ClaudeCode,
-    Text,
 }
 
 #[derive(Subcommand)]
@@ -543,13 +537,6 @@ fn main() -> ExitCode {
     }
 }
 
-/// `agent check`/`agent hook` get their clap definitions now; another agent
-/// fills in their behavior in `src/agent.rs`.
-fn not_implemented() -> ExitCode {
-    eprintln!("airlock: not implemented yet");
-    ExitCode::from(125)
-}
-
 // ─── Command: run ───────────────────────────────────────────────────────────
 
 fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
@@ -841,8 +828,13 @@ fn cmd_tools(action: Option<ToolsAction>) -> ExitCode {
 // ─── Command: agent ──────────────────────────────────────────────────────────
 
 fn cmd_agent(action: AgentAction) -> ExitCode {
-    let _ = action;
-    not_implemented()
+    match action {
+        AgentAction::Check { quiet } => airlock::agent::check_cmd(quiet),
+        AgentAction::Hook {
+            harness,
+            print_settings,
+        } => airlock::agent::hook_cmd(harness, print_settings),
+    }
 }
 
 // ─── Command: session ────────────────────────────────────────────────────────
