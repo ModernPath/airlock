@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use airlock::daemon;
-use airlock::protocol::{ClientMessage, DaemonMessage};
+use airlock::protocol::v1::{ClientMessage, DaemonMessage};
 
 // ─── Test helpers ─────────────────────────────────────────────────────────────
 

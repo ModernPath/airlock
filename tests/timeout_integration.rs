@@ -8,7 +8,7 @@ mod e2e_helpers;
 
 use std::time::Duration;
 
-use airlock::protocol::{ClientMessage, DaemonMessage};
+use airlock::protocol::v1::{ClientMessage, DaemonMessage};
 use e2e_helpers::*;
 
 // ─── Timed-out tool is killed and client receives timeout error ─────────────

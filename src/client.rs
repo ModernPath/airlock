@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use thiserror::Error;
 
 use crate::config::{self, ConfigError};
-use crate::protocol::{ClientMessage, DaemonMessage};
+use crate::protocol::v1::{ClientMessage, DaemonMessage};
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -923,11 +923,11 @@ mod tests {
 
             let response = DaemonMessage::LogsResponse {
                 entries: vec![
-                    crate::protocol::LogEntry {
+                    crate::protocol::v1::LogEntry {
                         timestamp: "2025-01-15T10:30:00Z".to_string(),
                         message: "daemon started".to_string(),
                     },
-                    crate::protocol::LogEntry {
+                    crate::protocol::v1::LogEntry {
                         timestamp: "2025-01-15T10:30:05Z".to_string(),
                         message: "connection accepted".to_string(),
                     },

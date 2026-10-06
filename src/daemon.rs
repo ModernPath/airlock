@@ -34,7 +34,7 @@ use tokio::task::JoinSet;
 use crate::config::{self, Config, ConfigError};
 use crate::exec;
 use crate::policy;
-use crate::protocol::{ClientMessage, DaemonMessage, LogEntry};
+use crate::protocol::v1::{ClientMessage, DaemonMessage, LogEntry};
 use crate::proxy::ca::{CaError, ProxyCa};
 use crate::proxy::server::{ProxySession, ProxyShared};
 use crate::redact::{self, RedactError, Redactor, RedactorSwap};
