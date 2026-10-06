@@ -14,6 +14,7 @@ pub mod run;
 pub mod runtime_dir;
 pub mod sandbox;
 pub mod secrets;
+pub mod service;
 pub mod trust;
 
 #[cfg(test)]
