@@ -511,7 +511,7 @@ pub enum ConfigError {
 /// or a `--config` file). Which fields a given layer may use is validated
 /// after parsing, in [`crate::layers`] — the raw shape here is deliberately
 /// permissive enough to parse any layer unambiguously.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawConfig {
     /// Global timeout in seconds. Defaults to 300 (5 minutes).
@@ -547,7 +547,7 @@ pub struct RawConfig {
 }
 
 /// Raw deserialized `[filesystem]` section.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawFilesystem {
     /// Global read-only paths.
@@ -559,7 +559,7 @@ pub struct RawFilesystem {
 }
 
 /// Raw deserialized `[agent.filesystem]` subsection.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawAgentFilesystem {
     /// Additional read-only paths for the agent.
@@ -575,7 +575,7 @@ pub struct RawAgentFilesystem {
 /// Uses `#[serde(deny_unknown_fields)]` to surface typos and
 /// `#[serde(default)]` on all fields so a bare `[agent]` header with no
 /// fields is valid.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawAgentConfig {
     /// Agent session timeout in seconds. `None` (absent) means no limit.
@@ -601,7 +601,7 @@ pub struct RawAgentConfig {
 /// `from = "global"` instead of a `source` of its own. [`crate::layers`]
 /// validates the combination per layer; this type only has to parse every
 /// legal shape unambiguously. `deny_unknown_fields` still catches typos.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSecretSpec {
     /// What the project needs this secret for. Shown in the "unbound repo
@@ -649,7 +649,7 @@ pub struct RawSecretSpec {
 ///
 /// A bare string is a static value; an inline table `{ secret = "label" }`
 /// references an entry in `[secrets]`.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
 pub enum RawEnvValue {
     /// Inline table: `NAME = { secret = "label" }`. Declared first so serde
@@ -660,7 +660,7 @@ pub enum RawEnvValue {
 }
 
 /// Inline-table form of an env var value that references a secret by label.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawSecretRef {
     /// Label of the entry in `[secrets.<label>]` whose resolved value is
@@ -669,7 +669,7 @@ pub struct RawSecretRef {
 }
 
 /// Raw deserialized `[tools.X]` entry.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawToolConfig {
     /// Environment variables set when spawning this tool. Optional; a tool
@@ -704,7 +704,7 @@ pub struct RawToolConfig {
 }
 
 /// Raw deserialized `[[tools.X.routes]]` entry.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawProxyRoute {
     /// DNS name or `*.`-prefixed DNS name.
@@ -721,7 +721,7 @@ pub struct RawProxyRoute {
 }
 
 /// Raw deserialized `inject = { header, value, secret }` inline table.
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct RawInject {
     pub header: String,

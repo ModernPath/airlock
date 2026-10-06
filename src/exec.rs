@@ -158,49 +158,6 @@ pub struct FilteredPath {
     pub dropped: Vec<(String, String)>,
 }
 
-/// Canonicalize the longest existing prefix of `path`, then re-append the
-/// (non-existent) remainder.
-///
-/// This lets us compare a path that may not exist yet — a write grant for a
-/// directory the tool hasn't created, say — against one that does, without
-/// requiring either side to exist, while still resolving symlinks wherever
-/// the filesystem lets us.
-///
-/// A sibling of this logic belongs on `anchors::overlaps`/`is_inside`
-/// (coordinator note: the two may be worth deduplicating into one shared
-/// helper once both modules land).
-fn canonicalize_longest_existing_prefix(path: &Path) -> PathBuf {
-    let mut current = path.to_path_buf();
-    let mut tail: Vec<std::ffi::OsString> = Vec::new();
-
-    loop {
-        if let Ok(canon) = current.canonicalize() {
-            let mut result = canon;
-            for component in tail.into_iter().rev() {
-                result.push(component);
-            }
-            return result;
-        }
-
-        match current.file_name() {
-            Some(name) => tail.push(name.to_os_string()),
-            None => return path.to_path_buf(),
-        }
-        let Some(parent) = current.parent() else {
-            return path.to_path_buf();
-        };
-        current = parent.to_path_buf();
-    }
-}
-
-/// True when `path`, after resolving symlinks in its longest existing
-/// prefix, is equal to or inside `dir` (after the same treatment).
-fn path_is_inside_or_equal(path: &Path, dir: &Path) -> bool {
-    let path = canonicalize_longest_existing_prefix(path);
-    let dir = canonicalize_longest_existing_prefix(dir);
-    path == dir || path.starts_with(&dir)
-}
-
 /// Where a resolved binary landed, relative to the anchors that must never
 /// contain one.
 pub(crate) enum Location {
@@ -215,11 +172,11 @@ pub(crate) enum Location {
 /// Classify `path` against the root and write grants, root taking priority
 /// so the more specific "inside the project" message wins when both apply.
 pub(crate) fn classify_location(path: &Path, root: &Path, write_grants: &[PathBuf]) -> Location {
-    if path_is_inside_or_equal(path, root) {
+    if crate::anchors::is_inside(path, root) {
         Location::InsideRoot
     } else if write_grants
         .iter()
-        .any(|grant| path_is_inside_or_equal(path, grant))
+        .any(|grant| crate::anchors::is_inside(path, grant))
     {
         Location::InsideWriteGrant
     } else {
@@ -251,13 +208,13 @@ pub fn filter_path(path_var: &str, root: &Path, write_grants: &[PathBuf]) -> Fil
             dropped.push((raw.to_string(), "relative".to_string()));
             continue;
         }
-        if path_is_inside_or_equal(candidate, root) {
+        if crate::anchors::is_inside(candidate, root) {
             dropped.push((raw.to_string(), "inside the project".to_string()));
             continue;
         }
         if write_grants
             .iter()
-            .any(|grant| path_is_inside_or_equal(candidate, grant))
+            .any(|grant| crate::anchors::is_inside(candidate, grant))
         {
             dropped.push((raw.to_string(), "writable from a sandbox".to_string()));
             continue;
