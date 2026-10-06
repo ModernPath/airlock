@@ -24,9 +24,10 @@
 //!    sandboxed. `airlock.toml` is already trusted, so the command line is
 //!    too — but the operator should treat it with the same care.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fmt;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, RwLock};
 use std::thread;
@@ -35,7 +36,8 @@ use std::time::{Duration, Instant};
 use thiserror::Error;
 use zeroize::Zeroize;
 
-use crate::config::{Config, SecretSource};
+use crate::config::{CommandEnv, Config, SecretSource};
+use crate::exec::FilteredPath;
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -75,6 +77,25 @@ pub enum SecretsError {
     CommandFailures {
         /// Pairs of (secret label, failure reason).
         failures: Vec<(String, String)>,
+    },
+
+    /// Under [`collect_secrets_with`]: a `source = "command"` secret's
+    /// `argv[0]` is not on the session's filtered `PATH`, or resolves inside
+    /// the project root or a write grant (B2 in the design doc — approving
+    /// `airlock.toml` does not approve a binary the agent can rewrite).
+    /// Returned eagerly, like [`SecretsError::InvalidUtf8`], rather than
+    /// batched: it is a config problem, not a one-off command failure.
+    #[error("{0}")]
+    CommandUnusable(String),
+
+    /// Under [`collect_secrets_with`]: one or more `source = "command"`
+    /// secrets ran but failed (non-zero exit, spawn error, or timeout).
+    /// Each message is pre-formatted per the UX table: the command
+    /// backticked, its stderr indented beneath it.
+    #[error("{}", messages.join("\n\n"))]
+    CommandRunFailures {
+        /// One formatted message per failed secret.
+        messages: Vec<String>,
     },
 }
 
@@ -264,22 +285,109 @@ pub fn collect_secrets(config: &Config) -> Result<HashMap<String, Secret<String>
     Ok(secrets)
 }
 
-/// Spawn `argv` and capture its stdout as a secret value, with a wall-clock
+/// The outcome of spawning a secret command and waiting for it, before any
+/// label- or UX-specific formatting is applied. Shared by the legacy
+/// (process-env) and [`CommandContext`]-based run paths.
+pub(crate) enum CommandRunError {
+    /// `Command::spawn` itself failed.
+    Spawn(String),
+    /// The child exited (successfully or not); stdout could not be read.
+    ReadStdout(String),
+    /// The child exited non-zero. `stderr` is already trimmed and may be
+    /// empty.
+    Exited { status: String, stderr: String },
+    /// The child did not exit within its timeout and was killed.
+    Timeout(u64),
+    /// `try_wait` itself failed.
+    Wait(String),
+}
+
+impl CommandRunError {
+    /// Render as the single-line reason string the legacy (process-env)
+    /// callers have always returned.
+    pub(crate) fn to_flat(&self) -> String {
+        match self {
+            CommandRunError::Spawn(e) => format!("spawn failed: {e}"),
+            CommandRunError::ReadStdout(e) => format!("failed to read stdout: {e}"),
+            CommandRunError::Exited { status, stderr } => {
+                if stderr.is_empty() {
+                    format!("exited with {status}")
+                } else {
+                    format!("exited with {status}: {stderr}")
+                }
+            }
+            CommandRunError::Timeout(secs) => format!("timed out after {secs}s"),
+            CommandRunError::Wait(e) => format!("wait failed: {e}"),
+        }
+    }
+}
+
+/// Spawn an already-configured `cmd` and wait for it, with a wall-clock
 /// timeout.
 ///
-/// The command inherits the daemon's environment (so tools like `op` and
-/// `vault` can read `OP_SERVICE_ACCOUNT_TOKEN` / `VAULT_ADDR`). Stdin is
-/// connected to `/dev/null`. Stdout is the value; stderr is captured only to
+/// Stdin must already be `/dev/null`, and stdout/stderr piped — this
+/// function only drives the wait loop and reads the pipes; it does not
+/// configure the command. Stdout is the value; stderr is captured only to
 /// enrich failure messages. Trailing `\n`/`\r` are trimmed from stdout for
 /// convenience (most CLIs emit a newline).
 ///
 /// Timeout is enforced by polling `try_wait` with a 50 ms tick. If stdout is
 /// very large (>64 KiB) it may block the child before it exits; for secret
 /// fetching this is an acceptable constraint.
+fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<String, CommandRunError> {
+    let mut child = cmd
+        .spawn()
+        .map_err(|e| CommandRunError::Spawn(e.to_string()))?;
+
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut stdout = String::new();
+                if let Some(mut pipe) = child.stdout.take() {
+                    pipe.read_to_string(&mut stdout)
+                        .map_err(|e| CommandRunError::ReadStdout(e.to_string()))?;
+                }
+                if !status.success() {
+                    let mut stderr = String::new();
+                    if let Some(mut pipe) = child.stderr.take() {
+                        let _ = pipe.read_to_string(&mut stderr);
+                    }
+                    return Err(CommandRunError::Exited {
+                        status: status.to_string(),
+                        stderr: stderr.trim().to_string(),
+                    });
+                }
+                while stdout.ends_with('\n') || stdout.ends_with('\r') {
+                    stdout.pop();
+                }
+                return Ok(stdout);
+            }
+            Ok(None) => {
+                if Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return Err(CommandRunError::Timeout(timeout.as_secs()));
+                }
+                thread::sleep(Duration::from_millis(50));
+            }
+            Err(e) => return Err(CommandRunError::Wait(e.to_string())),
+        }
+    }
+}
+
+/// Spawn `argv` and capture its stdout as a secret value, inheriting the
+/// daemon's own environment (so tools like `op` and `vault` can read
+/// `OP_SERVICE_ACCOUNT_TOKEN` / `VAULT_ADDR`).
+///
+/// This is the v1 daemon's path: `argv[0]` is resolved by `exec(3)` against
+/// the daemon's own `PATH`, with no location check. [`CommandContext`] and
+/// [`collect_secrets_with`] replace it for v2 sessions, which run with an
+/// explicit snapshot and filtered `PATH` instead.
 pub(crate) fn run_command_secret(
     argv: &[String],
     timeout: Duration,
-    env: &crate::config::CommandEnv,
+    env: &CommandEnv,
 ) -> Result<String, String> {
     let mut cmd = Command::new(&argv[0]);
     cmd.args(&argv[1..])
@@ -294,45 +402,260 @@ pub(crate) fn run_command_secret(
         cmd.env(name, value);
     }
 
-    let mut child = cmd.spawn().map_err(|e| format!("spawn failed: {e}"))?;
+    run_with_timeout(cmd, timeout).map_err(|e| e.to_flat())
+}
 
-    let deadline = Instant::now() + timeout;
-    loop {
-        match child.try_wait() {
-            Ok(Some(status)) => {
-                let mut stdout = String::new();
-                if let Some(mut pipe) = child.stdout.take() {
-                    pipe.read_to_string(&mut stdout)
-                        .map_err(|e| format!("failed to read stdout: {e}"))?;
-                }
-                if !status.success() {
-                    let mut stderr = String::new();
-                    if let Some(mut pipe) = child.stderr.take() {
-                        let _ = pipe.read_to_string(&mut stderr);
-                    }
-                    let trimmed = stderr.trim();
-                    return Err(if trimmed.is_empty() {
-                        format!("exited with {status}")
-                    } else {
-                        format!("exited with {status}: {trimmed}")
-                    });
-                }
-                while stdout.ends_with('\n') || stdout.ends_with('\r') {
-                    stdout.pop();
-                }
-                return Ok(stdout);
-            }
-            Ok(None) => {
-                if Instant::now() >= deadline {
-                    let _ = child.kill();
-                    let _ = child.wait();
-                    return Err(format!("timed out after {}s", timeout.as_secs()));
-                }
-                thread::sleep(Duration::from_millis(50));
-            }
-            Err(e) => return Err(format!("wait failed: {e}")),
+// ─── Session-scoped secret collection ────────────────────────────────────────
+
+/// Everything a session's secret commands need, in place of the daemon's
+/// own environment and `PATH`: the launcher's environment snapshot (taken
+/// once, at `Register` time), the session's filtered `PATH`, and the
+/// anchors a resolved `argv[0]` must land outside of.
+///
+/// Held by the session so `refresh.rs` can re-run `source = "command"`
+/// secrets later without ever touching the daemon's process environment.
+pub struct CommandContext {
+    /// The launcher's own environment at registration time, minus the
+    /// variables consumed by `source = "env"` secrets.
+    pub snapshot: BTreeMap<String, String>,
+    /// The session's filtered `PATH`. Always wins over `snapshot`'s own
+    /// `PATH`, and over an unresolved `argv[0]`'s search — see
+    /// [`run_command_with_ctx`].
+    pub path: FilteredPath,
+    /// Working directory for secret commands (the session's root, or a
+    /// subdirectory of it if the launcher started there).
+    pub cwd: PathBuf,
+    /// The project root. An `argv[0]` resolving here is refused.
+    pub root: PathBuf,
+    /// Write grants. An `argv[0]` resolving into one of these is refused,
+    /// same as the root.
+    pub write_grants: Vec<PathBuf>,
+}
+
+/// The result of [`collect_secrets_with`]: resolved values, plus which
+/// `source = "env"` variable names were actually read, so the launcher can
+/// drop them from the snapshot it hands the daemon (B2: the daemon's
+/// session state should not carry a secret value twice).
+#[derive(Debug)]
+pub struct Collected {
+    /// Resolved values, keyed by label.
+    pub values: HashMap<String, Secret<String>>,
+    /// Names of the daemon/launcher env vars consumed by `source = "env"`
+    /// secrets.
+    pub consumed_env: Vec<String>,
+}
+
+/// The outcome of resolving and running a `source = "command"` secret under
+/// a [`CommandContext`], before label-specific formatting.
+pub(crate) enum CommandCtxError {
+    /// `argv[0]` (a bare name) was not found on `ctx.path`'s surviving
+    /// entries.
+    NotOnPath {
+        argv0: String,
+        dropped: Vec<(String, String)>,
+    },
+    /// `argv[0]` resolved inside the project root.
+    InsideRoot { argv0: String, path: PathBuf },
+    /// `argv[0]` resolved inside a write grant (but not the root).
+    InsideWriteGrant { argv0: String, path: PathBuf },
+    /// `argv[0]` resolved and passed its location check, but running it
+    /// failed.
+    Run(CommandRunError),
+}
+
+impl CommandCtxError {
+    /// Render the full, label-prefixed message. Structural failures
+    /// (`NotOnPath`, `Inside*`) are formatted per the UX table's secret
+    /// command messages; a run failure defers to [`CommandRunError::to_flat`].
+    pub(crate) fn to_flat(&self, label: &str) -> String {
+        match self {
+            CommandCtxError::NotOnPath { argv0, dropped } => format!(
+                "secret {label}: command {argv0:?} is not on the session's PATH{}",
+                crate::exec::format_dropped_suffix(dropped)
+            ),
+            CommandCtxError::InsideRoot { argv0, path } => format!(
+                "secret {label}: command {argv0:?} resolves to {}, inside the project; \
+                 refusing to run it. Install it outside the project (Homebrew, mise, Nix).",
+                path.display()
+            ),
+            CommandCtxError::InsideWriteGrant { argv0, path } => format!(
+                "secret {label}: command {argv0:?} resolves to {}, inside a write grant; \
+                 refusing to run it. Install it outside the project (Homebrew, mise, Nix).",
+                path.display()
+            ),
+            CommandCtxError::Run(e) => e.to_flat(),
         }
     }
+}
+
+/// Resolve `argv[0]` against the session's filtered `PATH`, applying the
+/// same location check as tool binaries ([`crate::exec::resolve_binary_in`]):
+/// an `argv0` containing `/` is canonicalized and checked directly (relative
+/// to `ctx.cwd`, matching shell semantics), exactly like a bare name found
+/// on `PATH` — so `command = ["./scripts/token.sh"]` is refused the same
+/// way a planted `gh` would be.
+fn resolve_command_argv0(argv0: &str, ctx: &CommandContext) -> Result<PathBuf, CommandCtxError> {
+    let canon = if argv0.contains('/') {
+        let candidate = Path::new(argv0);
+        let candidate = if candidate.is_relative() {
+            ctx.cwd.join(candidate)
+        } else {
+            candidate.to_path_buf()
+        };
+        std::fs::canonicalize(&candidate).unwrap_or(candidate)
+    } else {
+        match crate::exec::search_path_entries(argv0, &ctx.path.entries) {
+            Some(p) => p,
+            None => {
+                return Err(CommandCtxError::NotOnPath {
+                    argv0: argv0.to_string(),
+                    dropped: ctx.path.dropped.clone(),
+                });
+            }
+        }
+    };
+
+    match crate::exec::classify_location(&canon, &ctx.root, &ctx.write_grants) {
+        crate::exec::Location::Outside => Ok(canon),
+        crate::exec::Location::InsideRoot => Err(CommandCtxError::InsideRoot {
+            argv0: argv0.to_string(),
+            path: canon,
+        }),
+        crate::exec::Location::InsideWriteGrant => Err(CommandCtxError::InsideWriteGrant {
+            argv0: argv0.to_string(),
+            path: canon,
+        }),
+    }
+}
+
+/// Run a `source = "command"` secret under a [`CommandContext`]: `argv[0]`
+/// resolved and location-checked against the session's filtered `PATH`,
+/// spawned with `cwd = ctx.cwd` and an environment built as
+/// `(env.clear ? {} : ctx.snapshot) + PATH=<filtered> + env.set` — in that
+/// order, so the filtered `PATH` always overrides the snapshot's own, and
+/// an explicit `env.set["PATH"]` (the user's approved choice in
+/// `airlock.toml`) overrides the filtered one in turn.
+pub(crate) fn run_command_with_ctx(
+    argv: &[String],
+    timeout: Duration,
+    env: &CommandEnv,
+    ctx: &CommandContext,
+) -> Result<String, CommandCtxError> {
+    let argv0 = argv.first().map(String::as_str).unwrap_or("");
+    let binary = resolve_command_argv0(argv0, ctx)?;
+
+    let mut cmd = Command::new(&binary);
+    cmd.args(&argv[1..])
+        .current_dir(&ctx.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    cmd.env_clear();
+    if !env.clear {
+        for (name, value) in &ctx.snapshot {
+            cmd.env(name, value);
+        }
+    }
+    let filtered_path = ctx
+        .path
+        .entries
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":");
+    cmd.env("PATH", filtered_path);
+    for (name, value) in &env.set {
+        cmd.env(name, value);
+    }
+
+    run_with_timeout(cmd, timeout).map_err(CommandCtxError::Run)
+}
+
+/// Resolve every `[secrets.<label>]` entry into a live value, the
+/// [`CommandContext`]-based counterpart to [`collect_secrets`].
+///
+/// `source = "env"` reads `env_lookup` — the launcher's own environment —
+/// instead of the daemon's. `source = "command"` runs under `ctx`: its
+/// `argv[0]` resolved and location-checked against the session's filtered
+/// `PATH`, spawned with `ctx`'s snapshot and `PATH`, never the daemon's own
+/// environment (see [`run_command_with_ctx`]).
+///
+/// # Errors
+///
+/// - [`SecretsError::MissingSecrets`] — one or more `env` sources are absent
+///   from `env_lookup`, batched together.
+/// - [`SecretsError::CommandUnusable`] — a `command` secret's `argv[0]` is
+///   not on the filtered `PATH`, or resolves inside the root or a write
+///   grant. Returned eagerly (it is a config problem, not a one-off
+///   failure), so a later label's missing `env` var may go unreported in
+///   the same call.
+/// - [`SecretsError::CommandRunFailures`] — one or more `command` secrets
+///   resolved but failed to run, batched.
+pub fn collect_secrets_with(
+    config: &Config,
+    env_lookup: &dyn Fn(&str) -> Option<String>,
+    ctx: &CommandContext,
+) -> Result<Collected, SecretsError> {
+    let mut labels: Vec<&String> = config.secrets.keys().collect();
+    labels.sort();
+
+    let mut values: HashMap<String, Secret<String>> = HashMap::with_capacity(labels.len());
+    let mut consumed_env: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    let mut run_failures: Vec<String> = Vec::new();
+
+    for label in labels {
+        let spec = &config.secrets[label];
+        match &spec.source {
+            SecretSource::Env { from } => match env_lookup(from) {
+                Some(value) => {
+                    values.insert(label.clone(), Secret::new(value));
+                    consumed_env.push(from.clone());
+                }
+                None => missing.push(from.clone()),
+            },
+            SecretSource::Command {
+                argv, timeout, env, ..
+            } => match run_command_with_ctx(argv, *timeout, env, ctx) {
+                Ok(value) => {
+                    values.insert(label.clone(), Secret::new(value));
+                }
+                Err(CommandCtxError::Run(run_err)) => {
+                    let cmd_display = argv.join(" ");
+                    let mut msg = match &run_err {
+                        CommandRunError::Exited { status, .. } => {
+                            format!("secret {label}: `{cmd_display}` exited with {status}:")
+                        }
+                        other => format!("secret {label}: `{cmd_display}` {}", other.to_flat()),
+                    };
+                    if let CommandRunError::Exited { stderr, .. } = &run_err {
+                        for line in stderr.lines() {
+                            msg.push('\n');
+                            msg.push_str("  ");
+                            msg.push_str(line);
+                        }
+                    }
+                    run_failures.push(msg);
+                }
+                Err(other) => return Err(SecretsError::CommandUnusable(other.to_flat(label))),
+            },
+        }
+    }
+
+    if !missing.is_empty() {
+        return Err(SecretsError::MissingSecrets { missing });
+    }
+    if !run_failures.is_empty() {
+        return Err(SecretsError::CommandRunFailures {
+            messages: run_failures,
+        });
+    }
+
+    Ok(Collected {
+        values,
+        consumed_env,
+    })
 }
 
 // ─── Environment clearing ────────────────────────────────────────────────────
@@ -381,6 +704,8 @@ mod tests {
     use std::path::PathBuf;
     use std::sync::MutexGuard;
     use std::time::Duration;
+
+    use tempfile::tempdir;
 
     use crate::config::{Config, SecretSpec};
 
@@ -821,6 +1146,234 @@ mod tests {
         };
         let out = run_command_secret(&argv, Duration::from_secs(5), &env).unwrap();
         assert_eq!(out, "EXPLICIT=seen/MISSING");
+    }
+
+    // ── collect_secrets_with / CommandContext ─────────────────────────────
+
+    /// Build a `CommandContext` whose filtered `PATH` is `/bin:/usr/bin` —
+    /// real system directories outside any test tempdir, so `sh` and other
+    /// POSIX utilities actually resolve through it — plus the given
+    /// snapshot, cwd, root and write grants.
+    fn test_ctx(
+        snapshot: std::collections::BTreeMap<String, String>,
+        cwd: PathBuf,
+        root: PathBuf,
+        write_grants: Vec<PathBuf>,
+    ) -> CommandContext {
+        let path = crate::exec::filter_path("/bin:/usr/bin", &root, &write_grants);
+        CommandContext {
+            snapshot,
+            path,
+            cwd,
+            root,
+            write_grants,
+        }
+    }
+
+    fn no_env(_: &str) -> Option<String> {
+        None
+    }
+
+    /// `source = "command"` under `collect_secrets_with` runs with `ctx`'s
+    /// snapshot, not the process environment — proven with a snapshot value
+    /// absent from the real process env — and `argv[0]` ("sh", a bare name)
+    /// resolves through `ctx`'s filtered `PATH`.
+    #[test]
+    fn collect_secrets_with_command_uses_snapshot_and_filtered_path() {
+        let root = tempdir().unwrap();
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(
+            "AIRLOCK_TEST_CTX_ONLY".to_string(),
+            "from-the-snapshot".to_string(),
+        );
+        let ctx = test_ctx(
+            snapshot,
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+
+        let config = make_config_command(vec![(
+            "pw",
+            vec!["sh", "-c", "printf %s \"$AIRLOCK_TEST_CTX_ONLY\""],
+            5,
+        )]);
+
+        let collected = collect_secrets_with(&config, &no_env, &ctx).expect("should succeed");
+        assert_eq!(collected.values["pw"].expose_secret(), "from-the-snapshot");
+    }
+
+    /// `source = "env"` under `collect_secrets_with` reads `env_lookup`, and
+    /// every variable it actually reads is reported in `consumed_env`.
+    #[test]
+    fn collect_secrets_with_reports_consumed_env() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let config = make_config_env(vec![
+            ("alpha", "TEST_CTX_ENV_A"),
+            ("beta", "TEST_CTX_ENV_B"),
+        ]);
+
+        let lookup = |name: &str| match name {
+            "TEST_CTX_ENV_A" => Some("value-a".to_string()),
+            "TEST_CTX_ENV_B" => Some("value-b".to_string()),
+            _ => None,
+        };
+
+        let collected = collect_secrets_with(&config, &lookup, &ctx).expect("should succeed");
+        assert_eq!(collected.values["alpha"].expose_secret(), "value-a");
+        assert_eq!(collected.values["beta"].expose_secret(), "value-b");
+
+        let mut consumed = collected.consumed_env.clone();
+        consumed.sort();
+        assert_eq!(consumed, vec!["TEST_CTX_ENV_A", "TEST_CTX_ENV_B"]);
+    }
+
+    /// `source = "env"` under `collect_secrets_with` never falls back to the
+    /// process environment, even when `env_lookup` returns nothing and the
+    /// process happens to have the variable set.
+    #[test]
+    fn collect_secrets_with_env_source_ignores_process_env() {
+        let _guard = EnvGuard::new(&[("TEST_CTX_PROCESS_ONLY", "should-not-be-seen")]);
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let config = make_config_env(vec![("x", "TEST_CTX_PROCESS_ONLY")]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::MissingSecrets { missing } => {
+                assert_eq!(missing, vec!["TEST_CTX_PROCESS_ONLY".to_string()]);
+            }
+            other => panic!("expected MissingSecrets, got: {other:?}"),
+        }
+    }
+
+    /// An `argv[0]` containing `/` is resolved relative to `ctx.cwd` and
+    /// refused when it lands inside the project root — `command =
+    /// ["./scripts/token.sh"]` is a config error, not a one-off failure.
+    #[test]
+    fn collect_secrets_with_argv0_with_slash_inside_root_refused() {
+        let root = tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("scripts")).unwrap();
+        let script = root.path().join("scripts/token.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let config = make_config_command(vec![("pw", vec!["./scripts/token.sh"], 5)]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::CommandUnusable(msg) => {
+                assert!(msg.contains("secret pw"));
+                assert!(msg.contains("./scripts/token.sh"));
+                assert!(msg.contains("inside the project"));
+            }
+            other => panic!("expected CommandUnusable, got: {other:?}"),
+        }
+    }
+
+    /// Same check, but the offending path is inside a write grant rather
+    /// than the root.
+    #[test]
+    fn collect_secrets_with_argv0_with_slash_inside_write_grant_refused() {
+        let root = tempdir().unwrap();
+        let grant_dir = tempdir().unwrap();
+        let script = grant_dir.path().join("token.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![grant_dir.path().to_path_buf()],
+        );
+        let argv0 = script.to_string_lossy().into_owned();
+        let config = make_config_command(vec![("pw", vec![argv0.as_str()], 5)]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::CommandUnusable(msg) => {
+                assert!(msg.contains("secret pw"));
+                assert!(msg.contains("inside a write grant"));
+            }
+            other => panic!("expected CommandUnusable, got: {other:?}"),
+        }
+    }
+
+    /// A bare `argv[0]` not found on the filtered `PATH` reports the
+    /// dropped entries and why, like the tool "binary not found" message.
+    #[test]
+    fn collect_secrets_with_command_not_on_path_lists_dropped() {
+        let root = tempdir().unwrap();
+        let mut ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        // Force a known drop so the message has something concrete to name.
+        ctx.path
+            .dropped
+            .push(("relative/bin".to_string(), "relative".to_string()));
+        let config = make_config_command(vec![("pw", vec!["totally_missing_tool_xyzzy"], 5)]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::CommandUnusable(msg) => {
+                assert!(msg.contains("secret pw"));
+                assert!(msg.contains("totally_missing_tool_xyzzy"));
+                assert!(msg.contains("session's PATH"));
+                assert!(msg.contains("relative/bin"));
+            }
+            other => panic!("expected CommandUnusable, got: {other:?}"),
+        }
+    }
+
+    /// A command that resolves and runs, but exits non-zero, is reported
+    /// per the UX table: the command backticked, its stderr indented
+    /// beneath it, batched under `CommandRunFailures`.
+    #[test]
+    fn collect_secrets_with_run_failure_is_formatted_and_batched() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let config =
+            make_config_command(vec![("pw", vec!["sh", "-c", "echo boom >&2; exit 3"], 5)]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::CommandRunFailures { messages } => {
+                assert_eq!(messages.len(), 1);
+                assert!(messages[0].contains("secret pw"));
+                assert!(messages[0].contains('`'));
+                assert!(messages[0].contains("exited with"));
+                assert!(messages[0].contains("\n  boom"));
+            }
+            other => panic!("expected CommandRunFailures, got: {other:?}"),
+        }
     }
 
     // ── Environment clearing tests ───────────────────────────────────────
