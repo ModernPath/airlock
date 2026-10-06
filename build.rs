@@ -20,6 +20,14 @@
 use std::env;
 use std::process::Command;
 
+// This is the build script, not the `airlock` daemon or client — it runs at
+// compile time, once per build, long before any daemon process or session
+// exists. The session-isolation lint (clippy.toml) is about the daemon's own
+// process environment at request time; it doesn't apply here.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "build-time only: not daemon or client code, runs before any binary exists"
+)]
 fn main() {
     // Re-run if the git HEAD changes (new commit, checkout, etc.).
     println!("cargo:rerun-if-changed=.git/HEAD");

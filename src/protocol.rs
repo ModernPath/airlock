@@ -663,7 +663,7 @@ pub struct RegisterPayload {
     /// Entries the filter dropped from the launcher's `PATH`, and why.
     pub dropped_path: Vec<DroppedPath>,
     /// Every path a sandboxed tool may write to, used for the anchor-overlap
-    /// check and `resolve_binary`'s project/grant refusal.
+    /// check and `resolve_binary_in`'s project/grant refusal.
     pub write_grants: Vec<PathBuf>,
     /// The anchor paths the launcher validated.
     pub anchors: WireAnchors,

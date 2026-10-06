@@ -271,6 +271,10 @@ enum DaemonAction {
 // ─── Sandbox refusal (U16 / "Commands refused inside the sandbox") ──────────
 
 /// `true` when this process is itself running inside an Airlock sandbox.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary checking its own environment, not daemon request-path code"
+)]
 fn in_sandbox() -> bool {
     std::env::var("AIRLOCK_SANDBOX").as_deref() == Ok("1")
 }
@@ -429,6 +433,10 @@ fn customize_help(mut cmd: clap::Command, sandboxed: bool) -> clap::Command {
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving its own cwd before talking to the daemon"
+)]
 fn current_dir_or_fail() -> Result<PathBuf, ExitCode> {
     std::env::current_dir().map_err(|e| {
         eprintln!("error: failed to determine current directory: {e}");
@@ -436,6 +444,10 @@ fn current_dir_or_fail() -> Result<PathBuf, ExitCode> {
     })
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving the user's home directory, not daemon request-path code"
+)]
 fn home_dir_or_fail() -> Result<PathBuf, ExitCode> {
     std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
         eprintln!("error: HOME is not set");
@@ -579,6 +591,10 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
 /// process, `XDG_CONFIG_HOME` for `--global`'s directory, and the real
 /// `git check-ignore` for `--local`'s ignore-file note. `--global` inside
 /// the sandbox is already refused by `sandbox_refusal` before this runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: gathers the CLI's own cwd/HOME/XDG_CONFIG_HOME to hand to inspect::init_cmd"
+)]
 fn cmd_init(local: bool, global: bool) -> ExitCode {
     let cwd = match current_dir_or_fail() {
         Ok(d) => d,
@@ -613,6 +629,10 @@ fn cmd_init(local: bool, global: bool) -> ExitCode {
 /// real `cwd`, `HOME`, anchors (`anchors::resolve` over the real
 /// environment) and runtime dir, then hands them to [`inspect::config_cmd`],
 /// which does the actual file reading and rendering.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::config_cmd"
+)]
 fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> ExitCode {
     let cwd = match current_dir_or_fail() {
         Ok(d) => d,
@@ -721,6 +741,10 @@ impl inspect::DaemonProbe for AdminProbe {
 /// `airlock status [--config] [--no-project-config]`. Refused inside the
 /// sandbox before this runs (`sandbox_refusal`, with a hint to `agent
 /// check`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::status_cmd"
+)]
 fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> ExitCode {
     let cwd = match current_dir_or_fail() {
         Ok(d) => d,
@@ -1429,6 +1453,10 @@ fn find_session(
 /// Best-effort project root discovery for `--here` filtering: walks up from
 /// `cwd` the same way `DiscoveryMode::Default` does, but never fails — a
 /// project with no config simply matches no session.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving its own HOME/anchors for best-effort `--here` filtering"
+)]
 fn discover_root_quietly(cwd: &std::path::Path) -> Option<PathBuf> {
     let home = std::env::var("HOME").ok()?;
     let runtime = RuntimeDir::locate().ok()?;

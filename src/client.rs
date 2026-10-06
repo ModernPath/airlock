@@ -30,6 +30,10 @@ pub(crate) const NO_SESSION_MESSAGE: &str = "no Airlock session. The user starts
 /// collapse to the same "no session" message (docs/airlock-v2-ux.md,
 /// "Messages → Agent"). `pub(crate)`: shared with `agent.rs`'s `check`/
 /// `hook`, which read the same two variables and nothing else.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: reads the two session-handoff variables from its own process environment, not daemon request-path code"
+)]
 pub(crate) fn session_from_env() -> Option<(PathBuf, SessionToken)> {
     let addr = std::env::var("AIRLOCK_ADDR").ok()?;
     let session = std::env::var("AIRLOCK_SESSION").ok()?;
@@ -446,6 +450,10 @@ fn print_tools(tools: &[crate::protocol::ToolInfo]) {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use std::sync::MutexGuard;

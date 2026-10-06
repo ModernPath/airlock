@@ -36,20 +36,6 @@ use crate::sandbox::SandboxProfile;
 /// Errors that can occur during binary resolution, spawn preparation, or spawn.
 #[derive(Debug, Error)]
 pub enum ExecError {
-    /// The tool name contains a `/` path separator.
-    ///
-    /// Only bare binary names (e.g., `"sh"`, `"python3"`) are accepted;
-    /// absolute or relative paths (e.g., `"/usr/bin/sh"`, `"./script"`) are not.
-    #[error(
-        "tool name contains a path separator ('/'): only bare binary names are accepted, \
-         not paths: {0:?}"
-    )]
-    PathSeparatorInName(String),
-
-    /// The `PATH` environment variable is not set in the daemon's environment.
-    #[error("PATH environment variable is not set in the daemon's environment")]
-    PathNotSet,
-
     /// No executable with the given name was found in any directory in `PATH`.
     #[error("binary {0:?} not found in PATH")]
     BinaryNotFound(String),
@@ -265,38 +251,6 @@ fn is_executable(path: &Path) -> bool {
     unsafe { libc::access(cstr.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Walk a colon-separated `path_var` string to find an executable binary.
-///
-/// This inner function accepts an explicit `path_var` so that tests can drive
-/// it without manipulating the process environment. It is the engine behind
-/// the legacy, process-env-reading [`resolve_binary`]; the v2 path
-/// ([`resolve_binary_in`]) walks an already-[`filter_path`]ed entry list
-/// instead, since it tolerates relative entries (resolved against the
-/// process `cwd`, exactly as a shell would) in a way the filtered path
-/// deliberately does not.
-///
-/// Non-existent directories are silently skipped; the search continues to the
-/// next `PATH` entry. An empty `path_var` or a `path_var` that contains only
-/// non-existent directories returns [`ExecError::BinaryNotFound`].
-fn walk_path_var(tool_name: &str, path_var: &str) -> Result<PathBuf, ExecError> {
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            // Skip empty components produced by leading/trailing colons or
-            // consecutive colons (e.g. "dir1::dir2", ":dir", "dir:").
-            continue;
-        }
-
-        let candidate = Path::new(dir).join(tool_name);
-        if let Some(resolved) = probe_executable(&candidate) {
-            return Ok(resolved);
-        }
-        // Directory did not exist, or the binary was not found / not executable:
-        // silently continue to the next PATH entry.
-    }
-
-    Err(ExecError::BinaryNotFound(tool_name.to_string()))
-}
-
 /// If `candidate` exists, is a regular file, and is executable, return its
 /// canonicalized path. `metadata()` follows symlinks and returns `Err` when
 /// the path does not exist or is not accessible, so a missing directory or
@@ -322,27 +276,6 @@ pub(crate) fn search_path_entries(name: &str, entries: &[PathBuf]) -> Option<Pat
     entries
         .iter()
         .find_map(|dir| probe_executable(&dir.join(name)))
-}
-
-/// Resolve a bare binary name to its absolute canonical path by walking `PATH`.
-///
-/// Resolution happens at request time (not at daemon startup), so tools
-/// installed after the daemon starts are found correctly.
-///
-/// # Errors
-///
-/// - [`ExecError::PathSeparatorInName`] — `tool_name` contains a `'/'`.
-/// - [`ExecError::PathNotSet`] — the `PATH` environment variable is not set.
-/// - [`ExecError::BinaryNotFound`] — no executable with `tool_name` was found
-///   in any directory listed in `PATH`.
-pub fn resolve_binary(tool_name: &str) -> Result<PathBuf, ExecError> {
-    // Reject names that contain a path separator character.
-    if tool_name.contains('/') {
-        return Err(ExecError::PathSeparatorInName(tool_name.to_string()));
-    }
-
-    let path_var = std::env::var("PATH").map_err(|_| ExecError::PathNotSet)?;
-    walk_path_var(tool_name, &path_var)
 }
 
 /// Resolve a declared tool's binary against its session's filtered `PATH`
@@ -438,36 +371,6 @@ pub fn build_env_from(
     env
 }
 
-/// Build a clean, minimal environment map for a child process, reading the
-/// daemon's own environment.
-///
-/// A thin, process-env-reading wrapper around [`build_env_from`] for the v1
-/// daemon: it snapshots `ESSENTIAL_VARS` from `std::env`, wraps the daemon's
-/// own `PATH` in an unfiltered [`FilteredPath`] (so the join in
-/// `build_env_from` reproduces it byte-for-byte), and delegates. Phase 2
-/// removes this along with every other process-env read on the request
-/// path.
-///
-/// See [`build_env_from`] for the exact contents of the returned map.
-pub fn build_env(secrets: &[(String, String)]) -> HashMap<String, String> {
-    let mut snapshot = BTreeMap::new();
-    for var in ESSENTIAL_VARS {
-        if let Ok(value) = std::env::var(var) {
-            snapshot.insert((*var).to_string(), value);
-        }
-    }
-
-    let unfiltered = match snapshot.get("PATH") {
-        Some(path_var) => FilteredPath {
-            entries: path_var.split(':').map(PathBuf::from).collect(),
-            dropped: Vec::new(),
-        },
-        None => FilteredPath::default(),
-    };
-
-    build_env_from(&snapshot, &unfiltered, secrets)
-}
-
 // ─── ExecRequest ─────────────────────────────────────────────────────────────
 
 /// All pre-fork state required by [`spawn`].
@@ -481,7 +384,7 @@ pub fn build_env(secrets: &[(String, String)]) -> HashMap<String, String> {
 /// duplicated, so cloning would be semantically incorrect.
 pub struct ExecRequest {
     /// Absolute, canonical path to the executable binary (produced by
-    /// [`resolve_binary`]).
+    /// [`resolve_binary_in`]).
     pub binary: PathBuf,
 
     /// Argument list — the full `argv` after the binary name (i.e., `argv[1..]`).
@@ -493,7 +396,7 @@ pub struct ExecRequest {
     /// this module does not re-validate it.
     pub work_dir: PathBuf,
 
-    /// Clean environment map for the child process (produced by [`build_env`]).
+    /// Clean environment map for the child process (produced by [`build_env_from`]).
     pub env: HashMap<String, String>,
 
     /// Pre-built, platform-specific sandbox profile produced by a
@@ -832,6 +735,10 @@ pub fn kill_process_group(child_pid: u32, signal: i32) -> Result<(), ExecError> 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
@@ -842,12 +749,44 @@ mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
 
-    /// Hold the crate-wide env lock. The tests below compare `build_env()`'s
+    /// Hold the crate-wide env lock. The tests below compare `test_env()`'s
     /// snapshot of the environment against a second `std::env::var` read of the
     /// same variable; without the lock a concurrent test mutating `HOME` or
     /// `LANG` can change the answer between the two reads.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Resolve `name` against the real process `PATH`, for tests that need a
+    /// real binary and aren't exercising `resolve_binary_in`'s own location
+    /// checks (those build a `FilteredPath` and root by hand instead).
+    fn test_resolve(name: &str) -> Result<PathBuf, ExecError> {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let path = FilteredPath {
+            entries: path_var.split(':').map(PathBuf::from).collect(),
+            dropped: Vec::new(),
+        };
+        // No real binary lives under this root, so the location check in
+        // `resolve_binary_in` never fires for anything the real PATH finds.
+        resolve_binary_in(
+            name,
+            &path,
+            Path::new("/airlock-test-root-never-exists"),
+            &[],
+        )
+    }
+
+    /// Build a child environment from the real process environment and
+    /// `PATH`, for tests that exercise `build_env_from`'s shape (which vars
+    /// survive, which don't) rather than its snapshot/`PATH` plumbing.
+    fn test_env(secrets: &[(String, String)]) -> HashMap<String, String> {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let path = FilteredPath {
+            entries: path_var.split(':').map(PathBuf::from).collect(),
+            dropped: Vec::new(),
+        };
+        let snapshot: BTreeMap<String, String> = std::env::vars().collect();
+        build_env_from(&snapshot, &path, secrets)
     }
 
     // ── Binary resolution ────────────────────────────────────────────────────
@@ -856,7 +795,7 @@ mod tests {
     /// Verify that it resolves to an absolute path pointing to an executable file.
     #[test]
     fn resolve_sh_returns_absolute_executable_path() {
-        let path = resolve_binary("sh").expect("sh should be found in PATH");
+        let path = test_resolve("sh").expect("sh should be found in PATH");
 
         assert!(
             path.is_absolute(),
@@ -877,7 +816,7 @@ mod tests {
     #[test]
     fn resolve_nonexistent_binary_returns_error_with_name() {
         let name = "binary_that_definitely_does_not_exist_in_any_path_directory_xyzzy42";
-        let err = resolve_binary(name).expect_err("nonexistent binary should not resolve");
+        let err = test_resolve(name).expect_err("nonexistent binary should not resolve");
         let msg = err.to_string();
         assert!(
             msg.contains(name),
@@ -885,53 +824,41 @@ mod tests {
         );
     }
 
-    /// A tool name containing a `'/'` character returns a `PathSeparatorInName`
-    /// error without consulting PATH at all.
+    /// An empty `FilteredPath` returns a "not on PATH" error (no directories
+    /// to search).
     #[test]
-    fn resolve_with_slash_returns_path_separator_error() {
-        // Absolute path — rejected.
-        let result = resolve_binary("/usr/bin/sh");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "absolute path should return PathSeparatorInName, got: {result:?}"
-        );
-
-        // Relative path with directory component — also rejected.
-        let result = resolve_binary("some/relative/path");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "relative path with '/' should return PathSeparatorInName, got: {result:?}"
-        );
-
-        // Bare name with a trailing slash — also rejected.
-        let result = resolve_binary("sh/");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "name with trailing '/' should return PathSeparatorInName, got: {result:?}"
-        );
-    }
-
-    /// An empty PATH string returns an error (no directories to search).
-    #[test]
-    fn empty_path_string_returns_error() {
-        let result = walk_path_var("sh", "");
+    fn resolve_in_empty_filtered_path_returns_error() {
+        let root = tempdir().unwrap();
+        let result = resolve_binary_in("sh", &FilteredPath::default(), root.path(), &[]);
         assert!(
             result.is_err(),
-            "empty PATH string should return an error, got: {result:?}"
+            "empty PATH should return an error, got: {result:?}"
         );
     }
 
-    /// A PATH containing a non-existent directory does not panic; that directory
-    /// is skipped and resolution continues to the next entry.
+    /// A `PATH` entry that does not exist does not panic; that directory is
+    /// skipped and resolution continues to the next entry.
     #[test]
     fn nonexistent_dir_in_path_is_skipped_and_binary_found() {
         // Build a custom PATH that has a non-existent directory first, followed
         // by the real PATH (which contains sh).
         let real_path = std::env::var("PATH").unwrap_or_default();
-        let custom_path = format!("/this/directory/does/absolutely/not/exist/xyzzy:{real_path}");
+        let mut entries = vec![PathBuf::from(
+            "/this/directory/does/absolutely/not/exist/xyzzy",
+        )];
+        entries.extend(real_path.split(':').map(PathBuf::from));
+        let path = FilteredPath {
+            entries,
+            dropped: Vec::new(),
+        };
 
         // Must not panic, and should still find sh via the real PATH entries.
-        let result = walk_path_var("sh", &custom_path);
+        let result = resolve_binary_in(
+            "sh",
+            &path,
+            Path::new("/airlock-test-root-never-exists"),
+            &[],
+        );
         assert!(
             result.is_ok(),
             "should find sh despite a non-existent leading directory, got: {result:?}"
@@ -1172,7 +1099,7 @@ mod tests {
             ("MY_API_KEY".to_string(), "secret_value_123".to_string()),
             ("DB_PASSWORD".to_string(), "hunter2".to_string()),
         ];
-        let env = build_env(&secrets);
+        let env = test_env(&secrets);
 
         assert_eq!(
             env.get("MY_API_KEY").map(String::as_str),
@@ -1197,7 +1124,7 @@ mod tests {
             return;
         };
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(expected_path.as_str()),
@@ -1211,7 +1138,7 @@ mod tests {
     fn build_env_contains_essential_vars_when_present_in_daemon_env() {
         let _guard = env_lock();
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         for var in &["HOME", "TERM", "LANG", "USER"] {
             match std::env::var(var) {
@@ -1247,7 +1174,7 @@ mod tests {
             ("SECRET_ALPHA".to_string(), "value_a".to_string()),
             ("SECRET_BETA".to_string(), "value_b".to_string()),
         ];
-        let env = build_env(&secrets);
+        let env = test_env(&secrets);
 
         let secret_names: HashSet<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
         let essential_names: HashSet<&str> = ESSENTIAL_VARS.iter().copied().collect();
@@ -1286,7 +1213,7 @@ mod tests {
     /// beyond the declared secrets and the essential set.
     #[test]
     fn build_env_does_not_leak_daemon_environment() {
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         // A sample of well-known environment variables that are commonly set in
         // daemon/CI/developer environments but must not appear in the child env.
@@ -1330,7 +1257,7 @@ mod tests {
     fn build_env_omits_absent_essential_vars_without_error() {
         let _guard = env_lock();
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         match std::env::var("TERM") {
             Ok(val) => {
@@ -1353,7 +1280,7 @@ mod tests {
     /// essential variables that are present in the daemon's environment.
     #[test]
     fn build_env_no_secrets_produces_only_essential_vars() {
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         let essential_names: HashSet<&str> = ESSENTIAL_VARS.iter().copied().collect();
 
@@ -1369,7 +1296,7 @@ mod tests {
 
     /// `build_env_from` reads `ESSENTIAL_VARS` from the explicit snapshot, not
     /// the process environment — proven by a value absent from the real
-    /// process env (so `build_env` could never have produced it).
+    /// process env, which only the snapshot could have supplied.
     #[test]
     fn build_env_from_uses_snapshot_not_process_env() {
         let mut snapshot = BTreeMap::new();
@@ -1466,7 +1393,7 @@ mod tests {
             binary: PathBuf::from("/bin/sh"),
             args: vec!["-c".to_string(), "true".to_string()],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&secrets),
+            env: test_env(&secrets),
             sandbox_profile,
             timeout: Duration::from_secs(30),
         };
@@ -1565,10 +1492,10 @@ mod tests {
         let profile = SandboxProfile::new_for_test(fd);
 
         let request = ExecRequest {
-            binary: resolve_binary("true").expect("true should be in PATH"),
+            binary: test_resolve("true").expect("true should be in PATH"),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&[]),
+            env: test_env(&[]),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -1633,10 +1560,10 @@ mod tests {
         let probe = FdClosedProbe::arm(raw_fd);
 
         let request = ExecRequest {
-            binary: resolve_binary("true").expect("true should be in PATH"),
+            binary: test_resolve("true").expect("true should be in PATH"),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&[]),
+            env: test_env(&[]),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };

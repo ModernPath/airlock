@@ -338,6 +338,10 @@ pub fn start(mode: DaemonMode, foreground: bool) -> Result<(), DaemonError> {
 ///
 /// The debug-only override is read here, in `start`, and nowhere else on the
 /// request path.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "debug-only test override, read once in `start` before the runtime (and any session) exists"
+)]
 fn idle_exit_duration(mode: DaemonMode) -> Option<Duration> {
     if mode != DaemonMode::Automatic {
         return None;

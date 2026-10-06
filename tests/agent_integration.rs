@@ -18,6 +18,11 @@
 //! probes are all expected to FAIL — that FAILure is exactly what proves
 //! the probes are doing real `open`s rather than always reporting "ok".
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test harness drives the real binary via its own process env, not daemon request-path code"
+)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;

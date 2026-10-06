@@ -9,6 +9,11 @@
 //! rejected by the kernel) — those are written but `#[ignore]`d per the v2
 //! implementation contract's environment rules.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test harness drives the real binary via its own process env, not daemon request-path code"
+)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;

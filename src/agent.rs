@@ -438,6 +438,10 @@ pub fn check_cmd(quiet: bool) -> ExitCode {
     rt.block_on(check_cmd_async(quiet))
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: `agent check` probes the current process's own HOME/env, not daemon request-path code"
+)]
 async fn check_cmd_async(quiet: bool) -> ExitCode {
     let home = std::env::var("HOME").map(PathBuf::from).unwrap_or_default();
 
@@ -603,6 +607,10 @@ fn render_hook(harness: Harness, context: Option<&str>, system_message: Option<&
 /// `home`), the same walk `prepare`/`session start` use
 /// ([`crate::layers::load_layers`]). A malformed file still counts as
 /// "has config" — it exists, it just doesn't parse.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: `agent hook` resolving the current process's own anchors, not daemon request-path code"
+)]
 fn project_has_config(cwd: &Path, home: &Path) -> bool {
     let Ok(runtime) = crate::runtime_dir::RuntimeDir::locate() else {
         return false;
@@ -619,6 +627,10 @@ fn project_has_config(cwd: &Path, home: &Path) -> bool {
     )
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: `agent hook` probes the current process's own cwd/HOME/env, not daemon request-path code"
+)]
 async fn hook_cmd_async(harness: Harness) {
     if harness == Harness::ClaudeCode {
         // Drain stdin so the harness's write doesn't block on a full pipe;
@@ -718,6 +730,10 @@ fn print_rendered(harness: Harness, context: Option<&str>, system_message: Optio
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use crate::protocol::{EndsInfo, SessionId, WireMode};

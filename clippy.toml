@@ -1,0 +1,22 @@
+# Enforces "no process-global state after startup" (docs/airlock-v2-design.md,
+# "Session isolation"): once a session is registered, a request handler reads
+# only through its `Arc<Session>` — never the daemon's own process
+# environment or working directory. Everything a request needs (the
+# environment snapshot, the filtered `PATH`, secret values) travels with
+# `Register`/`Reload` instead.
+#
+# A regression here fails CI (`cargo clippy --all-targets -- -D warnings`),
+# not just review. Startup/launcher-side code that legitimately needs the
+# process environment carries a narrowly-scoped
+# `#[allow(clippy::disallowed_methods, reason = "...")]` on the specific
+# function; test modules carry a module-level allow.
+disallowed-methods = [
+    { path = "std::env::var", reason = "reads the process environment; daemon-side code after Register must use the session's environment snapshot instead (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::var_os", reason = "reads the process environment; daemon-side code after Register must use the session's environment snapshot instead (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::vars", reason = "reads the process environment; daemon-side code after Register must use the session's environment snapshot instead (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::vars_os", reason = "reads the process environment; daemon-side code after Register must use the session's environment snapshot instead (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::set_var", reason = "mutates the process environment, which is shared by every session; nothing after Register may touch it (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::remove_var", reason = "mutates the process environment, which is shared by every session; nothing after Register may touch it (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::current_dir", reason = "reads the process-global working directory, shared by every session; a request's cwd must come from the session instead (see docs/airlock-v2-design.md, \"Session isolation\")" },
+    { path = "std::env::set_current_dir", reason = "mutates the process-global working directory, shared by every session; nothing after Register may touch it (see docs/airlock-v2-design.md, \"Session isolation\")" },
+]
