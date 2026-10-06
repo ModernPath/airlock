@@ -10,6 +10,7 @@ pub mod refresh;
 pub mod run;
 pub mod sandbox;
 pub mod secrets;
+pub mod trust;
 
 #[cfg(test)]
 pub(crate) mod test_support {
