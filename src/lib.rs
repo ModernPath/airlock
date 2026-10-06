@@ -5,6 +5,7 @@ pub mod config;
 pub mod daemon;
 pub mod exec;
 pub mod inspect;
+pub mod launcher;
 pub mod layers;
 pub mod policy;
 pub mod process_tree;
