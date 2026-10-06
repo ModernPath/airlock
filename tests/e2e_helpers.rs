@@ -265,6 +265,9 @@ pub fn start_daemon_with_config(project_dir: &Path, toml_src: &str) -> DaemonHan
     let mut process = Command::new(binary)
         .args(["daemon", "start", "--foreground"])
         .env("AIRLOCK_TEST_RUNTIME_DIR", &runtime_base)
+        // The suite may itself run under Airlock; the daemon it starts stands
+        // in for one started from the user's terminal.
+        .env_remove("AIRLOCK_SANDBOX")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::inherit())

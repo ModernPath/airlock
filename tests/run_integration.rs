@@ -130,7 +130,7 @@ fn run_no_session_after_trust_runs_the_command() {
 }
 
 #[test]
-#[ignore = "needs the v2 daemon (phase 2 merge)"]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 fn run_with_session_registers_and_execs_through_the_daemon() {
     let fx = Fixture::new();
     fx.write_config(minimal_config());

@@ -6,6 +6,7 @@
 //! up is `#[ignore = "needs the v2 daemon (phase 2 merge)"]`. What's left
 //! is the CLI behavior that holds with no daemon running at all.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -20,9 +21,13 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        let runtime = tempfile::tempdir().unwrap();
+        // The daemon refuses a runtime dir others can read, and tempdir()
+        // follows the umask.
+        std::fs::set_permissions(runtime.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
         Fixture {
             home: tempfile::tempdir().unwrap(),
-            runtime: tempfile::tempdir().unwrap(),
+            runtime,
         }
     }
 
@@ -65,7 +70,6 @@ fn install_and_uninstall_are_phase_three_stubs() {
 }
 
 #[test]
-#[ignore = "needs the v2 daemon (phase 2 merge)"]
 fn start_foreground_then_stop_is_a_full_lifecycle() {
     let fx = Fixture::new();
     let mut child = fx
@@ -86,13 +90,16 @@ fn start_foreground_then_stop_is_a_full_lifecycle() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
 
+    // `daemon stop` polls the PID until it is gone. The daemon is this test's
+    // own child, so reap it as soon as it exits; an unreaped zombie still
+    // answers kill(pid, 0).
+    let reaper = std::thread::spawn(move || child.wait());
     let stop = fx.cmd().args(["daemon", "stop", "--yes"]).output().unwrap();
     assert!(stop.status.success(), "{stop:?}");
-    let _ = child.wait();
+    reaper.join().unwrap().unwrap();
 }
 
 #[test]
-#[ignore = "needs the v2 daemon (phase 2 merge)"]
 fn restart_replaces_a_running_daemon() {
     let fx = Fixture::new();
     let start = fx
