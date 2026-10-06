@@ -1,16 +1,19 @@
 # Multi-cloud setup: AWS CLI + Google Cloud CLI + GitHub CLI + kubectl
 #
-# Start the daemon:
+# Use it:
+#   cp examples/cloud-providers.toml airlock.toml
 #   GH_TOKEN="ghp_xxxx" \
 #   AWS_ACCESS_KEY_ID="AKIA..." \
 #   AWS_SECRET_ACCESS_KEY="wJal..." \
-#     airlock daemon start
+#     airlock run --profile claude
 #
 # (`gcloud` needs nothing in the environment: the daemon mints a token for a
 # read-only service account at start — see [secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
-# below and examples/gcp-impersonation.toml for the full walkthrough.)
+# below and examples/gcp-impersonation.toml for the full walkthrough. See
+# examples/secret-sources.toml for `op run -- airlock run` instead of typing
+# secrets into a shell.)
 #
-# Use it:
+# Inside the agent:
 #   airlock exec -- gh repo list
 #   airlock exec -- aws s3 ls
 #   airlock exec -- gcloud compute instances list
@@ -70,12 +73,11 @@ timeout = 30
 refresh = 3000
 refresh_max_backoff = 600
 
-# Per-tool config directories live under the sandbox root ({sandbox_root}
-# expands at config-load time to the canonicalized directory containing this
-# file). Each checkout therefore keeps its own isolated gh / aws / gcloud
-# state — a second clone of the repo gets its own auth session, and nothing
-# under ~/.config leaks in. The sandbox root is always read-write, so each
-# tool can populate its config dir without extra_read/extra_write entries.
+# Per-tool config directories use `{tool_state}`, which expands to a
+# per-project, per-tool directory under $XDG_CACHE_HOME/airlock — outside the
+# project, so the agent can't read it and git never sees it. Each checkout
+# therefore keeps its own isolated gh / aws / gcloud state, and nothing under
+# ~/.config leaks in.
 
 # GitHub CLI
 [tools.gh]
@@ -84,7 +86,7 @@ timeout = 60
 
 [tools.gh.env]
 GH_TOKEN = { secret = "GH_TOKEN" }
-GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
+GH_CONFIG_DIR = "{tool_state}"
 
 # AWS CLI
 [tools.aws]
@@ -94,8 +96,8 @@ timeout = 120
 [tools.aws.env]
 AWS_ACCESS_KEY_ID = { secret = "AWS_ACCESS_KEY_ID" }
 AWS_SECRET_ACCESS_KEY = { secret = "AWS_SECRET_ACCESS_KEY" }
-AWS_CONFIG_FILE = "{sandbox_root}/.aws/config"
-AWS_SHARED_CREDENTIALS_FILE = "{sandbox_root}/.aws/credentials"
+AWS_CONFIG_FILE = "{tool_state}/config"
+AWS_SHARED_CREDENTIALS_FILE = "{tool_state}/credentials"
 AWS_PAGER = ""
 
 # Google Cloud CLI
@@ -105,15 +107,17 @@ timeout = 120
 
 [tools.gcloud.env]
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
-# `gcloud container clusters get-credentials` writes kubeconfig here,
-# and kubectl below reads from the same path.
+CLOUDSDK_CONFIG = "{tool_state}"
+# `{tool_state}` is exclusive to one tool, but `gcloud container clusters
+# get-credentials` writes a kubeconfig that kubectl, a different tool, has
+# to read — so this one file stays under the sandbox root, which every tool
+# can already reach, rather than in either tool's own state directory.
 KUBECONFIG = "{sandbox_root}/.kube/config"
 
 # kubectl — no secret of its own. Auth is whatever gcloud / aws / etc. wrote
-# into the kubeconfig under the sandbox root. For GKE that kubeconfig calls
-# gke-gcloud-auth-plugin, which resolves credentials the way gcloud does — so
-# it needs the same env to pick up the same scoped token. Running under
+# into the kubeconfig. For GKE that kubeconfig calls gke-gcloud-auth-plugin,
+# which resolves credentials the way gcloud does — so it needs the same
+# CLOUDSDK_AUTH_ACCESS_TOKEN to pick up the same scoped token. Running under
 # airlock gives it the same filesystem/network sandbox as the other tools.
 [tools.kubectl]
 description = "Kubernetes CLI"
@@ -122,4 +126,4 @@ timeout = 120
 [tools.kubectl.env]
 KUBECONFIG = "{sandbox_root}/.kube/config"
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+CLOUDSDK_CONFIG = "{tool_state}"
