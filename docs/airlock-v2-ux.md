@@ -667,8 +667,8 @@ The other outcomes:
 | No session, but the project has `airlock.toml` | "This project uses Airlock, but this agent was not started with `airlock run`, so tools that need credentials are unavailable. Tell the user. Do not look for credentials yourself." | "Airlock: this agent has no session. Start it with `airlock run`." |
 | Session ended, or the daemon does not answer | the `exec` error message, and "tell the user" | the same message |
 | A self-test check fails | "Airlock's sandbox self-test failed: <check>. Do not use `airlock exec` until the user fixes it. Tell the user." No tool list. | "Airlock sandbox self-test failed: <check>" |
-| External sandbox | the tool list, plus "Before your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user." | none |
-| Config changed since the session started | the tool list, plus the config-changed note from [The agent changes the config](#the-agent-changes-the-config) | none |
+| External sandbox | the success context with its first sentence saying the harness provides the sandbox (not self-tested), plus "Before your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user." | none |
+| Config changed since the session started | the success context, plus the config-changed note from [The agent changes the config](#the-agent-changes-the-config) | none |
 
 Printing nothing outside Airlock projects means the hook can sit in the
 user-wide `~/.claude/settings.json` without effect elsewhere.
