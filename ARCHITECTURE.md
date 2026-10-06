@@ -104,7 +104,7 @@ One daemon serves every project a user has. A **session** binds a client to one 
 | Component | Type (indicative) | Purpose |
 |---|---|---|
 | Sessions | `DashMap<SessionId, Arc<Session>>` or equivalent | Every registered session; the token resolves to exactly one `Arc<Session>` |
-| `Session` | struct | id, token, root, `ArcSwap<SessionPolicy>` (compiled tools/secrets/proxy routes, swapped whole by `Reload`), process-tree binding, lease-or-TTL, exec counter |
+| `Session` | struct | id, token, root, `RwLock<Arc<SessionPolicy>>` (compiled tools/secrets/proxy routes, swapped whole by `Reload`), process-tree binding, lease-or-TTL, exec counter |
 | Admin credential | `admin.token`, mode 0600 in the runtime dir | Required by `Register`, `Reload`, `session list/revoke/renew`, `tools list --session`, `status`, `daemon logs/stop/restart`. No sandbox can read it. |
 | Global redactor | `Arc<RwLock<Arc<Redactor>>>` built from every live session's secrets | A last-pass safety net: after a session's own redactor, output also passes this one, so a bug that put another session's secret in the wrong place still gets masked |
 
@@ -128,9 +128,10 @@ Daemon handler:
     is within the session's root.
  3. Resolve binary on the session's filtered PATH; refuse if it resolves
     inside the root or a write grant (same check the launcher ran at Register).
- 4. Build child env: tool.env in declared order, Static(s) as-is and
-    SecretRef(label) via the session's secret store; then the essential
-    pass-through set (PATH, HOME, TERM, USER, TZ, LC_*).
+ 4. Build child env: tool.env in alphabetical order (a `BTreeMap`, not
+    declaration order), Static(s) as-is and SecretRef(label) via the
+    session's secret store; then the essential pass-through set (PATH,
+    HOME, TERM, USER, TZ, LC_*).
  5. Proxy tools only: bind a loopback proxy listener for this exec, overlay
     the daemon-owned HTTPS_PROXY / CA variables.
  6. Resolve timeout; build ToolPolicy and SandboxProfile (SBPL / Landlock).

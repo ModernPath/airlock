@@ -69,6 +69,8 @@ The daemon closes this by binding each token to a **process tree**, not just its
 
 This binding is a property of the Unix transport (peer PID is meaningless over a network); a future transport would need tokens bound to a TLS client identity instead.
 
+For `session start`, the anchor is the *parent* of the `session start` process itself — ordinarily the interactive shell that ran it, since `eval "$(airlock session start)"` execs `session start` as a direct child of that shell with no extra fork. Piping the command through anything else (`eval "$(airlock session start | cat)"`, or capturing it inside a script that then `eval`s the result in a different shell) forces an extra fork: the anchor becomes that pipeline's subshell, which exits as soon as the pipe finishes, and every later request is refused with `OutsideProcessTree` even though the token itself is valid. Run `airlock session start` directly in the shell that will use the session.
+
 ### Lifetime
 
 A `run` session ends when its lease — the `Register` connection, held open by the launcher for as long as the harness runs — closes; the kernel closes it however the launcher dies (exit, panic, SIGKILL, OOM), so nothing can leak a session past a dead launcher, and no heartbeat is needed. A `session start` session ends on its TTL (default 12h) or an explicit `session revoke`; without a TTL, a forgotten `session start` would keep a token valid, and an automatic daemon running, indefinitely.
@@ -205,6 +207,7 @@ The project directory is always included as a read-write path in the sandbox pol
 - macOS only: also widens write access to `~/.claude.json`'s sibling lock and per-pid `.tmp.*` files, and `~/.claude.lock`.
 - **Keychain posture**: keychain is unreachable. The baseline Mach allowlist excludes `com.apple.SecurityServer` and `com.apple.securityd.xpc`, and `~/Library/Keychains/` is denied for both read and write. Claude Code's probe (`security show-keychain-info`) fails, the auth subsystem reports "macOS Keychain is not writable", and OAuth tokens are persisted to `~/.claude/.credentials.json` (mode `0600`) instead. This moves secrets-at-rest from the encrypted keychain DB to a plaintext file inside `$HOME` — a deliberate trade for keeping the agent unable to see *any* keychain content from any other app.
 - Installs the `airlock agent hook claude-code` `SessionStart` hook — see [External sandboxes](#external-sandboxes) for what the equivalent hook does when the harness runs its own sandbox instead of this profile.
+- Passes `--settings` with `"sandbox":{"enabled":false}`, so Claude Code does not also try to apply its own `sandbox-exec` wrapper inside Airlock's Seatbelt profile — nesting two Seatbelt profiles is rejected by the OS. `airlock agent hook claude-code --print-settings` prints only the hook block (what to paste into a harness started another way); the `sandbox` key is specific to `--profile claude`'s own invocation and is not part of that printed block.
 
 **`claude-relaxed`** — `claude` plus interactive-ergonomics relaxations.
 
