@@ -591,9 +591,6 @@ pub(crate) fn empty_policy() -> SessionPolicy {
     SessionPolicy {
         config: Config {
             sandbox_root: PathBuf::from("/tmp"),
-            socket_path: PathBuf::from("/tmp/airlock.sock"),
-            pid_path: PathBuf::from("/tmp/airlock.pid"),
-            ca_path: PathBuf::from("/tmp/airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),

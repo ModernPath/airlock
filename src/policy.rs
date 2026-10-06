@@ -295,9 +295,6 @@ mod tests {
 
         Config {
             sandbox_root: sandbox_root.clone(),
-            socket_path: sandbox_root.join("airlock.sock"),
-            pid_path: sandbox_root.join("airlock.pid"),
-            ca_path: sandbox_root.join("airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read,
             filesystem_write,
@@ -725,9 +722,6 @@ mod tests {
     ) -> Config {
         Config {
             sandbox_root: sandbox_root.clone(),
-            socket_path: sandbox_root.join("airlock.sock"),
-            pid_path: sandbox_root.join("airlock.pid"),
-            ca_path: sandbox_root.join("airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read,
             filesystem_write,
