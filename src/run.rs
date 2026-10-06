@@ -6,7 +6,7 @@
 //! - Builds a clean, sandboxed environment for the agent child process.
 //! - Spawns the agent with platform-specific OS sandboxing (Seatbelt on
 //!   macOS, Landlock on Linux).
-//! - Forwards SIGTERM and SIGHUP to the agent.
+//! - Forwards SIGHUP, SIGINT and SIGTERM to the agent.
 //! - Watches the session's lease connection and tells the user if it closes
 //!   out from under a running agent.
 //! - Ends the lease (if any) when the agent exits.
@@ -573,6 +573,12 @@ async fn signal_loop(
 ) -> ExitCode {
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("SIGHUP handler should be installable");
+    // The agent shares this process's group, so a terminal Ctrl-C already
+    // delivers SIGINT to it directly; forwarding it again here is harmless
+    // (same as SIGTERM below) and covers a SIGINT sent to the launcher
+    // alone, e.g. via `kill -INT`.
+    let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
+        .expect("SIGINT handler should be installable");
 
     let use_timeout = !timeout.is_zero();
     let timeout_sleep = tokio::time::sleep(if use_timeout {
@@ -599,6 +605,9 @@ async fn signal_loop(
             }
             _ = sighup.recv() => {
                 unsafe { libc::kill(child_pid as i32, libc::SIGHUP); }
+            }
+            _ = sigint.recv() => {
+                unsafe { libc::kill(child_pid as i32, libc::SIGINT); }
             }
             _ = &mut lease_ended, if !lease_notified => {
                 lease_notified = true;
@@ -798,5 +807,40 @@ mod tests {
         let resolved = resolve_paths(&[PathBuf::from("rel"), PathBuf::from("/abs")], cwd);
         assert_eq!(resolved[0], PathBuf::from("/some/project/rel"));
         assert_eq!(resolved[1], PathBuf::from("/abs"));
+    }
+
+    // `signal_loop` only needs an already-spawned `tokio::process::Child`,
+    // not an OS sandbox, so its SIGINT wiring is testable here without
+    // nesting one: a real SIGINT delivered to this test process (which
+    // `signal_loop`'s own handler, installed inside it, intercepts instead
+    // of the OS default) must reach the child.
+    #[tokio::test]
+    async fn signal_loop_forwards_sigint_to_the_child() {
+        let child = tokio::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .expect("spawn sleep");
+        let child_pid = child.id().expect("child has a pid");
+
+        let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
+            .expect("install sigterm");
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        std::mem::forget(tx);
+
+        let handle = tokio::spawn(signal_loop(child, child_pid, Duration::ZERO, sigterm, rx));
+
+        // Give the spawned task a chance to run and install signal_loop's
+        // own SIGINT handler before this sends one.
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        // SAFETY: sends to this test process's own pid, a standard libc call.
+        unsafe { libc::kill(std::process::id() as i32, libc::SIGINT) };
+
+        let exit_code = tokio::time::timeout(Duration::from_secs(5), handle)
+            .await
+            .expect("signal_loop should not hang")
+            .expect("signal_loop should not panic");
+        // `sleep` has no SIGINT handler of its own, so the forwarded signal
+        // kills it; a signal-terminated child has no exit code.
+        assert_eq!(exit_code, ExitCode::FAILURE);
     }
 }
