@@ -27,6 +27,7 @@ use crate::client;
 use crate::protocol::{
     DaemonMessage, SandboxKind, SessionInfo, SessionRequest, ToolInfo, WireAnchors,
 };
+use crate::trust::escape_for_terminal as esc;
 
 /// Hanging indent for a probe or hook line's continuation text: 2 spaces
 /// plus an 8-wide label field (docs/airlock-v2-ux.md, "`airlock agent
@@ -351,8 +352,9 @@ fn tool_table(tools: &[ToolInfo]) -> String {
     sorted
         .iter()
         .map(|t| {
-            let desc = t.description.as_deref().unwrap_or("");
-            format!("  {:<width$}  {desc}", t.name, width = width)
+            let name = esc(&t.name);
+            let desc = t.description.as_deref().map(esc).unwrap_or_default();
+            format!("  {name:<width$}  {desc}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -948,6 +950,19 @@ mod tests {
             tool_table(&sample_tools()),
             "  gh    GitHub CLI\n  psql  Postgres shell\n  tofu  OpenTofu"
         );
+    }
+
+    #[test]
+    fn tool_table_escapes_untrusted_control_characters() {
+        // The description comes from the daemon's merged config, which may
+        // include an unapproved file — a bidi override or an ESC byte must
+        // not reach the agent's context (or the terminal, for `check`) raw.
+        let tools = vec![fake_tool("gh", "evil\u{202e}desc\x1b[31m")];
+        let out = tool_table(&tools);
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\x1b'));
+        assert!(out.contains("\\u{202e}"));
+        assert!(out.contains("\\u{1b}"));
     }
 
     #[test]

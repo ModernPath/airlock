@@ -21,7 +21,7 @@ use crate::layers::{
     SecretProvenance,
 };
 use crate::protocol::{DaemonMode, LayerKind, SessionInfo};
-use crate::trust::{Approval, TrustError, TrustStore};
+use crate::trust::{escape_for_terminal as esc, Approval, TrustError, TrustStore};
 
 // ─── Shared display helpers ─────────────────────────────────────────────────
 
@@ -130,7 +130,7 @@ fn layer_rows_table(layers: &[LayerRow]) -> String {
         .map(|l| {
             vec![
                 format!("  {}", layer_label(l.kind)),
-                l.path_display.clone(),
+                esc(&l.path_display),
                 l.state.text().to_string(),
             ]
         })
@@ -275,9 +275,9 @@ pub fn render_config(report: &ConfigReport) -> String {
             .iter()
             .map(|s| {
                 vec![
-                    format!("  {}", s.label),
+                    format!("  {}", esc(&s.label)),
                     s.layer_text.clone(),
-                    s.source_text.clone(),
+                    esc(&s.source_text),
                     if s.unapproved {
                         "(unapproved)".to_string()
                     } else {
@@ -299,7 +299,7 @@ pub fn render_config(report: &ConfigReport) -> String {
                 let secret_env = t
                     .secret_env
                     .iter()
-                    .map(|(var, label)| format!("{var} = <secret \"{label}\">"))
+                    .map(|(var, label)| format!("{} = <secret \"{}\">", esc(var), esc(label)))
                     .collect::<Vec<_>>()
                     .join(", ");
                 let marker = match (t.replaces_global, t.unapproved) {
@@ -309,9 +309,9 @@ pub fn render_config(report: &ConfigReport) -> String {
                     (false, false) => String::new(),
                 };
                 vec![
-                    format!("  {}", t.name),
+                    format!("  {}", esc(&t.name)),
                     t.layer_text.clone(),
-                    t.description.clone(),
+                    esc(&t.description),
                     secret_env,
                     marker,
                 ]
@@ -328,7 +328,7 @@ pub fn render_config(report: &ConfigReport) -> String {
 
     for note in &report.notes {
         out.push('\n');
-        out.push_str(note);
+        out.push_str(&esc(note));
         out.push('\n');
     }
 
@@ -354,14 +354,14 @@ fn render_settings_rows(settings: &[SettingRow]) -> String {
             } => (
                 format!("filesystem.{kind}"),
                 format!("filesystem.{kind}"),
-                path.clone(),
+                esc(path),
                 layer_text.clone(),
                 String::new(),
             ),
             SettingRow::PassthroughEnv { name, layer_text } => (
                 "agent.passthrough_env".to_string(),
                 "agent.passthrough_env".to_string(),
-                name.clone(),
+                esc(name),
                 layer_text.clone(),
                 String::new(),
             ),
@@ -382,9 +382,9 @@ fn render_settings_rows(settings: &[SettingRow]) -> String {
                     String::new()
                 };
                 (
-                    format!("agent.env.{key}"),
-                    format!("agent.env.{key}"),
-                    value_display.clone(),
+                    format!("agent.env.{}", esc(key)),
+                    format!("agent.env.{}", esc(key)),
+                    esc(value_display),
                     layer_col,
                     marker,
                 )
@@ -417,20 +417,20 @@ pub struct PathsReport {
 pub fn render_paths(report: &PathsReport) -> String {
     let mut rows = vec![vec![
         "global config".to_string(),
-        report.global_config.clone(),
+        esc(&report.global_config),
     ]];
     if let Some(repo) = &report.repo {
-        rows.push(vec!["repo config".to_string(), repo.clone()]);
+        rows.push(vec!["repo config".to_string(), esc(repo)]);
     }
     if let Some(local) = &report.local {
-        rows.push(vec!["local config".to_string(), local.clone()]);
+        rows.push(vec!["local config".to_string(), esc(local)]);
     }
-    rows.push(vec!["trust store".to_string(), report.trust_store.clone()]);
-    rows.push(vec!["runtime dir".to_string(), report.runtime_dir.clone()]);
-    rows.push(vec!["socket".to_string(), report.socket.clone()]);
+    rows.push(vec!["trust store".to_string(), esc(&report.trust_store)]);
+    rows.push(vec!["runtime dir".to_string(), esc(&report.runtime_dir)]);
+    rows.push(vec!["socket".to_string(), esc(&report.socket)]);
     rows.push(vec![
         "tool state".to_string(),
-        report.tool_state_base.clone(),
+        esc(&report.tool_state_base),
     ]);
     table(&rows)
 }
@@ -1449,6 +1449,34 @@ mod tests {
         let out = render_config(&report);
         // Matches docs/airlock-v2-design.md, "Duplicate tool".
         assert!(norm_lines(&out).contains(&"gh repo GitHub CLI (replaces global)".to_string()));
+    }
+
+    #[test]
+    fn render_config_escapes_untrusted_control_characters() {
+        // A description from an unapproved config file could carry a bidi
+        // override (U+202E) or an ESC byte that starts an ANSI escape —
+        // `airlock config` must never let either reach the terminal raw.
+        let report = ConfigReport {
+            layers: vec![layer(
+                LayerKind::Repo,
+                "airlock.toml",
+                ApprovalState::NotTrustedYet,
+            )],
+            tools: vec![ToolRow {
+                name: "gh".to_string(),
+                layer_text: "repo".to_string(),
+                description: "evil\u{202e}desc\x1b[31m".to_string(),
+                secret_env: vec![],
+                replaces_global: false,
+                unapproved: true,
+            }],
+            ..Default::default()
+        };
+        let out = render_config(&report);
+        assert!(!out.contains('\u{202e}'));
+        assert!(!out.contains('\x1b'));
+        assert!(out.contains("\\u{202e}"));
+        assert!(out.contains("\\u{1b}"));
     }
 
     // ── render_paths ─────────────────────────────────────────────────────
