@@ -177,6 +177,7 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     review_and_trust(&anchors, &loaded, &root, &raw_config, &merged)?;
 
     for dir in merged.tool_state_dirs() {
+        anchors::validate_tool_state_dir(&anchors, &root, dir)?;
         create_dir_0700(dir)?;
     }
 
