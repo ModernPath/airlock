@@ -2946,9 +2946,13 @@ pub mod macos {
             // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
             // admin.token WAS readable, bit 2 = the socket connect FAILED.
             // A correctly isolated sandbox exits 0.
+            // The write probe runs in a subshell: a failed redirection on the
+            // `:` special builtin ends a POSIX shell, which would read as a
+            // probe result.
             let probe_script = format!(
                 r#"
-                if : > "{base}/probe" 2>/dev/null; then code=1; else code=0; fi
+                code=0
+                if ( : > "{base}/probe" ) 2>/dev/null; then code=1; fi
                 if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
                 if ! nc -zU "{base}/airlock.sock" 2>/dev/null; then code=$((code | 4)); fi
                 exit "$code"
@@ -3714,14 +3718,21 @@ pub mod linux {
             // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
             // admin.token WAS readable, bit 2 = the socket connect FAILED.
             // A correctly isolated sandbox exits 0.
+            // The write probe runs in a subshell: a failed redirection on the
+            // `:` special builtin ends a POSIX shell, which would read as a
+            // probe result. Output goes to `work`, since the Landlock baseline
+            // grants /dev/null for reading only.
             let probe_script = format!(
                 r#"
-                if : > "{base}/probe" 2>/dev/null; then code=1; else code=0; fi
-                if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
-                if ! nc -zU "{base}/airlock.sock" 2>/dev/null; then code=$((code | 4)); fi
+                code=0
+                if ( : > "{base}/probe" ) 2>"{work}/err"; then code=1; fi
+                if cat "{base}/admin.token" >"{work}/out" 2>"{work}/err"; then code=$((code | 2)); fi
+                if command -v nc >"{work}/out" 2>&1 &&
+                    ! nc -zU "{base}/airlock.sock" 2>"{work}/err"; then code=$((code | 4)); fi
                 exit "$code"
                 "#,
                 base = base.display(),
+                work = work.display(),
             );
 
             let mut env = HashMap::new();

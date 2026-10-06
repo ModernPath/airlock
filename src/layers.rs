@@ -705,7 +705,10 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
     let merged_allow_home_root = global_raw.as_ref().and_then(|c| c.allow_home_root) == Some(true)
         || local_raw.as_ref().and_then(|c| c.allow_home_root) == Some(true);
-    if ctx.root == ctx.home && !merged_allow_home_root {
+    // Canonical on both sides: the root is canonical already, and a home
+    // reached through a symlink must not slip past the guard.
+    let home = std::fs::canonicalize(&ctx.home).unwrap_or_else(|_| ctx.home.clone());
+    if ctx.root == home && !merged_allow_home_root {
         return Err(ConfigError::HomeRootNotAllowed {
             home: ctx.root.clone(),
         });
@@ -1260,10 +1263,13 @@ mod tests {
         std::fs::write(dir.join(name), content).unwrap();
     }
 
+    /// The tests put the project at the top of a temp dir that also stands in
+    /// for home when loading layers; merging against that home would trip the
+    /// home-root guard, so the merge sees a home elsewhere.
     fn ctx(root: &Path, home: &Path) -> MergeContext {
         MergeContext {
             root: root.to_path_buf(),
-            home: home.to_path_buf(),
+            home: PathBuf::from("/nonexistent-airlock-test-home"),
             tool_state_base: home.join(".cache").join("airlock"),
         }
     }
@@ -1590,6 +1596,27 @@ mod tests {
         let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
         let wire = merged.to_wire();
         assert!(wire.secrets.unwrap().contains_key("GH_TOKEN"));
+    }
+
+    #[test]
+    fn merge_refuses_a_project_at_home_reached_through_a_symlink() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        std::fs::create_dir(&home).unwrap();
+        let link = tmp.path().join("home-link");
+        std::os::unix::fs::symlink(&home, &link).unwrap();
+        write(&home, "airlock.toml", "[tools.t]\n");
+        let layers = load_default(&home, &home).unwrap();
+        let c = MergeContext {
+            root: layers.root.clone(),
+            home: link,
+            tool_state_base: tmp.path().join("cache"),
+        };
+        let err = merge(&layers, &c).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::HomeRootNotAllowed { .. }),
+            "{err:?}"
+        );
     }
 
     #[test]
