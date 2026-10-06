@@ -521,7 +521,7 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 
 - `~/foo` → `$HOME/foo`; relative paths resolve against the sandbox root (an error in the global layer, since it applies to every project); absolute paths are used as-is.
 - Static `env` strings may use `{sandbox_root}` (the canonicalized project directory), or `{tool_state}` (a per-project, per-tool directory under `$XDG_CACHE_HOME/airlock`, created on first use, writable only by that one tool — nothing else, not even another tool or the agent, can reach it). Use `{tool_state}` for a tool's own config directory (`GH_CONFIG_DIR`, `CLOUDSDK_CONFIG`); use `{sandbox_root}` only when two tools genuinely need to share a path, as `KUBECONFIG` does above. Escape literal braces as `\{` `\}`. No other placeholders exist; this is not shell interpolation.
-- **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System` and `/Library` on macOS, `/usr/bin`, `/bin`, `/lib*` on Linux). Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
+- **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System` and `/Library` on macOS, `/usr/bin`, `/bin`, `/lib*` on Linux) — except `/dev/null`, which is also writable, so `2>/dev/null` works. Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
 
 ## Command reference
 

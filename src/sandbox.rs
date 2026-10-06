@@ -3344,7 +3344,12 @@ pub mod linux {
             let Ok(path_fd) = PathFd::new(path) else {
                 continue;
             };
-            let access = read_access_for_path(std::path::Path::new(path), abi);
+            let mut access = read_access_for_path(std::path::Path::new(path), abi);
+            // Shells open /dev/null for writing on every `2>/dev/null`; the
+            // macOS baseline grants the same.
+            if *path == "/dev/null" {
+                access |= AccessFs::WriteFile;
+            }
             ruleset = ruleset
                 .add_rule(PathBeneath::new(path_fd, access))
                 .map_err(to_profile_err)?;
@@ -3638,6 +3643,37 @@ pub mod linux {
 
         // ── Runtime base: Landlock has no carve-out, so nothing grants it ────
 
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_profile_can_redirect_to_dev_null() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = LinuxLandlock
+                .build(&ToolPolicy {
+                    network: NetworkAccess::None,
+                    ..Default::default()
+                })
+                .expect("tool profile should build");
+            let mut env = std::collections::HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            let request = crate::exec::ExecRequest {
+                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                args: vec![
+                    "-c".to_string(),
+                    "echo hidden >/dev/null 2>/dev/null".to_string(),
+                ],
+                work_dir: std::fs::canonicalize(tmp.path()).unwrap(),
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            let status = spawned.child.wait().await.expect("wait should succeed");
+            assert!(
+                status.success(),
+                "redirecting to /dev/null failed: {status:?}"
+            );
+        }
+
         #[test]
         fn landlock_baseline_never_grants_tmp_or_run_user() {
             // The runtime base lives under /run/user/<uid> or /tmp (see
@@ -3742,8 +3778,7 @@ pub mod linux {
             // A correctly isolated sandbox exits 0.
             // The write probe runs in a subshell: a failed redirection on the
             // `:` special builtin ends a POSIX shell, which would read as a
-            // probe result. Output goes to `work`, since the Landlock baseline
-            // grants /dev/null for reading only.
+            // probe result.
             let probe_script = format!(
                 r#"
                 code=0
