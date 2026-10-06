@@ -1,17 +1,15 @@
 //! Configuration discovery, parsing, and validation for Airlock.
 //!
 //! This module is responsible for:
-//! - Discovering `airlock.toml` by walking from a starting directory up to `$HOME`
 //! - Verifying config file ownership against the current effective uid
 //! - Parsing the TOML config into strongly-typed structures
 //! - Resolving paths (tilde expansion, relative-to-sandbox-root resolution)
-//! - Deriving socket and PID file paths from the sandbox root
 //! - Validating tool names (no path separators)
-//! - Providing a lightweight socket-path-only discovery for client use
 //!
-//! This module is consumed by nearly every other module: the daemon needs the
-//! full parsed config, the client needs the socket path, and commands like
-//! `status` and `stop` need the PID file path.
+//! Discovery itself — walking from a directory up to `$HOME`, merging the
+//! global/repo/local layers — is [`crate::layers`]; this module resolves the
+//! merged, normalized wire form ([`resolve_wire_config`]) the daemon
+//! actually runs against.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -41,19 +39,6 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 
 /// Default timeout in seconds for `source = "command"` secret fetching.
 const DEFAULT_COMMAND_SECRET_TIMEOUT_SECS: u64 = 10;
-
-/// Socket filename derived from the sandbox root.
-const SOCKET_FILENAME: &str = "airlock.sock";
-
-/// PID file filename derived from the sandbox root.
-const PID_FILENAME: &str = "airlock.pid";
-
-/// Filename of the proxy CA certificate, derived from the sandbox root.
-///
-/// It lives beside the socket and the PID file so it falls inside the
-/// sandbox root every tool can already read. Only the certificate is written;
-/// the key never leaves the daemon's memory.
-const CA_CERT_FILENAME: &str = "airlock-ca.pem";
 
 // ─── Error type ───────────────────────────────────────────────────────────────
 
@@ -739,21 +724,11 @@ fn is_false(b: &bool) -> bool {
 /// A fully parsed and validated Airlock configuration.
 ///
 /// All paths have been resolved (tilde expanded, relative paths resolved
-/// against the sandbox root). Derived paths (socket, PID file) are included.
+/// against the sandbox root).
 #[derive(Debug)]
 pub struct Config {
     /// The canonicalized directory containing the discovered `airlock.toml`.
     pub sandbox_root: PathBuf,
-
-    /// Path to the Unix domain socket: `{sandbox_root}/airlock.sock`.
-    pub socket_path: PathBuf,
-
-    /// Path to the PID file: `{sandbox_root}/airlock.pid`.
-    pub pid_path: PathBuf,
-
-    /// Path to the proxy CA certificate: `{sandbox_root}/airlock-ca.pem`.
-    /// Written only when at least one tool declares `proxy = true`.
-    pub ca_path: PathBuf,
 
     /// Global timeout for tool execution.
     pub timeout: Duration,
@@ -891,33 +866,6 @@ pub struct AgentConfig {
     pub filesystem_write: Vec<PathBuf>,
 }
 
-/// Lightweight discovery result containing only derived paths.
-///
-/// Used by the client and management commands that need to locate the socket
-/// or PID file without parsing the full config.
-#[derive(Debug)]
-pub struct DiscoveredPaths {
-    /// The canonicalized sandbox root directory.
-    pub sandbox_root: PathBuf,
-
-    /// Path to the Unix domain socket.
-    pub socket_path: PathBuf,
-
-    /// Path to the PID file.
-    pub pid_path: PathBuf,
-
-    /// Path to the proxy CA certificate.
-    pub ca_path: PathBuf,
-}
-
-impl Config {
-    /// Every file the daemon creates, for cleanup at shutdown or after a
-    /// crash. Kept in step with [`DiscoveredPaths::runtime_files`].
-    pub fn runtime_files(&self) -> [&Path; 3] {
-        [&self.pid_path, &self.socket_path, &self.ca_path]
-    }
-}
-
 /// Every path this config grants write access to: `filesystem.write`, every
 /// tool's `extra_write` (which already includes its `{tool_state}` dir, if
 /// any), and `agent.filesystem.write`.
@@ -938,13 +886,6 @@ pub fn write_grants(config: &Config) -> Vec<PathBuf> {
     grants
 }
 
-impl DiscoveredPaths {
-    /// Every file a running daemon creates, for cleanup after it has gone.
-    pub fn runtime_files(&self) -> [&Path; 3] {
-        [&self.pid_path, &self.socket_path, &self.ca_path]
-    }
-}
-
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
 /// Get the current effective uid of the process.
@@ -952,23 +893,6 @@ pub(crate) fn current_euid() -> u32 {
     // SAFETY: geteuid(2) is always safe — it reads a process attribute
     // without modifying any state.
     unsafe { libc::geteuid() }
-}
-
-/// Check whether `path` is the user's home directory, comparing canonicalized
-/// forms so symlinked home directories (`/home/foo` → `/mnt/home/foo`) are
-/// still detected.
-///
-/// Returns `Err(HomeNotSet)` if the `HOME` environment variable is unset.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
-)]
-pub(crate) fn is_home_directory(path: &Path) -> Result<bool, ConfigError> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-    let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
-    Ok(path == home_canonical)
 }
 
 /// Check whether the file at `path` is a regular file owned by `expected_uid`,
@@ -1075,95 +999,15 @@ pub(crate) fn read_config_securely(path: &Path, expected_uid: u32) -> Result<Str
     Ok(buf)
 }
 
-/// Walk from `start_dir` upward to `$HOME` (inclusive), looking for a valid
-/// `airlock.toml` owned by the current effective uid.
-///
-/// Returns the path to the discovered config file and its canonicalized
-/// parent directory (the sandbox root).
-///
-/// The starting directory is typically the process's current working directory,
-/// but accepting it as a parameter makes the function testable.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
-)]
-fn discover_config_file(start_dir: &Path) -> Result<(PathBuf, PathBuf), ConfigError> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-
-    let euid = current_euid();
-
-    // Canonicalize `start_dir` and `home` for reliable prefix comparison.
-    // If canonicalization fails for the start dir, fall back to the original path.
-    let start_canonical =
-        std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
-    let home_canonical = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
-
-    let mut current = start_canonical.clone();
-
-    loop {
-        let candidate = current.join(CONFIG_FILENAME);
-
-        // `is_owned_by` opens with O_NOFOLLOW and fstats the fd, so it
-        // implicitly handles missing files, symlinks, and non-regular files
-        // (returning false for any of them). No separate `is_file()` check is
-        // needed — it would only follow symlinks and widen the attack surface.
-        if is_owned_by(&candidate, euid) {
-            // Canonicalize the parent directory to get the sandbox root.
-            let sandbox_root = std::fs::canonicalize(&current).map_err(|e| {
-                ConfigError::CanonicalizationError {
-                    path: current.clone(),
-                    source: e,
-                }
-            })?;
-            return Ok((candidate, sandbox_root));
-        }
-
-        // Check if we've reached $HOME — stop here (inclusive: we already checked it).
-        if current == home_canonical {
-            break;
-        }
-
-        // Move to the parent directory.
-        match current.parent() {
-            Some(parent) => {
-                // If the parent is the same as current, we've hit the root.
-                if parent == current {
-                    break;
-                }
-                current = parent.to_path_buf();
-            }
-            None => break,
-        }
-    }
-
-    Err(ConfigError::NotFound {
-        start_dir: start_dir.to_path_buf(),
-        home_dir: home,
-    })
-}
-
 // ─── Path resolution ──────────────────────────────────────────────────────────
 
 /// Resolve a path string according to Airlock path resolution rules:
-/// - Tilde (`~`) at the start is expanded to `$HOME`
-/// - Relative paths are resolved relative to the sandbox root
+/// - Tilde (`~`) at the start is expanded to `home`
+/// - Relative paths are resolved relative to `sandbox_root`
 /// - Absolute paths are left unchanged
-#[allow(
-    clippy::disallowed_methods,
-    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
-)]
-pub(crate) fn resolve_path(raw: &str, sandbox_root: &Path) -> Result<PathBuf, ConfigError> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-    Ok(resolve_path_with_home(raw, sandbox_root, &home))
-}
-
-/// Same as [`resolve_path`], but takes `home` explicitly instead of reading
-/// `$HOME` — used by [`crate::layers`], which must not read the process
-/// environment itself.
+///
+/// Takes `home` explicitly rather than reading `$HOME` itself — used by
+/// [`crate::layers`], which must not read the process environment.
 pub(crate) fn resolve_path_with_home(raw: &str, sandbox_root: &Path, home: &Path) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
         home.join(rest)
@@ -1180,19 +1024,7 @@ pub(crate) fn resolve_path_with_home(raw: &str, sandbox_root: &Path, home: &Path
     }
 }
 
-/// Resolve a list of path strings.
-pub(crate) fn resolve_paths(
-    raw_paths: &[String],
-    sandbox_root: &Path,
-) -> Result<Vec<PathBuf>, ConfigError> {
-    raw_paths
-        .iter()
-        .map(|p| resolve_path(p, sandbox_root))
-        .collect()
-}
-
-/// Same as [`resolve_paths`], but takes `home` explicitly — used by
-/// [`crate::layers`].
+/// Resolve a list of path strings — used by [`crate::layers`].
 pub(crate) fn resolve_paths_with_home(
     raw_paths: &[String],
     sandbox_root: &Path,
@@ -1474,264 +1306,6 @@ pub(crate) fn resolve_proxy_policy(
     Ok(Some(ProxyPolicy { routes }))
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/// Parse and resolve a raw TOML config string into a fully validated [`Config`].
-///
-/// This is the shared resolution core called by both [`load_config`] (which
-/// discovers the file) and [`load_config_from_file`] (explicit path). All
-/// validation — home-root guard, tool names, secret refs, env var names,
-/// path resolution — is performed here.
-fn parse_and_resolve_config(
-    contents: &str,
-    config_path: &Path,
-    sandbox_root: PathBuf,
-) -> Result<Config, ConfigError> {
-    let raw: RawConfig = toml::from_str(contents).map_err(|e| ConfigError::ParseError {
-        path: config_path.to_path_buf(),
-        source: e,
-    })?;
-
-    // Refuse to use $HOME as the sandbox root unless the config explicitly
-    // opts in. A lone `airlock.toml` in the home directory would otherwise
-    // silently expose the whole home directory to sandboxed tools.
-    if is_home_directory(&sandbox_root)? && raw.allow_home_root != Some(true) {
-        return Err(ConfigError::HomeRootNotAllowed { home: sandbox_root });
-    }
-
-    // Resolve global timeout.
-    let timeout = Duration::from_secs(raw.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
-
-    // Resolve filesystem paths.
-    let (filesystem_read, filesystem_write) = match raw.filesystem {
-        Some(fs) => (
-            resolve_paths(&fs.read, &sandbox_root)?,
-            resolve_paths(&fs.write, &sandbox_root)?,
-        ),
-        None => (Vec::new(), Vec::new()),
-    };
-
-    // Resolve [secrets] entries first so tool and agent env entries can be
-    // validated against them in the same pass. There is no layering here —
-    // a single file, parsed and used on its own — so every label must bind
-    // to a concrete source: nothing can fill in `from = "global"` or an
-    // absent source later.
-    let raw_secrets = raw.secrets.unwrap_or_default();
-    let mut secrets: HashMap<String, SecretSpec> = HashMap::with_capacity(raw_secrets.len());
-    for (label, spec) in raw_secrets {
-        if spec.source.is_none() {
-            return Err(ConfigError::SecretMissingSource { label });
-        }
-        let source = resolve_bound_secret_source(&label, &spec)?;
-        secrets.insert(label.clone(), SecretSpec { label, source });
-    }
-
-    // {tool_state} needs a project id and a base directory. The legacy
-    // single-file loaders have no launcher-supplied anchors to draw on, so
-    // they derive both the same way a `--no-project-config` run would: the
-    // id from this file's own sandbox root, the base from
-    // $XDG_CACHE_HOME/airlock (default ~/.cache/airlock).
-    let project_id = project_id(&sandbox_root);
-    let tool_state_base = default_tool_state_base()?;
-    let mut tool_state_dirs: Vec<PathBuf> = Vec::new();
-
-    // Validate and resolve tool definitions. Env var names and secret
-    // references are validated in a batched pass so the operator sees every
-    // problem in one error message. The location key in each undeclared-ref
-    // tuple is `"tools.<name>"` for per-tool entries (see also the agent pass
-    // below, which uses `"agent"`).
-    let raw_tools = raw.tools.unwrap_or_default();
-    let mut tools = HashMap::with_capacity(raw_tools.len());
-    let mut undeclared_refs: Vec<(String, String, String)> = Vec::new();
-
-    for (name, raw_tool) in raw_tools {
-        validate_tool_name(&name)?;
-
-        let mut env: BTreeMap<String, EnvValue> = BTreeMap::new();
-        // Collected separately from raw_tool.extra_write so a tool can use
-        // {tool_state} in its env without also listing the same directory
-        // under extra_write by hand.
-        let mut tool_extra_write: Vec<PathBuf> = Vec::new();
-        if let Some(raw_env) = raw_tool.env {
-            for (var_name, raw_value) in raw_env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: name.clone(),
-                        name: var_name,
-                    });
-                }
-                if raw_tool.proxy && crate::proxy::is_reserved_env_var(&var_name) {
-                    return Err(ConfigError::ProxyReservedEnvVar {
-                        tool: name.clone(),
-                        var_name,
-                    });
-                }
-                let value = match raw_value {
-                    RawEnvValue::Static(s) => {
-                        let tool_state_dir = if uses_tool_state_placeholder(&s) {
-                            Some(resolve_tool_state_path(
-                                &tool_state_base,
-                                &project_id,
-                                &name,
-                            ))
-                        } else {
-                            None
-                        };
-                        let rendered = render_env_template(
-                            &s,
-                            &sandbox_root,
-                            tool_state_dir.as_deref(),
-                            &name,
-                            &var_name,
-                        )?;
-                        if let Some(dir) = tool_state_dir {
-                            tool_extra_write.push(dir.clone());
-                            tool_state_dirs.push(dir);
-                        }
-                        EnvValue::Static(rendered)
-                    }
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if raw_tool.proxy {
-                            return Err(ConfigError::ProxyToolSecretEnv {
-                                tool: name.clone(),
-                                var_name,
-                            });
-                        }
-                        if !secrets.contains_key(&secret) {
-                            // Location key includes the "tools." prefix so the
-                            // error message formats as [tools.<name>.env.<var>].
-                            undeclared_refs.push((
-                                format!("tools.{name}"),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                env.insert(var_name, value);
-            }
-        }
-
-        let proxy = resolve_proxy_policy(&name, raw_tool.proxy, raw_tool.routes, &secrets)?;
-
-        let mut extra_write = resolve_paths(&raw_tool.extra_write, &sandbox_root)?;
-        extra_write.extend(tool_extra_write);
-
-        let tool_config = ToolConfig {
-            env,
-            extra_read: resolve_paths(&raw_tool.extra_read, &sandbox_root)?,
-            extra_write,
-            timeout: raw_tool.timeout.map(Duration::from_secs),
-            description: raw_tool.description,
-            proxy,
-        };
-
-        tools.insert(name, tool_config);
-    }
-
-    // Resolve the [agent] section when present.
-    let agent = match raw.agent {
-        None => None,
-        Some(raw_agent) => {
-            let agent_timeout = Duration::from_secs(raw_agent.timeout.unwrap_or(0));
-
-            let mut agent_env: BTreeMap<String, EnvValue> = BTreeMap::new();
-            for (var_name, raw_value) in raw_agent.env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: "agent".to_string(),
-                        name: var_name,
-                    });
-                }
-                let value = match raw_value {
-                    RawEnvValue::Static(s) => EnvValue::Static(render_env_template(
-                        &s,
-                        &sandbox_root,
-                        None,
-                        "agent",
-                        &var_name,
-                    )?),
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if !secrets.contains_key(&secret) {
-                            // Location key is "agent" so the error message
-                            // formats as [agent.env.<var>].
-                            undeclared_refs.push((
-                                "agent".to_string(),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                agent_env.insert(var_name, value);
-            }
-
-            let (agent_fs_read, agent_fs_write) = match raw_agent.filesystem {
-                Some(fs) => (
-                    resolve_paths(&fs.read, &sandbox_root)?,
-                    resolve_paths(&fs.write, &sandbox_root)?,
-                ),
-                None => (Vec::new(), Vec::new()),
-            };
-
-            Some(AgentConfig {
-                timeout: agent_timeout,
-                passthrough_env: raw_agent.passthrough_env,
-                env: agent_env,
-                filesystem_read: agent_fs_read,
-                filesystem_write: agent_fs_write,
-            })
-        }
-    };
-
-    if !undeclared_refs.is_empty() {
-        return Err(ConfigError::UndeclaredSecretRefs {
-            refs: undeclared_refs,
-        });
-    }
-
-    // Derive socket, PID and CA certificate paths.
-    let socket_path = sandbox_root.join(SOCKET_FILENAME);
-    let pid_path = sandbox_root.join(PID_FILENAME);
-    let ca_path = sandbox_root.join(CA_CERT_FILENAME);
-
-    Ok(Config {
-        sandbox_root,
-        socket_path,
-        pid_path,
-        ca_path,
-        timeout,
-        filesystem_read,
-        filesystem_write,
-        secrets,
-        tools,
-        agent,
-        tool_state_dirs,
-    })
-}
-
-/// `$XDG_CACHE_HOME/airlock` (default `~/.cache/airlock`). Only the legacy
-/// single-file loaders use this directly — once a launcher is in the
-/// picture, it resolves the tool-state base from the real anchors and
-/// passes the literal path down.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
-)]
-fn default_tool_state_base() -> Result<PathBuf, ConfigError> {
-    if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
-        && !xdg.is_empty()
-    {
-        return Ok(PathBuf::from(xdg).join("airlock"));
-    }
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-    Ok(home.join(".cache").join("airlock"))
-}
-
 /// Resolve a `[secrets.<label>]` entry's own `source` into a [`SecretSource`].
 ///
 /// Assumes `spec.source` is `Some` — callers that allow an absent source
@@ -1954,15 +1528,8 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
         });
     }
 
-    let socket_path = sandbox_root.join(SOCKET_FILENAME);
-    let pid_path = sandbox_root.join(PID_FILENAME);
-    let ca_path = sandbox_root.join(CA_CERT_FILENAME);
-
     Ok(Config {
         sandbox_root,
-        socket_path,
-        pid_path,
-        ca_path,
         timeout,
         filesystem_read,
         filesystem_write,
@@ -1972,148 +1539,6 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
         // The launcher already created every {tool_state} dir before
         // normalizing paths into this wire form; nothing left to create.
         tool_state_dirs: Vec::new(),
-    })
-}
-
-/// Discover and parse the Airlock configuration.
-///
-/// Walks from `start_dir` upward to `$HOME` looking for a valid `airlock.toml`
-/// owned by the current effective uid. The first valid file found is parsed
-/// and returned as a fully resolved [`Config`].
-///
-/// # Arguments
-///
-/// * `start_dir` — The directory to start searching from (typically `std::env::current_dir()`).
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if:
-/// - No valid config file is found between `start_dir` and `$HOME`
-/// - `$HOME` is not set
-/// - The config file cannot be read or parsed
-/// - A tool name contains a path separator
-pub fn load_config(start_dir: &Path) -> Result<Config, ConfigError> {
-    let (config_path, sandbox_root) = discover_config_file(start_dir)?;
-
-    // Re-open the config via O_NOFOLLOW + fstat to close the TOCTOU window
-    // between discovery and read. An attacker who cannot modify the containing
-    // directory cannot swap the file between the walk's ownership check and
-    // this read — but if they can, the re-check here will catch a UID change.
-    let contents = read_config_securely(&config_path, current_euid())?;
-
-    parse_and_resolve_config(&contents, &config_path, sandbox_root)
-}
-
-/// Load and fully validate a config from an explicitly supplied path.
-///
-/// Unlike [`load_config`], this function skips the directory walk and uses the
-/// given `path` directly. It applies the same `O_NOFOLLOW` + `fstat` ownership
-/// check as the discovery path. The sandbox root is the canonicalized parent
-/// directory of `path`.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if:
-/// - The file does not exist or cannot be opened
-/// - The file is not owned by the current effective uid
-/// - `$HOME` is not set (needed for tilde expansion and home-root guard)
-/// - The config file cannot be parsed or fails validation
-pub fn load_config_from_file(path: &Path) -> Result<Config, ConfigError> {
-    // Canonicalize the parent directory to derive sandbox_root before reading
-    // the file, so that path resolution in parse_and_resolve_config is correct.
-    let parent = path.parent().ok_or_else(|| ConfigError::ReadError {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no parent directory",
-        ),
-    })?;
-
-    let sandbox_root =
-        std::fs::canonicalize(parent).map_err(|e| ConfigError::CanonicalizationError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-
-    // read_config_securely opens with O_NOFOLLOW and checks the file's uid via
-    // fstat, providing the same TOCTOU-resistant ownership guarantee as the
-    // discovery path. Missing files surface as ReadError(NotFound); files owned
-    // by a different uid surface as ReadError(PermissionDenied).
-    let contents = read_config_securely(path, current_euid())?;
-
-    parse_and_resolve_config(&contents, path, sandbox_root)
-}
-
-/// Discover the socket and PID file paths without parsing the config file.
-///
-/// This is a lightweight alternative to [`load_config`] for use by the client
-/// and management commands that only need the socket location. It performs the
-/// same directory walk and ownership check but does not read or parse the file
-/// contents.
-///
-/// # Arguments
-///
-/// * `start_dir` — The directory to start searching from.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if no valid config file is found or `$HOME` is not set.
-pub fn discover_paths(start_dir: &Path) -> Result<DiscoveredPaths, ConfigError> {
-    let (_config_path, sandbox_root) = discover_config_file(start_dir)?;
-
-    Ok(DiscoveredPaths {
-        socket_path: sandbox_root.join(SOCKET_FILENAME),
-        pid_path: sandbox_root.join(PID_FILENAME),
-        ca_path: sandbox_root.join(CA_CERT_FILENAME),
-        sandbox_root,
-    })
-}
-
-/// Return the socket and PID file paths derived from an explicitly supplied
-/// config file path, without parsing the file contents.
-///
-/// This is the explicit-path counterpart of [`discover_paths`]. It applies the
-/// same `O_NOFOLLOW` + `fstat` ownership check as the discovery path but skips
-/// the directory walk, using `path`'s parent as the sandbox root.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if the file does not exist, is not owned by the
-/// current effective uid, or its parent directory cannot be canonicalized.
-pub fn discover_paths_from_file(path: &Path) -> Result<DiscoveredPaths, ConfigError> {
-    let euid = current_euid();
-
-    // Ownership check: opens with O_NOFOLLOW and fstats the fd — the same
-    // TOCTOU-resistant method used during directory-walk discovery.
-    if !is_owned_by(path, euid) {
-        return Err(ConfigError::ReadError {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "config file not found or not owned by current user",
-            ),
-        });
-    }
-
-    let parent = path.parent().ok_or_else(|| ConfigError::ReadError {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no parent directory",
-        ),
-    })?;
-
-    let sandbox_root =
-        std::fs::canonicalize(parent).map_err(|e| ConfigError::CanonicalizationError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-
-    Ok(DiscoveredPaths {
-        socket_path: sandbox_root.join(SOCKET_FILENAME),
-        pid_path: sandbox_root.join(PID_FILENAME),
-        ca_path: sandbox_root.join(CA_CERT_FILENAME),
-        sandbox_root,
     })
 }
 
@@ -2318,15 +1743,16 @@ mod tests {
         fs::write(dir.join(CONFIG_FILENAME), content).expect("failed to write config");
     }
 
+    /// Create an `airlock.local.toml` — the one layer besides global that
+    /// may set `allow_home_root` (v2: it is a config error in the repo
+    /// layer, see [`ConfigError::AllowHomeRootInRepo`]).
+    fn write_local_config(dir: &Path, content: &str) {
+        fs::write(dir.join(LOCAL_CONFIG_FILENAME), content).expect("failed to write local config");
+    }
+
     /// Minimal valid config with one tool and one secret.
-    ///
-    /// Includes `allow_home_root = true` because many tests set `HOME` to the
-    /// tempdir where the config lives; without the opt-in, `load_config` would
-    /// refuse to use `$HOME` as the sandbox root.
     fn minimal_config() -> &'static str {
         r#"
-allow_home_root = true
-
 [secrets.my_secret]
 source = "env"
 from = "MY_SECRET"
@@ -2340,7 +1766,6 @@ MY_SECRET = { secret = "my_secret" }
     fn full_config() -> &'static str {
         r#"
 timeout = 120
-allow_home_root = true
 
 [filesystem]
 read = ["/usr/share", "~/docs"]
@@ -2381,170 +1806,61 @@ passthrough_env = ["TERM"]
 "#
     }
 
-    // ── Discovery: finds config in starting directory ────────────────────
+    // ── v1→v2 test shim ───────────────────────────────────────────────────
+    //
+    // The rest of this suite was written against the v1 loaders
+    // (`load_config`, `load_config_from_file`), deleted along with the
+    // single-file discovery they drove — the daemon now only ever resolves
+    // the already-merged wire config (`resolve_wire_config`), and discovery
+    // itself lives in `layers::load_layers`/`merge`. Rather than rewrite
+    // every call site, these two functions run the real v2 pipeline
+    // (`load_layers` → `merge` → `to_wire` → `resolve_wire_config`) against
+    // the single file `write_config` wrote, so every existing assertion
+    // below still exercises genuine, current code.
 
-    #[test]
-    fn discovery_finds_config_in_start_dir() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Set HOME to the temp dir so the walk doesn't escape.
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, sandbox_root) = discover_config_file(tmp.path()).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
-        assert_eq!(
-            sandbox_root, canonical_tmp,
-            "sandbox root should be the canonicalized parent of the config file"
-        );
+    fn resolve_through_v2_pipeline(
+        mode: &crate::layers::DiscoveryMode,
+        cwd: &Path,
+        home: &Path,
+    ) -> Result<Config, ConfigError> {
+        let no_global = home.join("no-such-global.toml");
+        let loaded = crate::layers::load_layers(mode, cwd, home, &no_global)?;
+        let ctx = crate::layers::MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: home.join(".cache/airlock"),
+        };
+        let merged = crate::layers::merge(&loaded, &ctx)?;
+        resolve_wire_config(merged.to_wire(), &loaded.root)
     }
 
-    // ── Discovery: finds config in parent directory ──────────────────────
-
-    #[test]
-    fn discovery_finds_config_in_parent() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Create a child directory with no config.
-        let child = tmp.path().join("subdir");
-        fs::create_dir(&child).unwrap();
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&child).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
+    /// A `$HOME` that is never equal to a test's project directory, so the
+    /// home-root guard (`ctx.root == home`) never fires for a test that
+    /// isn't specifically exercising it — none of these tests' configs set
+    /// `allow_home_root`, which v2 refuses in the repo layer anyway.
+    fn decoy_home() -> &'static Path {
+        Path::new("/no/such/home")
     }
 
-    // ── Discovery: walks upward through multiple levels ──────────────────
-
-    #[test]
-    fn discovery_walks_through_multiple_levels() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Create nested subdirectories.
-        let deep = tmp.path().join("a").join("b").join("c");
-        fs::create_dir_all(&deep).unwrap();
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&deep).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
+    /// Replaces v1's `load_config(dir)`.
+    fn load_config(dir: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(&crate::layers::DiscoveryMode::Default, dir, decoy_home())
     }
 
-    // ── Discovery: stops at $HOME ────────────────────────────────────────
-
-    #[test]
-    fn discovery_stops_at_home() {
-        let tmp = tempdir().unwrap();
-
-        // Create structure: tmp/home_dir/subdir
-        // Put config ABOVE home_dir (at tmp level), but set HOME to home_dir.
-        let home_dir = tmp.path().join("home_dir");
-        let subdir = home_dir.join("subdir");
-        fs::create_dir_all(&subdir).unwrap();
-
-        // Put config at tmp level (above HOME).
-        write_config(tmp.path(), minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", home_dir.to_str().unwrap());
-
-        let result = discover_config_file(&subdir);
-        assert!(
-            result.is_err(),
-            "discovery should not find config above $HOME"
-        );
-        assert!(
-            matches!(result.unwrap_err(), ConfigError::NotFound { .. }),
-            "should return NotFound error"
-        );
+    /// Like [`load_config`], but `$HOME` is given explicitly — for the
+    /// home-root guard's own tests, which need `cwd`/`home` to actually
+    /// match (or not) on request.
+    fn load_config_at(cwd: &Path, home: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(&crate::layers::DiscoveryMode::Default, cwd, home)
     }
 
-    // ── Discovery: error when no config found ────────────────────────────
-
-    #[test]
-    fn discovery_error_when_no_config() {
-        let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let result = discover_config_file(tmp.path());
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::NotFound { .. }));
-    }
-
-    // ── Discovery: skips file owned by different uid ─────────────────────
-
-    #[test]
-    fn discovery_skips_file_with_different_owner() {
-        // We can't easily change file ownership without root privileges.
-        // Instead, we test that the `is_owned_by` function works correctly
-        // with our own uid, and that the discovery logic flows correctly.
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        let euid = current_euid();
-        let config_path = tmp.path().join(CONFIG_FILENAME);
-
-        // Our file should be owned by us.
-        assert!(
-            is_owned_by(&config_path, euid),
-            "file should be owned by current euid"
-        );
-
-        // A non-existent uid should not match.
-        assert!(
-            !is_owned_by(&config_path, euid.wrapping_add(1)),
-            "file should not be owned by a different uid"
-        );
-    }
-
-    // ── Discovery: accepts file owned by current euid ────────────────────
-
-    #[test]
-    fn discovery_accepts_file_owned_by_current_euid() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        // The file we just created should be owned by us.
-        let result = discover_config_file(tmp.path());
-        assert!(result.is_ok(), "should accept config owned by current euid");
-    }
-
-    // ── Discovery: closest config wins ───────────────────────────────────
-
-    #[test]
-    fn discovery_closest_config_wins() {
-        let tmp = tempdir().unwrap();
-
-        // Config in parent.
-        write_config(
-            tmp.path(),
-            r#"
-timeout = 999
-
-[tools.parent_tool]
-"#,
-        );
-
-        // Config in child (closer to start).
-        let child = tmp.path().join("project");
-        fs::create_dir(&child).unwrap();
-        write_config(&child, minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_child = std::fs::canonicalize(&child).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&child).unwrap();
-        assert_eq!(
-            config_path,
-            canonical_child.join(CONFIG_FILENAME),
-            "closest config file should win"
-        );
+    /// Replaces v1's `load_config_from_file(path)`.
+    fn load_config_from_file(path: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(
+            &crate::layers::DiscoveryMode::ConfigFile(path.to_path_buf()),
+            decoy_home(),
+            decoy_home(),
+        )
     }
 
     // ── Parsing: minimal valid config ────────────────────────────────────
@@ -2585,10 +1901,10 @@ timeout = 999
     #[test]
     fn parse_full_config() {
         let tmp = tempdir().unwrap();
+        let home = tempdir().unwrap();
         write_config(tmp.path(), full_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let config = load_config(tmp.path()).unwrap();
+        let config = load_config_at(tmp.path(), home.path()).unwrap();
 
         // Global timeout.
         assert_eq!(config.timeout, Duration::from_secs(120));
@@ -2600,10 +1916,8 @@ timeout = 999
                 .filesystem_read
                 .contains(&PathBuf::from("/usr/share"))
         );
-        // ~/docs should be expanded to {tmp_path}/docs (HOME was set to tmp_path).
-        // Use tmp.path() directly rather than re-reading HOME to avoid races
-        // with concurrent tests that also modify the HOME env var.
-        let expected_home_docs = tmp.path().join("docs");
+        // ~/docs should be expanded to {home}/docs.
+        let expected_home_docs = home.path().join("docs");
         assert!(
             config.filesystem_read.contains(&expected_home_docs),
             "filesystem_read should contain expanded ~/docs = {:?}, got {:?}",
@@ -2667,7 +1981,6 @@ timeout = 999
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.mytool]
 
@@ -2696,7 +2009,6 @@ passthrough_env = ["TERM", "COLORTERM"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.mytool]
 
@@ -2721,7 +2033,6 @@ relaxed = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.one]
 source = "env"
@@ -2756,7 +2067,6 @@ ONE = { secret = "one" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools]
 "#,
@@ -2804,7 +2114,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 future_field = "hello"
 
 [secrets.s]
@@ -2829,9 +2138,8 @@ S = { secret = "s" }
     #[test]
     fn path_tilde_expansion() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let resolved = resolve_path("~/documents", tmp.path()).unwrap();
+        let resolved = resolve_path_with_home("~/documents", tmp.path(), tmp.path());
         let expected = PathBuf::from(format!("{}/documents", tmp.path().display()));
         assert_eq!(resolved, expected);
     }
@@ -2839,9 +2147,8 @@ S = { secret = "s" }
     #[test]
     fn path_tilde_only() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let resolved = resolve_path("~", tmp.path()).unwrap();
+        let resolved = resolve_path_with_home("~", tmp.path(), tmp.path());
         assert_eq!(resolved, tmp.path().to_path_buf());
     }
 
@@ -2850,8 +2157,8 @@ S = { secret = "s" }
     #[test]
     fn path_relative_resolved_against_sandbox_root() {
         let sandbox = PathBuf::from("/fake/sandbox/root");
-        // HOME isn't needed for relative path resolution.
-        let resolved = resolve_path("data/input", &sandbox).unwrap();
+        let home = PathBuf::from("/fake/home");
+        let resolved = resolve_path_with_home("data/input", &sandbox, &home);
         assert_eq!(resolved, PathBuf::from("/fake/sandbox/root/data/input"));
     }
 
@@ -2860,7 +2167,8 @@ S = { secret = "s" }
     #[test]
     fn path_absolute_unchanged() {
         let sandbox = PathBuf::from("/fake/sandbox/root");
-        let resolved = resolve_path("/usr/bin/tool", &sandbox).unwrap();
+        let home = PathBuf::from("/fake/home");
+        let resolved = resolve_path_with_home("/usr/bin/tool", &sandbox, &home);
         assert_eq!(resolved, PathBuf::from("/usr/bin/tool"));
     }
 
@@ -2877,38 +2185,6 @@ S = { secret = "s" }
         assert_eq!(
             config.sandbox_root, canonical,
             "sandbox root should be the canonicalized directory containing airlock.toml"
-        );
-    }
-
-    // ── Derived paths: socket path ───────────────────────────────────────
-
-    #[test]
-    fn socket_path_derived_correctly() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config = load_config(tmp.path()).unwrap();
-        assert_eq!(
-            config.socket_path,
-            config.sandbox_root.join("airlock.sock"),
-            "socket path should be {{sandbox_root}}/airlock.sock"
-        );
-    }
-
-    // ── Derived paths: PID file path ─────────────────────────────────────
-
-    #[test]
-    fn pid_path_derived_correctly() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config = load_config(tmp.path()).unwrap();
-        assert_eq!(
-            config.pid_path,
-            config.sandbox_root.join("airlock.pid"),
-            "PID file path should be {{sandbox_root}}/airlock.pid"
         );
     }
 
@@ -2953,7 +2229,6 @@ S = { secret = "s" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools."bad/name"]
 "#,
@@ -2974,7 +2249,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools."bad\\name"]
 "#,
@@ -2994,16 +2268,15 @@ allow_home_root = true
     #[test]
     fn load_refuses_home_root_without_opt_in() {
         let tmp = tempdir().unwrap();
-        // Config without allow_home_root.
+        // Config without allow_home_root anywhere.
         write_config(
             tmp.path(),
             r#"
 [tools.mytool]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let result = load_config(tmp.path());
+        let result = load_config_at(tmp.path(), tmp.path());
         match result {
             Err(ConfigError::HomeRootNotAllowed { .. }) => {}
             other => panic!("expected HomeRootNotAllowed, got: {other:?}"),
@@ -3013,11 +2286,13 @@ allow_home_root = true
     #[test]
     fn load_accepts_home_root_with_opt_in() {
         let tmp = tempdir().unwrap();
-        // minimal_config() already includes allow_home_root = true.
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        // v2: allow_home_root is a config error in the repo layer — only
+        // the local (or global) layer may opt in.
+        write_local_config(tmp.path(), "allow_home_root = true\n");
 
-        load_config(tmp.path()).expect("allow_home_root=true should permit $HOME as sandbox root");
+        load_config_at(tmp.path(), tmp.path())
+            .expect("allow_home_root=true in the local layer should permit $HOME as sandbox root");
     }
 
     #[test]
@@ -3032,40 +2307,9 @@ allow_home_root = true
 [tools.mytool]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        load_config(&project).expect("non-home sandbox root should load without opt-in");
-    }
-
-    // ── Lightweight discovery: socket path only ──────────────────────────
-
-    #[test]
-    fn discover_paths_finds_socket_path() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let paths = discover_paths(tmp.path()).unwrap();
-        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-
-        assert_eq!(paths.sandbox_root, canonical);
-        assert_eq!(paths.socket_path, canonical.join("airlock.sock"));
-        assert_eq!(paths.pid_path, canonical.join("airlock.pid"));
-    }
-
-    #[test]
-    fn discover_paths_does_not_parse_contents() {
-        let tmp = tempdir().unwrap();
-        // Write invalid TOML — should still succeed since we don't parse.
-        write_config(tmp.path(), "this is not valid toml at all [[[");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let result = discover_paths(tmp.path());
-        assert!(
-            result.is_ok(),
-            "discover_paths should succeed even with invalid TOML contents: {:?}",
-            result.err()
-        );
+        load_config_at(&project, tmp.path())
+            .expect("non-home sandbox root should load without opt-in");
     }
 
     // ── [secrets] + tools.env schema ─────────────────────────────────────
@@ -3077,7 +2321,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.GH_TOKEN]
 source = "env"
@@ -3101,7 +2344,6 @@ GH_TOKEN = { secret = "GH_TOKEN" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.cmd_token]
 source = "command"
@@ -3140,7 +2382,6 @@ TOKEN = { secret = "cmd_token" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.gcp_token]
 source = "command"
@@ -3173,7 +2414,6 @@ TOKEN = { secret = "gcp_token" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3205,7 +2445,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3231,7 +2470,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3257,7 +2495,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3282,7 +2519,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3309,7 +2545,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3341,7 +2576,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -3373,7 +2607,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "env"
@@ -3397,7 +2630,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.api_key]
 source = "env"
@@ -3430,12 +2662,10 @@ REGION = "eu-north-1"
 
     #[test]
     fn reject_undeclared_secret_ref_lists_all() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [secrets.known]
 source = "env"
 from = "KNOWN"
@@ -3447,10 +2677,10 @@ A = { secret = "ghost_a" }
 B = { secret = "ghost_b" }
 KNOWN = { secret = "known" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { refs } => {
                 assert_eq!(refs.len(), 2);
@@ -3470,7 +2700,6 @@ KNOWN = { secret = "known" }
             tmp.path(),
             &format!(
                 r#"
-allow_home_root = true
 
 [secrets.gcp_token]
 source = "env"
@@ -3774,7 +3003,6 @@ alow = ["GET /**"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.bad.env]
 "1LEADING_DIGIT" = "nope"
@@ -3794,7 +3022,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.gh.env]
 GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
@@ -3816,7 +3043,6 @@ GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 BOTH = "{sandbox_root}:{sandbox_root}"
@@ -3839,7 +3065,6 @@ BOTH = "{sandbox_root}:{sandbox_root}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 LIT = "\\{sandbox_root\\}"
@@ -3860,7 +3085,6 @@ LIT = "\\{sandbox_root\\}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 X = "{home}"
@@ -3889,7 +3113,6 @@ X = "{home}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 X = "{sandbox_root"
@@ -3913,7 +3136,6 @@ X = "{sandbox_root"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets."weird{label}"]
 source = "env"
@@ -3938,7 +3160,6 @@ WEIRD = { secret = "weird{label}" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 HOST = "github.com"
@@ -3959,7 +3180,6 @@ HOST = "github.com"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.bad]
 source = "command"
@@ -3978,7 +3198,6 @@ command = []
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.x]
 source = "vault"
@@ -3997,7 +3216,6 @@ address = "https://vault"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.x]
 source = "env"
@@ -4146,7 +3364,6 @@ X = { secret = "x", type = "string" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 "#,
@@ -4185,7 +3402,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 timeout = 0
@@ -4207,7 +3423,6 @@ timeout = 0
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 timeout = 120
@@ -4231,7 +3446,6 @@ timeout = 120
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 passthrough_env = ["COLORTERM", "NO_COLOR"]
@@ -4255,7 +3469,6 @@ passthrough_env = ["COLORTERM", "NO_COLOR"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 LOG_LEVEL = "info"
@@ -4279,7 +3492,6 @@ LOG_LEVEL = "info"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.API_KEY]
 source = "env"
@@ -4303,19 +3515,19 @@ API_KEY = { secret = "API_KEY" }
 
     #[test]
     fn agent_env_undeclared_secret_ref_error() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // v2's layers::merge additionally scope-checks a repo-layer item's
+        // secret refs before resolve_wire_config ever runs — bypass it and
+        // call resolve_wire_config directly, which is what actually owns
+        // the UndeclaredSecretRefs accumulation this test is about.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [agent.env]
 MISSING = { secret = "nonexistent_label" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { ref refs } => {
                 assert_eq!(refs.len(), 1);
@@ -4342,22 +3554,20 @@ MISSING = { secret = "nonexistent_label" }
 
     #[test]
     fn undeclared_refs_accumulates_tool_and_agent() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [tools.mytool.env]
 A = { secret = "tool_ghost" }
 
 [agent.env]
 B = { secret = "agent_ghost" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { refs } => {
                 assert_eq!(refs.len(), 2, "both tool and agent refs should be reported");
@@ -4381,11 +3591,10 @@ B = { secret = "agent_ghost" }
     #[test]
     fn agent_filesystem_paths_resolved() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        let home = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.filesystem]
 read = ["~/projects", "relative/path"]
@@ -4393,11 +3602,11 @@ write = ["/tmp/agent"]
 "#,
         );
 
-        let config = load_config(tmp.path()).unwrap();
+        let config = load_config_at(tmp.path(), home.path()).unwrap();
         let agent = config.agent.unwrap();
 
         // Tilde expansion.
-        let expected_projects = tmp.path().join("projects");
+        let expected_projects = home.path().join("projects");
         assert!(
             agent.filesystem_read.contains(&expected_projects),
             "~/projects should expand to {{HOME}}/projects, got: {:?}",
@@ -4482,36 +3691,6 @@ write = ["/tmp/agent"]
         );
     }
 
-    // ── discover_paths_from_file: derives paths from explicit file ───────
-
-    #[test]
-    fn discover_paths_from_file_returns_correct_paths() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config_path = tmp.path().join(CONFIG_FILENAME);
-        let paths = discover_paths_from_file(&config_path).unwrap();
-
-        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-        assert_eq!(paths.sandbox_root, canonical);
-        assert_eq!(paths.socket_path, canonical.join("airlock.sock"));
-        assert_eq!(paths.pid_path, canonical.join("airlock.pid"));
-    }
-
-    #[test]
-    fn discover_paths_from_file_missing_file_returns_error() {
-        let tmp = tempdir().unwrap();
-        let missing = tmp.path().join("nonexistent.toml");
-
-        let result = discover_paths_from_file(&missing);
-        assert!(result.is_err(), "missing file should return an error");
-        assert!(
-            matches!(result.unwrap_err(), ConfigError::ReadError { .. }),
-            "should return ReadError for missing file"
-        );
-    }
-
     #[test]
     fn discover_paths_from_file_applies_ownership_check() {
         let tmp = tempdir().unwrap();
@@ -4562,7 +3741,6 @@ write = ["/tmp/agent"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "env"
@@ -4602,19 +3780,17 @@ LOG_LEVEL = "debug"
 
     #[test]
     fn undeclared_secret_ref_error_message_format() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [tools.mytool.env]
 A = { secret = "ghost" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         let msg = err.to_string();
         // Error message should show [tools.mytool.env.A] -> "ghost"
         assert!(
@@ -4631,7 +3807,6 @@ A = { secret = "ghost" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 ZEBRA = "z"
@@ -4655,7 +3830,6 @@ MANGO = "m"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 "1INVALID" = "value"
@@ -4678,7 +3852,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 unknown_field = "should fail"
@@ -4723,7 +3896,6 @@ unknown_field = "should fail"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 WORK_DIR = "{sandbox_root}/work"
@@ -4751,7 +3923,6 @@ WORK_DIR = "{sandbox_root}/work"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [filesystem]
 write = ["/tmp/global-write"]
@@ -4786,8 +3957,7 @@ write = ["/tmp/agent-write"]
     #[test]
     fn write_grants_empty_config_is_empty() {
         let tmp = tempdir().unwrap();
-        write_config(tmp.path(), "allow_home_root = true\n");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        write_config(tmp.path(), "");
         let config = load_config(tmp.path()).unwrap();
         assert!(write_grants(&config).is_empty());
     }

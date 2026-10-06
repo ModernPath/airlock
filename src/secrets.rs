@@ -620,9 +620,6 @@ mod tests {
         }
         Config {
             sandbox_root: PathBuf::from("/tmp/test-sandbox"),
-            socket_path: PathBuf::from("/tmp/test-sandbox/airlock.sock"),
-            pid_path: PathBuf::from("/tmp/test-sandbox/airlock.pid"),
-            ca_path: PathBuf::from("/tmp/test-sandbox/airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
@@ -653,9 +650,6 @@ mod tests {
         }
         Config {
             sandbox_root: PathBuf::from("/tmp/test-sandbox"),
-            socket_path: PathBuf::from("/tmp/test-sandbox/airlock.sock"),
-            pid_path: PathBuf::from("/tmp/test-sandbox/airlock.pid"),
-            ca_path: PathBuf::from("/tmp/test-sandbox/airlock-ca.pem"),
             timeout: Duration::from_secs(300),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),

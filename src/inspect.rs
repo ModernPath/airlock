@@ -21,7 +21,7 @@ use crate::layers::{
     SecretProvenance,
 };
 use crate::protocol::{DaemonMode, LayerKind, SessionInfo};
-use crate::trust::{escape_for_terminal as esc, Approval, TrustError, TrustStore};
+use crate::trust::{Approval, TrustError, TrustStore, escape_for_terminal as esc};
 
 // ─── Shared display helpers ─────────────────────────────────────────────────
 
@@ -428,10 +428,7 @@ pub fn render_paths(report: &PathsReport) -> String {
     rows.push(vec!["trust store".to_string(), esc(&report.trust_store)]);
     rows.push(vec!["runtime dir".to_string(), esc(&report.runtime_dir)]);
     rows.push(vec!["socket".to_string(), esc(&report.socket)]);
-    rows.push(vec![
-        "tool state".to_string(),
-        esc(&report.tool_state_base),
-    ]);
+    rows.push(vec!["tool state".to_string(), esc(&report.tool_state_base)]);
     table(&rows)
 }
 
