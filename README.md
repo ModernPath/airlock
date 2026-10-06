@@ -160,7 +160,7 @@ Every later `airlock run` in the project is quiet unless something changed:
 $ airlock run --profile claude
 ```
 
-More configs in [`examples/`](examples/).
+More configs in [`examples/`](examples/). For a scripted, end-to-end tour — config layers, approval, a redacted `exec`, `agent check`, the sandboxed `airlock run` path — run [`examples/demo/demo.sh`](examples/demo/demo.sh).
 
 ## Supplying secrets
 
