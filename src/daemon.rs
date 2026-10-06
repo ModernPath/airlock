@@ -1241,14 +1241,17 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonSta
 
 fn session_error_message(kind: ErrorKind) -> String {
     match kind {
-        ErrorKind::NoSession => "no session with that token".to_string(),
-        ErrorKind::SessionEnded => "the session has ended".to_string(),
-        ErrorKind::SessionExpired => {
-            "the session expired; renew it with `airlock session renew`".to_string()
+        ErrorKind::NoSession | ErrorKind::SessionEnded => {
+            "this session has ended (revoked by the user, or the daemon stopped). \
+             Ask the user to start a new session."
+                .to_string()
         }
-        ErrorKind::OutsideProcessTree => {
-            "this process is not a descendant of the session's owner".to_string()
-        }
+        ErrorKind::SessionExpired => "this session expired. Ask the user to start a new one, \
+             or to renew sessions before they expire with `airlock session renew`."
+            .to_string(),
+        ErrorKind::OutsideProcessTree => "this process was not started from the session's \
+             agent or shell, so it cannot use the session."
+            .to_string(),
         other => format!("{other:?}"),
     }
 }

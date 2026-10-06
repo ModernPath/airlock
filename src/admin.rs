@@ -9,7 +9,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::UnixStream;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -69,6 +69,10 @@ pub struct Hello {
 #[derive(Debug)]
 pub struct Connection {
     reader: BufReader<UnixStream>,
+    socket_path: PathBuf,
+    /// The daemon serves one request per connection, so a second request
+    /// reconnects first.
+    used: bool,
     pub hello: Hello,
 }
 
@@ -108,7 +112,12 @@ impl Connection {
             _ => return Err(AdminError::Malformed),
         };
 
-        Ok(Connection { reader, hello })
+        Ok(Connection {
+            reader,
+            socket_path: socket_path.to_path_buf(),
+            used: false,
+            hello,
+        })
     }
 
     /// Sends an admin-family request authenticated with `token`, and returns
@@ -123,6 +132,10 @@ impl Connection {
         token: &AdminToken,
         body: AdminRequest,
     ) -> Result<DaemonMessage, AdminError> {
+        if self.used {
+            *self = Connection::connect(&self.socket_path)?;
+        }
+        self.used = true;
         write_line(
             &mut self.reader,
             &Request {
