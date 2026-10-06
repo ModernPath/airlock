@@ -255,12 +255,35 @@ pub enum SecretProvenance {
     GlobalLink,
 }
 
+/// Where a merged `[agent.env.<key>]` entry's value came from, and which
+/// lower-precedence layer it overrode (if any) — `airlock config` shows that
+/// as `local (overrides repo)`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AgentEnvProvenance {
+    pub layer: LayerKind,
+    pub overrides: Option<LayerKind>,
+}
+
+/// Where each unioned or highest-wins scalar setting came from, for
+/// `airlock config`'s `settings` section. Lists carry one `(item, layer)`
+/// pair per entry in the order the entry first appeared, matching the
+/// corresponding list in [`MergedConfig::to_wire`].
+#[derive(Debug, Default)]
+pub struct SettingsProvenance {
+    pub timeout: Option<LayerKind>,
+    pub filesystem_read: Vec<(String, LayerKind)>,
+    pub filesystem_write: Vec<(String, LayerKind)>,
+    pub agent_passthrough_env: Vec<(String, LayerKind)>,
+    pub agent_env: HashMap<String, AgentEnvProvenance>,
+}
+
 /// Provenance recorded during [`merge`], kept for `airlock config` and the
 /// trust-prompt annotation.
 #[derive(Debug, Default)]
 pub struct Provenance {
     pub tools: HashMap<String, ToolProvenance>,
     pub secrets: HashMap<String, SecretProvenance>,
+    pub settings: SettingsProvenance,
 }
 
 /// The result of merging a project's layers: a wire-ready [`RawConfig`] plus
@@ -940,13 +963,28 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         ),
     ];
 
+    // Agent merge result plus the provenance `SettingsProvenance` needs,
+    // which the `if`/`else` below has no other way to hand back out of its
+    // local bookkeeping.
+    type AgentMergeResult = (
+        Option<config::RawAgentConfig>,
+        Vec<(String, LayerKind)>,
+        HashMap<String, AgentEnvProvenance>,
+    );
+
     let any_agent = layered_agents.iter().any(|(_, a)| a.is_some());
-    let agent = if !any_agent {
-        None
+    let (agent, passthrough_env_prov, agent_env_prov): AgentMergeResult = if !any_agent {
+        (None, Vec::new(), HashMap::new())
     } else {
         let mut timeout: Option<u64> = None;
         let mut passthrough_env: Vec<String> = Vec::new();
+        let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
         let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
+        // Every layer (in merge order) that set a given `agent.env` key, so
+        // the winner (last) and what it overrode (the one before it, if
+        // any) can both be reported — `airlock config`'s `local (overrides
+        // repo)` annotation.
+        let mut env_history: HashMap<String, Vec<LayerKind>> = HashMap::new();
         let mut fs_read: Vec<String> = Vec::new();
         let mut fs_write: Vec<String> = Vec::new();
 
@@ -958,10 +996,12 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             for v in &a.passthrough_env {
                 if !passthrough_env.contains(v) {
                     passthrough_env.push(v.clone());
+                    passthrough_env_prov.push((v.clone(), *kind));
                 }
             }
             for (k, v) in &a.env {
                 env_by_key.insert(k.clone(), (*kind, v.clone()));
+                env_history.entry(k.clone()).or_default().push(*kind);
             }
             if let Some(fs) = &a.filesystem {
                 for p in resolve_path_list(&fs.read, ctx) {
@@ -976,6 +1016,21 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 }
             }
         }
+
+        let agent_env_prov: HashMap<String, AgentEnvProvenance> = env_history
+            .into_iter()
+            .map(|(key, layers_seen)| {
+                let winner = *layers_seen.last().expect("push always precedes a read");
+                let overrides = (layers_seen.len() > 1).then(|| layers_seen[layers_seen.len() - 2]);
+                (
+                    key,
+                    AgentEnvProvenance {
+                        layer: winner,
+                        overrides,
+                    },
+                )
+            })
+            .collect();
 
         let mut final_env: HashMap<String, RawEnvValue> = HashMap::with_capacity(env_by_key.len());
         for (key, (kind, value)) in env_by_key {
@@ -1011,19 +1066,23 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             final_env.extend(resolved);
         }
 
-        Some(config::RawAgentConfig {
-            timeout,
-            passthrough_env,
-            env: final_env,
-            filesystem: if fs_read.is_empty() && fs_write.is_empty() {
-                None
-            } else {
-                Some(config::RawAgentFilesystem {
-                    read: fs_read,
-                    write: fs_write,
-                })
-            },
-        })
+        (
+            Some(config::RawAgentConfig {
+                timeout,
+                passthrough_env,
+                env: final_env,
+                filesystem: if fs_read.is_empty() && fs_write.is_empty() {
+                    None
+                } else {
+                    Some(config::RawAgentFilesystem {
+                        read: fs_read,
+                        write: fs_write,
+                    })
+                },
+            }),
+            passthrough_env_prov,
+            agent_env_prov,
+        )
     };
 
     if !undeclared_refs.is_empty() {
@@ -1078,19 +1137,37 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         .and_then(|c| c.timeout)
         .or_else(|| repo_raw.as_ref().and_then(|c| c.timeout))
         .or_else(|| global_raw.as_ref().and_then(|c| c.timeout));
+    let timeout_layer = if local_raw.as_ref().and_then(|c| c.timeout).is_some() {
+        Some(LayerKind::Local)
+    } else if repo_raw.as_ref().and_then(|c| c.timeout).is_some() {
+        Some(repo_kind)
+    } else if global_raw.as_ref().and_then(|c| c.timeout).is_some() {
+        Some(LayerKind::Global)
+    } else {
+        None
+    };
 
     let mut fs_read: Vec<String> = Vec::new();
     let mut fs_write: Vec<String> = Vec::new();
-    for raw in [&global_raw, &repo_raw, &local_raw].into_iter().flatten() {
+    let mut fs_read_prov: Vec<(String, LayerKind)> = Vec::new();
+    let mut fs_write_prov: Vec<(String, LayerKind)> = Vec::new();
+    for (kind, raw) in [
+        (LayerKind::Global, &global_raw),
+        (repo_kind, &repo_raw),
+        (LayerKind::Local, &local_raw),
+    ] {
+        let Some(raw) = raw else { continue };
         if let Some(fs) = &raw.filesystem {
             for p in resolve_path_list(&fs.read, ctx) {
                 if !fs_read.contains(&p) {
-                    fs_read.push(p);
+                    fs_read.push(p.clone());
+                    fs_read_prov.push((p, kind));
                 }
             }
             for p in resolve_path_list(&fs.write, ctx) {
                 if !fs_write.contains(&p) {
-                    fs_write.push(p);
+                    fs_write.push(p.clone());
+                    fs_write_prov.push((p, kind));
                 }
             }
         }
@@ -1127,6 +1204,13 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         provenance: Provenance {
             tools: tool_provenance,
             secrets: secret_provenance,
+            settings: SettingsProvenance {
+                timeout: timeout_layer,
+                filesystem_read: fs_read_prov,
+                filesystem_write: fs_write_prov,
+                agent_passthrough_env: passthrough_env_prov,
+                agent_env: agent_env_prov,
+            },
         },
     })
 }
@@ -1633,6 +1717,81 @@ LOG_LEVEL = "debug"
             RawEnvValue::Static(s) => assert_eq!(s, "debug"),
             other => panic!("expected Static, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_settings_provenance_matches_the_design_doc_worked_example() {
+        // Mirrors "Worked examples → Three layers and the merged result":
+        // timeout from repo, GH_TOKEN's source from local (a LocalOverride
+        // of a repo label), passthrough_env entries from their own layers,
+        // and LOG_LEVEL overriding the repo's value.
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(
+            &global,
+            r#"
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["op", "read", "op://Private/GitHub/token"]
+
+[agent]
+passthrough_env = ["COLORTERM"]
+"#,
+        )
+        .unwrap();
+        write(
+            tmp.path(),
+            "airlock.toml",
+            r#"
+timeout = 120
+
+[secrets.GH_TOKEN]
+source = "env"
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+
+[filesystem]
+read = ["/opt/homebrew/share"]
+
+[agent]
+passthrough_env = ["NO_COLOR"]
+[agent.env]
+LOG_LEVEL = "info"
+"#,
+        );
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            r#"
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["gh", "auth", "token"]
+
+[agent.env]
+LOG_LEVEL = "debug"
+"#,
+        );
+
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let settings = &merged.provenance().settings;
+
+        assert_eq!(settings.timeout, Some(LayerKind::Repo));
+        assert_eq!(
+            settings.filesystem_read,
+            vec![("/opt/homebrew/share".to_string(), LayerKind::Repo)]
+        );
+        assert_eq!(
+            settings.agent_passthrough_env,
+            vec![
+                ("COLORTERM".to_string(), LayerKind::Global),
+                ("NO_COLOR".to_string(), LayerKind::Repo),
+            ]
+        );
+        let log_level = settings.agent_env.get("LOG_LEVEL").unwrap();
+        assert_eq!(log_level.layer, LayerKind::Local);
+        assert_eq!(log_level.overrides, Some(LayerKind::Repo));
     }
 
     // ── Wire round trip ───────────────────────────────────────────────
