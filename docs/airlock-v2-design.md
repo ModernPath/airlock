@@ -368,9 +368,9 @@ GH_CONFIG_DIR = "{tool_state}"
 ```
 $XDG_STATE_HOME/airlock/trust/<id>/     (default ~/.local/state/airlock/trust/<id>/, mode 0700)
     root                  canonical project root
-    airlock.toml          approved copy of the repo file
-    airlock.local.toml    approved copy of the local file
-    <name>.toml           approved copy of a --config file named <name>.toml
+    airlock.toml          approved copy of the repo file, mode 0600
+    airlock.local.toml    approved copy of the local file, mode 0600
+    <name>.toml           approved copy of a --config file named <name>.toml, mode 0600
 ```
 
 Each copy is stored under the approved file's name. Every approved file sits
@@ -1658,3 +1658,79 @@ on it, so it adds no risk to v2 by waiting.
 - **CLAUDE.md:** the trust boundary invariant (session token, not the
   socket alone), the session isolation rules, and the socket invariant's
   file references.
+
+## Implementation notes
+
+Points this doc and [airlock-v2-ux.md](airlock-v2-ux.md) left open, or where
+the shipped code settled on something narrower or different from what was
+proposed:
+
+- **Test-only overrides are `cfg(debug_assertions)`, not an environment
+  check at runtime.** `AIRLOCK_TEST_RUNTIME_DIR` (runtime base) and
+  `AIRLOCK_TEST_IDLE_EXIT_SECS` (the automatic daemon's idle-exit grace
+  period) only compile into debug builds
+  ([src/runtime_dir.rs](../src/runtime_dir.rs),
+  [src/daemon.rs](../src/daemon.rs)). A release build has no code path that
+  reads either variable, so "ignores the environment" ([Location](#location))
+  holds even against a build-time environment that controls what a release
+  binary links against.
+- **The launcher starts an automatic daemon by re-executing itself**, not by
+  forking in-process: `std::env::current_exe()` spawns
+  `airlock daemon start --automatic` (a hidden flag) and waits for it to
+  exit, reusing the existing double-fork-and-readiness-pipe sequence
+  unchanged ([src/launcher.rs](../src/launcher.rs)). This keeps the fork
+  sequence to the one path `daemon start` already hardens, instead of a
+  second in-process fork with its own pre-tokio-runtime constraints.
+- **Unknown keys are an error at the top level too**, not only inside
+  `[tools.*]` and `[secrets.*]`. The RawConfig types use
+  `#[serde(deny_unknown_fields)]` at every level including the root, so a v1
+  top-level flatten catch-all does not exist in v2: a typo'd top-level key
+  fails config load instead of being silently dropped.
+- **`{tool_state}` is computed and created by the launcher**, not the
+  daemon, as `$XDG_CACHE_HOME/airlock/<project-id>/<tool>` with mode 0700,
+  before `Register` ([src/launcher.rs](../src/launcher.rs)). The daemon only
+  ever receives the already-resolved, already-created path.
+- **The exec cap is a concurrency limit, not a lifetime count.** 16 is the
+  number of `exec`s a session may have *in flight at once*, enforced with a
+  `tokio::sync::Semaphore` per session ([src/session.rs](../src/session.rs));
+  a 17th concurrent request is refused with `Busy` (exit 125). A session can
+  run far more than 16 execs over its life, serially.
+- **Hook dedup relies on Claude Code deduping identical commands**, so
+  `--profile claude` injects exactly the same `airlock agent hook
+  claude-code` command string as the block `--print-settings` prints,
+  rather than a marker variable or a generated id, so a hand-added hook and
+  the profile's hook collapse into one.
+- **[F9](#git-hooks-write-denial-f9) shipped** as a macOS-only Seatbelt
+  deny on `<root>/.git/hooks`, on both the agent and tool profiles, ordered
+  after every allow alongside the runtime-base and `admin.token` denies.
+- **The [open UX questions](airlock-v2-ux.md#open-ux-questions) resolved
+  mostly as proposed.** Session id and token format shipped exactly as
+  sketched there (6-hex id, `airlock_<id>_<43 base64url characters>`); the
+  idle grace period shipped at the proposed 5 minutes; `airlock trust`
+  stayed separate from `session reload`, as the doc's own leaning; `daemon
+  install` while a daemon runs took the simpler of the two options (it
+  tells the user to run `daemon restart`); long diffs get no pager. The one
+  exception is worktree dedup, which is still open as
+  [F6](#follow-ups) rather than resolved. (This is a different list from the
+  numbered gaps in [airlock-v2-questions.md](airlock-v2-questions.md), which
+  this doc's own worked examples and sections already answer inline.)
+- **`Session::policy` is `RwLock<Arc<SessionPolicy>>`**
+  ([src/session.rs](../src/session.rs)), not the `ArcSwap<SessionPolicy>`
+  sketched in
+  [airlock-v2-technical-guidance.md](airlock-v2-technical-guidance.md#session-state).
+  A `RwLock` needed no extra dependency and reload is rare enough that the
+  write-lock contention `ArcSwap` avoids was never a concern worth the
+  additional crate.
+- **The process-tree anchor for a `session start` session is the *parent*
+  of the `session start` process**, not the process itself — because
+  `eval "$(airlock session start)"` execs `session start` as a direct child
+  of the interactive shell with no extra fork, that parent is ordinarily
+  the shell the user ran it in. Piping the command through anything else
+  (`airlock session start | cat`, or capturing its output in a script that
+  `eval`s it in a different shell) forces bash to fork a pipeline subshell
+  to run `session start` in; that subshell becomes the anchor and is gone
+  the instant the pipe closes, so every later request fails with
+  `OutsideProcessTree` even though the token is otherwise valid. Neither
+  doc called this out explicitly; it follows from [Token
+  binding](#token-binding) but is easy to trip over, so README.md and
+  SECURITY.md now say it directly.
