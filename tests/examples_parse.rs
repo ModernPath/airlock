@@ -32,15 +32,19 @@ fn merge_context(root: PathBuf, home: PathBuf) -> MergeContext {
 /// global or local layer. Copy it into a scratch directory under that exact
 /// name and run it through the same discovery + merge a launcher would.
 fn assert_repo_example_merges(example: &Path) {
+    // The project sits one level below the stand-in home: a project at home
+    // itself would be refused without allow_home_root.
     let tmp = tempfile::tempdir().expect("tempdir");
+    let project = tmp.path().join("project");
+    std::fs::create_dir(&project).expect("create project dir");
     let bytes = std::fs::read(example).unwrap_or_else(|e| panic!("read {example:?}: {e}"));
-    std::fs::write(tmp.path().join("airlock.toml"), bytes).expect("write airlock.toml");
+    std::fs::write(project.join("airlock.toml"), bytes).expect("write airlock.toml");
 
     // No global layer: point at a path that doesn't exist, as a real
     // project with no ~/.config/airlock/airlock.toml would have.
     let no_global = tmp.path().join("no-global.toml");
 
-    let layers = layers::load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &no_global)
+    let layers = layers::load_layers(&DiscoveryMode::Default, &project, tmp.path(), &no_global)
         .unwrap_or_else(|e| panic!("{example:?}: load_layers failed: {e}"));
 
     assert!(
