@@ -80,6 +80,7 @@ fn permissive_policy(tmp_dir: &Path) -> ToolPolicy {
         read_write_paths: vec![PathBuf::from("/tmp"), tmp_dir.to_path_buf()],
         network: NetworkAccess::None,
         binary_path: None,
+        ..Default::default()
     }
 }
 
@@ -717,6 +718,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -774,6 +776,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -821,6 +824,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -893,6 +897,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -939,6 +944,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -980,6 +986,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock

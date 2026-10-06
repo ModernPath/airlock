@@ -548,6 +548,9 @@ fn run_with_embedded_daemon(
 
             let toolchain_paths = detect_toolchain_paths();
             let mut policy = build_agent_policy(&state.config, &toolchain_paths);
+            // Read directly here, not in sandbox.rs: the Seatbelt builder
+            // takes no environment input (see AgentPolicy::tmpdir).
+            policy.tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
             if let Some(p) = opts.profile {
                 policy.read_write_paths.extend(profile_read_write_paths(p));
             }
@@ -665,6 +668,9 @@ fn run_with_config_and_secrets(
 
     let toolchain_paths = detect_toolchain_paths();
     let mut policy = build_agent_policy(&config, &toolchain_paths);
+    // Read directly here, not in sandbox.rs: the Seatbelt builder takes no
+    // environment input (see AgentPolicy::tmpdir).
+    policy.tmpdir = std::env::var_os("TMPDIR").map(PathBuf::from);
     if let Some(p) = opts.profile {
         policy.read_write_paths.extend(profile_read_write_paths(p));
     }

@@ -144,6 +144,13 @@ pub fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> Result<(), PolicyError> 
 /// proxy's bound port because it is only known once the per-exec listener is
 /// up.
 ///
+/// `git_hooks_deny` is always set to `<sandbox_root>/.git/hooks` (F9); it is
+/// harmless when the root has no `.git` directory. `runtime_base` and
+/// `tmpdir` are left `None` here — the former has no caller-known value yet
+/// (the daemon's runtime directory is not wired in until sessions exist),
+/// and the latter is a process-environment read the caller performs, not
+/// this pure function (see [`AgentPolicy::tmpdir`](crate::sandbox::AgentPolicy::tmpdir)).
+///
 /// # Errors
 ///
 /// Returns [`PolicyError::UnknownTool`] if the tool name is not found in the
@@ -188,6 +195,8 @@ pub fn build_tool_policy(
         read_write_paths,
         network,
         binary_path: None,
+        git_hooks_deny: Some(config.sandbox_root.join(".git/hooks")),
+        ..Default::default()
     })
 }
 
@@ -206,6 +215,8 @@ pub fn build_tool_policy(
 ///   `filesystem_write` paths + agent-section `filesystem.write` (when
 ///   `[agent]` is present).
 /// - **`requires_network`** and **`requires_terminal`**: always `true`.
+/// - **`git_hooks_deny`**: always `<sandbox_root>/.git/hooks` (F9). `runtime_base`
+///   and `tmpdir` are left `None`; see [`build_tool_policy`] for why.
 ///
 /// The daemon socket lives at `{sandbox_root}/airlock.sock` and is therefore
 /// already covered by the `sandbox_root` rule; it does not need a separate
@@ -240,6 +251,8 @@ pub fn build_agent_policy(config: &Config, toolchain_paths: &[PathBuf]) -> Agent
         read_write_paths,
         requires_network: true,
         requires_terminal: true,
+        git_hooks_deny: Some(config.sandbox_root.join(".git/hooks")),
+        ..Default::default()
     }
 }
 
