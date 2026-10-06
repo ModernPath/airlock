@@ -43,7 +43,7 @@ pub fn display_path(path: &Path, home: &Path) -> String {
 /// whitespace is trimmed from every line. An empty leading cell still gets
 /// the column's indent, which is how a repeated label (`agent.passthrough_env`
 /// shown once, blank on the rows after it) lines up under the first row.
-fn table(rows: &[Vec<String>]) -> String {
+pub fn table(rows: &[Vec<String>]) -> String {
     if rows.is_empty() {
         return String::new();
     }
@@ -761,12 +761,16 @@ fn format_relative(now_unix: u64, then_unix: u64) -> String {
     }
 }
 
-/// `HH:MM`, UTC. `render_status` is pure and takes no timezone, so a
-/// session's start is shown in UTC rather than the viewer's local time —
-/// a deviation from the UX transcript, which shows local time implicitly;
-/// see the P3-D final report.
-fn format_hhmm_utc(unix: u64) -> String {
-    format!("{:02}:{:02}", (unix / 3600) % 24, (unix / 60) % 60)
+/// `HH:MM` in the viewer's local time zone, matching the UX transcript
+/// ("Every day" shows `10:42`, `11:30`). Goes through `libc::localtime_r`
+/// rather than the `time` crate's local-offset lookup, which is unsound to
+/// call once a process may have spawned threads (true of this binary, which
+/// creates a tokio runtime for most commands).
+pub fn format_hhmm_local(unix: u64) -> String {
+    let secs = unix.min(i64::MAX as u64) as libc::time_t;
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe { libc::localtime_r(&secs, &mut tm) };
+    format!("{:02}:{:02}", tm.tm_hour, tm.tm_min)
 }
 
 fn daemon_mode_text(daemon: &DaemonStatus, now_unix: u64) -> String {
@@ -789,7 +793,7 @@ fn render_session_rows(sessions: &[SessionRow]) -> String {
             vec![
                 format!("  {}", s.id),
                 s.name.clone(),
-                format_hhmm_utc(s.started_unix),
+                format_hhmm_local(s.started_unix),
                 format!("{} execs", s.execs),
                 if s.config_changed {
                     "config changed".to_string()
@@ -1476,11 +1480,13 @@ mod tests {
 
     #[test]
     fn render_status_matches_the_ux_every_day_transcript() {
+        // Arbitrary fixed instant; the daemon started 2h before `now` below.
+        let daemon_started = 1_700_000_000u64;
         let daemon = DaemonStatus {
             pid: 48211,
             version: "0.6.0".to_string(),
             mode: DaemonMode::Automatic,
-            started_unix: Some(0),
+            started_unix: Some(daemon_started),
             addr: "unix:///run/user/501/airlock/airlock.sock".to_string(),
         };
         let project = ProjectStatus {
@@ -1499,23 +1505,30 @@ mod tests {
                 ),
             ],
         };
+        // Arbitrary fixed instants, 48 minutes apart; the exact HH:MM they
+        // render as depends on the test runner's time zone, so the
+        // assertions below compute the expected label with the function
+        // under test rather than hard-coding one (which the UX transcript's
+        // `10:42`/`11:30` are only an example of, in some unstated zone).
+        let claude_started = daemon_started + 3600; // 1h after the daemon started.
+        let codex_started = claude_started + 48 * 60;
         let sessions = vec![
             SessionRow {
                 id: "7f3a9c".to_string(),
                 name: "claude".to_string(),
-                started_unix: 10 * 3600 + 42 * 60,
+                started_unix: claude_started,
                 execs: 14,
                 config_changed: false,
             },
             SessionRow {
                 id: "b20e51".to_string(),
                 name: "codex".to_string(),
-                started_unix: 11 * 3600 + 30 * 60,
+                started_unix: codex_started,
                 execs: 2,
                 config_changed: false,
             },
         ];
-        let now = 2 * 3600; // 2h after started_unix = 0.
+        let now = daemon_started + 2 * 3600;
 
         let out = render_status(Some(&daemon), Some(&project), &sessions, 3, now);
         let lines = norm_lines(&out);
@@ -1525,8 +1538,20 @@ mod tests {
         assert!(lines.contains(&"project ~/src/app".to_string()));
         assert!(lines.contains(&"global ~/.config/airlock/airlock.toml user file".to_string()));
         assert!(lines.contains(&"sessions 2 here, 3 in total".to_string()));
-        assert!(lines.contains(&"7f3a9c claude 10:42 14 execs".to_string()));
-        assert!(lines.contains(&"b20e51 codex 11:30 2 execs".to_string()));
+        assert!(lines.contains(&format!(
+            "7f3a9c claude {} 14 execs",
+            format_hhmm_local(claude_started)
+        )));
+        assert!(lines.contains(&format!(
+            "b20e51 codex {} 2 execs",
+            format_hhmm_local(codex_started)
+        )));
+        // Still a sane HH:MM shape regardless of zone.
+        for s in [claude_started, codex_started] {
+            let hhmm = format_hhmm_local(s);
+            assert_eq!(hhmm.len(), 5);
+            assert_eq!(hhmm.as_bytes()[2], b':');
+        }
     }
 
     #[test]
