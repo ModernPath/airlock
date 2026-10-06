@@ -3,11 +3,7 @@
 //!
 //! Unlike `run_integration.rs`'s sandboxed tests, nothing here spawns an
 //! OS sandbox — `session start` just registers a session and prints
-//! exports — so these tests need no nested sandbox. They're `#[ignore]`d
-//! for a different, temporary reason instead: `main.rs`'s `cmd_agent` is
-//! still the phase-3 `not_implemented()` stub (another agent is wiring it
-//! to `agent::check_cmd`/`agent::hook_cmd` concurrently); drop the
-//! `#[ignore]`s once that wiring lands.
+//! exports — so these tests need no nested sandbox.
 //!
 //! The session's token is bound to the process tree of whatever called
 //! `admin::Register` (docs/airlock-v2-design.md, "Token binding"): for a
@@ -118,7 +114,6 @@ fn minimal_config() -> &'static str {
 // ─── agent check: probes actually run (and FAIL unsandboxed) ────────────────
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_check_fails_runtime_dir_and_trust_store_probes_when_unsandboxed() {
     let fx = Fixture::new();
     fx.write_config(minimal_config());
@@ -141,7 +136,6 @@ fn agent_check_fails_runtime_dir_and_trust_store_probes_when_unsandboxed() {
 }
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_check_quiet_prints_only_fail_and_warn_lines() {
     let fx = Fixture::new();
     fx.write_config(minimal_config());
@@ -162,7 +156,6 @@ fn agent_check_quiet_prints_only_fail_and_warn_lines() {
 }
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_check_without_session_env_reports_no_session() {
     let fx = Fixture::new();
     let output = fx.agent_cmd(&["agent", "check"], None);
@@ -175,7 +168,6 @@ fn agent_check_without_session_env_reports_no_session() {
 // ─── agent hook: no config in the project prints nothing ────────────────────
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_hook_prints_nothing_without_config_or_session() {
     let fx = Fixture::new();
     // No airlock.toml written: this project has no Airlock config at all.
@@ -189,7 +181,6 @@ fn agent_hook_prints_nothing_without_config_or_session() {
 }
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_hook_without_session_but_with_config_reports_no_session() {
     let fx = Fixture::new();
     fx.write_config(minimal_config());
@@ -213,7 +204,6 @@ fn agent_hook_without_session_but_with_config_reports_no_session() {
 }
 
 #[test]
-#[ignore = "needs cmd_agent wired to agent::check_cmd/hook_cmd in main.rs (concurrent P3 CLI-wiring task)"]
 fn agent_hook_print_settings_matches_the_installed_hook_command() {
     let fx = Fixture::new();
     let output = fx.agent_cmd(&["agent", "hook", "claude-code", "--print-settings"], None);

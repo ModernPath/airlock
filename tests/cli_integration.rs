@@ -323,13 +323,15 @@ fn agent_check_is_a_phase_three_stub() {
 }
 
 #[test]
-fn agent_hook_is_a_phase_three_stub() {
+fn agent_hook_outside_an_airlock_project_prints_nothing() {
     let home = tempfile::tempdir().unwrap();
     let output = base_cmd(home.path())
         .args(["agent", "hook", "claude-code"])
+        .current_dir(home.path())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(125));
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty(), "{output:?}");
 }
 
 // ─── Agent-facing "no session" messages ──────────────────────────────────────
