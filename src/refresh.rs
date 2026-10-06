@@ -171,11 +171,48 @@ impl RefreshTask {
     }
 }
 
-/// Run one refresh attempt synchronously. On success, rebuild the redactor
-/// with two generations for this secret and swap it in, then publish the
-/// freshly-fetched value to the slot and mark it `Healthy`. On failure, mark
-/// the slot `Stale`, leave the value alone (so its bytes still feed the
-/// redactor), and log to the ring buffer.
+/// Run one refresh attempt synchronously against the daemon's own
+/// environment, the v1 path. [`refresh_once_ctx`] is the
+/// [`crate::secrets::CommandContext`]-based counterpart a session uses
+/// instead, once sessions exist.
+///
+/// See [`apply_refresh_result`] for what happens to the slot and redactor.
+pub(crate) fn refresh_once(
+    label: &str,
+    argv: &[String],
+    timeout: Duration,
+    env: &CommandEnv,
+    shared: &RefreshShared,
+) -> Result<(), String> {
+    apply_refresh_result(label, run_command_secret(argv, timeout, env), shared)
+}
+
+/// Run one refresh attempt synchronously under a session's
+/// [`crate::secrets::CommandContext`] — its own environment snapshot and
+/// filtered `PATH`, never the daemon's own environment.
+///
+/// See [`apply_refresh_result`] for what happens to the slot and redactor.
+/// Not yet wired into `spawn_all`: multi-session daemon work lands later
+/// and will call this per-session instead of [`refresh_once`]. Exercised
+/// directly by tests until then.
+#[allow(dead_code)]
+pub(crate) fn refresh_once_ctx(
+    label: &str,
+    argv: &[String],
+    timeout: Duration,
+    env: &CommandEnv,
+    ctx: &crate::secrets::CommandContext,
+    shared: &RefreshShared,
+) -> Result<(), String> {
+    let result =
+        crate::secrets::run_command_with_ctx(argv, timeout, env, ctx).map_err(|e| e.to_flat(label));
+    apply_refresh_result(label, result, shared)
+}
+
+/// On success, rebuild the redactor with two generations for this secret and
+/// swap it in, then publish the freshly-fetched value to the slot and mark
+/// it `Healthy`. On failure, mark the slot `Stale`, leave the value alone
+/// (so its bytes still feed the redactor), and log to the ring buffer.
 ///
 /// The redactor must be swapped *before* the slot is published: anything
 /// that reads the slot (the proxy's credential injection, exec's env
@@ -183,11 +220,9 @@ impl RefreshTask {
 /// snapshot taken for that response has to already know it. Publishing
 /// first would open a window where an echoing upstream returns the new
 /// secret to the tool in plaintext.
-pub(crate) fn refresh_once(
+fn apply_refresh_result(
     label: &str,
-    argv: &[String],
-    timeout: Duration,
-    env: &CommandEnv,
+    result: Result<String, String>,
     shared: &RefreshShared,
 ) -> Result<(), String> {
     let RefreshShared {
@@ -196,7 +231,7 @@ pub(crate) fn refresh_once(
         previous,
         ring,
     } = shared;
-    match run_command_secret(argv, timeout, env) {
+    match result {
         Ok(value) => {
             let new_value = Arc::new(Secret::new(value));
             let slot_lock = store
@@ -371,6 +406,99 @@ mod tests {
         assert!(res.is_ok(), "{res:?}");
         assert_eq!(read_value(&shared.store, "TOK"), "new-value");
         assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
+    }
+
+    /// Build a `CommandContext` with a filtered `PATH` of real system
+    /// directories (`/bin:/usr/bin`) — so `sh` actually resolves — and a
+    /// snapshot of the caller's choosing, rooted at `root` with no write
+    /// grants.
+    fn test_ctx(
+        root: &std::path::Path,
+        snapshot: std::collections::BTreeMap<String, String>,
+    ) -> crate::secrets::CommandContext {
+        let path = crate::exec::filter_path("/bin:/usr/bin", root, &[]);
+        crate::secrets::CommandContext {
+            snapshot,
+            path,
+            cwd: root.to_path_buf(),
+            root: root.to_path_buf(),
+            write_grants: Vec::new(),
+        }
+    }
+
+    /// `refresh_once_ctx` runs the command under the given `CommandContext`
+    /// — its snapshot, not the daemon's environment — and otherwise behaves
+    /// exactly like `refresh_once`: the slot is updated and marked healthy.
+    #[test]
+    fn refresh_once_ctx_uses_context_snapshot_and_marks_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(
+            "AIRLOCK_REFRESH_CTX_TEST".to_string(),
+            "ctx-value".to_string(),
+        );
+        let ctx = test_ctx(tmp.path(), snapshot);
+
+        let shared = &RefreshShared::new(
+            store_with("TOK", "old"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
+
+        let argv = vec![
+            "sh".to_string(),
+            "-c".to_string(),
+            "printf %s \"$AIRLOCK_REFRESH_CTX_TEST\"".to_string(),
+        ];
+        let res = refresh_once_ctx(
+            "TOK",
+            &argv,
+            Duration::from_secs(5),
+            &CommandEnv::default(),
+            &ctx,
+            shared,
+        );
+        assert!(res.is_ok(), "{res:?}");
+        assert_eq!(read_value(&shared.store, "TOK"), "ctx-value");
+        assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
+    }
+
+    /// A command that resolves inside the project root under a
+    /// `CommandContext` is refused and marks the slot stale, same as any
+    /// other refresh failure.
+    #[test]
+    fn refresh_once_ctx_refuses_command_inside_root_and_marks_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("scripts")).unwrap();
+        let script = tmp.path().join("scripts/token.sh");
+        std::fs::write(&script, "#!/bin/sh\necho hi\n").unwrap();
+        std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
+        let shared = &RefreshShared::new(
+            store_with("TOK", "still-good"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+        );
+
+        let res = refresh_once_ctx(
+            "TOK",
+            &["./scripts/token.sh".to_string()],
+            Duration::from_secs(5),
+            &CommandEnv::default(),
+            &ctx,
+            shared,
+        );
+        assert!(res.is_err());
+        let msg = res.unwrap_err();
+        assert!(msg.contains("secret TOK"));
+        assert!(msg.contains("inside the project"));
+        assert_eq!(read_value(&shared.store, "TOK"), "still-good");
+        assert!(matches!(
+            read_health(&shared.store, "TOK"),
+            Health::Stale { .. }
+        ));
     }
 
     #[test]
