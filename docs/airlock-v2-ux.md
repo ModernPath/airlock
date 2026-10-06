@@ -30,14 +30,13 @@ Paths in transcripts use `~`. The macOS runtime dir is shortened to
   someone forgot `.gitignore`, `airlock.local.toml`. Nothing else.
 - **The agent learns its tools from the harness, not only from the skill.**
   A harness hook tells the agent at start which tools it must run through
-  Airlock, and can steer it when it reaches for one directly. See [Harness
-  hooks](#harness-hooks).
+  Airlock. See [Harness hooks](#harness-hooks).
 
 ## Who runs what
 
 | Where | Commands | Needs |
 |---|---|---|
-| User's terminal | `run`, `init`, `trust`, `config`, `status`, `session …`, `daemon …`, `logs` | nothing; the daemon starts on demand |
+| User's terminal | `run`, `init`, `trust`, `config`, `status`, `session …`, `daemon …`, `logs`, `completions` | nothing; the daemon starts on demand |
 | Inside the agent (sandboxed) | `exec`, `list`, `status`, `check` | `AIRLOCK_ADDR` and `AIRLOCK_SESSION`, set by the session |
 | The harness, as a hook | `hook claude-code` | same; prints nothing in a project without Airlock |
 | Refused inside the sandbox | `run`, `trust`, `session`, `daemon` | — |
@@ -58,10 +57,11 @@ airlock status                               daemon, project config and sessions
 airlock exec -- TOOL [ARGS...]               (agent) run a declared tool
 airlock list                                 (agent) tools this session serves
 airlock check                                (agent) verify the session and self-test the sandbox
-airlock hook claude-code                     (harness) SessionStart / PreToolUse hook
+airlock hook claude-code                     (harness) SessionStart hook
 airlock session start | list | reload | revoke
 airlock daemon start | run | stop | restart | install | uninstall
 airlock logs [--session ID]
+airlock completions <bash|zsh>               shell completion script
 ```
 
 Changes from today:
@@ -77,6 +77,7 @@ Changes from today:
 | `airlock list` reads `airlock.toml` | `list` asks the daemon and needs a session. Humans use `airlock config` (U4). |
 | `airlock status`: is a daemon up | `status` shows daemon, project layers, approval state and sessions (U5) |
 | — | `trust`, `config`, `session`, `daemon install/uninstall`, `check`, `hook` |
+| No shell completion | `completions bash/zsh`, with tool names and session ids completed from the daemon (U14) |
 | The agent learns about Airlock from SKILL.md alone | A SessionStart hook puts the session state and tool list in the agent's context (U13) |
 | `daemon status` (in the design) | Dropped; `airlock status` covers it (U10) |
 
@@ -100,7 +101,7 @@ decided or left open. If accepted, the design doc is updated to match.
 | U11 | `--name` on `run` and `session start`. Default: the harness command's base name, or `shell`. | Sessions have only an id. | `session list` and `trust` notes need something a person recognizes. |
 | U12 | Optional `description` on `[secrets.<label>]`. | Not in the schema. | A repo label without a source is a request to each user. The description tells them what to supply. |
 | U13 | `airlock check` (session check and sandbox self-test) and `airlock hook claude-code` (SessionStart: check, then list tools into the agent's context). The session records whether the agent runs in Airlock's sandbox or an external one. `--profile claude` installs the hook. | Not covered. | Whether the agent uses `airlock exec` depends on it reading SKILL.md. A hook delivers the same facts on every start and after every compaction, and catches a broken sandbox before the agent's first `exec`. |
-| U14 | `airlock hook claude-code` on PreToolUse(Bash) denies a command whose program is a declared tool, with the `airlock exec` form as the reason. | Not covered. | The common failure is the agent running `gh pr list` directly and concluding that `gh` is not logged in. A deny with the right command fixes it in one turn. |
+| U14 | `airlock completions <bash\|zsh>`: a dynamic completion script that asks the daemon for tool names and session ids, and hands off to the tool's own completion after `exec -- <tool>`. Nix and release tarballs install it. | Not covered. | `exec -- <TAB>` is where completion helps most, and only the session knows the tool names. A static script also goes stale on upgrade. |
 
 ## Journeys
 
@@ -159,9 +160,7 @@ context.
 
 Claude starts with the SessionStart hook's context already in place: the
 session is active, the self-test passed, and `gh` runs through
-`airlock exec` ([Harness hooks](#harness-hooks)). If it still tries
-`gh pr list` directly, the PreToolUse hook denies the call and gives it
-`airlock exec -- gh pr list` instead.
+`airlock exec` ([Harness hooks](#harness-hooks)).
 
 Inside the agent:
 
@@ -479,7 +478,7 @@ airlock: this session has ended (revoked by the user, or the daemon stopped).
 SKILL.md tells the agent to run `airlock list` and use `airlock exec`. An
 agent that does not load the skill, or loses it in a compaction, runs `gh`
 directly, gets "not logged in", and works around it. A harness hook puts
-the facts in the agent's context without relying on the agent (U13, U14).
+the facts in the agent's context without relying on the agent (U13).
 
 Two commands:
 
@@ -561,7 +560,7 @@ no session or the daemon does not answer.
 
 ### `airlock hook claude-code`
 
-Handles two Claude Code hook events. It reads the event JSON from stdin and
+Handles Claude Code's SessionStart event. It reads the event JSON from stdin and
 always exits 0, so its output reaches Claude as context, not as a hook
 error.
 
@@ -592,26 +591,11 @@ The other outcomes:
 Printing nothing outside Airlock projects means the hook can sit in the
 user-wide `~/.claude/settings.json` without effect elsewhere.
 
-**PreToolUse, matcher `Bash` (U14).** If the command's program is a
-declared tool, the hook denies the call and gives the right form as the
-reason:
-
-```json
-{
-  "hookSpecificOutput": {
-    "hookEventName": "PreToolUse",
-    "permissionDecision": "deny",
-    "permissionDecisionReason": "`gh` is an Airlock tool in this project. Run it as: airlock exec -- gh pr list"
-  }
-}
-```
-
-The program is the first word after leading `VAR=value` assignments.
-`cd x && gh pr list`, `bash -c '…'` and aliases are not caught. This is a
-nudge for the common case, not a control: the agent has no credentials
-either way. Outside a session, or for any other command, the hook prints
-nothing and Claude Code proceeds as usual. The tool list comes from one
-`List` request per Bash call, which is a local socket round trip.
+Claude Code also offers a PreToolUse hook, which could deny a direct
+`gh pr list` and answer with the `airlock exec` form. It is left out for
+now. The SessionStart context is expected to be enough, and a hook on
+every shell command costs a daemon round trip per call and needs a command
+parser that is never complete.
 
 ### Installing the hook
 
@@ -619,11 +603,11 @@ nothing and Claude Code proceeds as usual. The tool list comes from one
 becomes:
 
 ```
-claude --dangerously-skip-permissions --settings '<hooks JSON>'
+claude --dangerously-skip-permissions --settings '<hook JSON>'
 ```
 
 A user who passes their own command after `--`, or uses another way to
-start Claude Code, adds the hooks to `~/.claude/settings.json` (all
+start Claude Code, adds the hook to `~/.claude/settings.json` (all
 projects) or to the project's `.claude/settings.json` (committed for the
 team):
 
@@ -632,10 +616,6 @@ team):
   "hooks": {
     "SessionStart": [
       { "hooks": [{ "type": "command", "command": "airlock hook claude-code" }] }
-    ],
-    "PreToolUse": [
-      { "matcher": "Bash",
-        "hooks": [{ "type": "command", "command": "airlock hook claude-code" }] }
     ]
   }
 }
@@ -660,6 +640,129 @@ $ airlock hook text
 It prints the same context as the SessionStart hook, as plain text, and
 exits 0.
 
+## Shell completion
+
+`airlock completions <bash|zsh>` prints a completion script for the shell
+(U14). The script is a thin registration: on each TAB it calls back into
+`airlock`, which computes the candidates. So completions know the current
+session's tools and the running sessions, and an installed script does not
+go stale when an upgrade adds a flag.
+
+### Installing
+
+| Shell | Per session (`~/.bashrc`, `~/.zshrc`) | As a file |
+|---|---|---|
+| bash | `source <(airlock completions bash)` | `airlock completions bash > ~/.local/share/bash-completion/completions/airlock` (bash-completion loads it on first use) |
+| zsh | `source <(airlock completions zsh)`, after `compinit` | `airlock completions zsh > ~/.zfunc/_airlock`, with `fpath+=(~/.zfunc)` before `compinit` |
+
+Packages install the file, so most users never run `completions`:
+
+- **Nix:** `postInstall` runs `installShellCompletion --cmd airlock` with
+  the output of `$out/bin/airlock completions bash` and `zsh`.
+- **Release tarballs:** `completions/airlock.bash` and
+  `completions/_airlock` next to the binary, generated by the release
+  build.
+
+### What completes
+
+| Position | Candidates | From |
+|---|---|---|
+| `airlock <TAB>` | subcommands; inside a sandbox (`AIRLOCK_SANDBOX=1`) only the ones that work there: `exec`, `list`, `status`, `check`, `config`, `init`, `hook` | static |
+| `airlock exec -- <TAB>` | the session's tools, with descriptions | a `List` request with the session token; nothing without a session |
+| `airlock exec -- gh <TAB>` | `gh`'s own completion, as if the line started with `gh` | delegation: zsh `_normal`, bash `_command_offset` |
+| `airlock run -- <TAB>` | commands, then that command's own completion | delegation |
+| `--profile` | `claude`, `claude-relaxed`, with descriptions | static |
+| `--config` | `*.toml` files | the shell's file completion |
+| `--allow-read`, `--allow-write` | paths | the shell's file completion |
+| `--passthrough-env` | names of exported variables | the shell |
+| `session reload`, `session revoke`, `logs --session` | session ids, with name, project and start time | the daemon, with `admin.token`; outside the sandbox only |
+| `hook` | `claude-code`, `text` | static |
+| `session start --format` | `sh`, `fish`, `json` | static |
+
+In zsh, descriptions appear next to candidates:
+
+```
+$ airlock exec -- <TAB>
+gh    -- GitHub CLI
+psql  -- Postgres shell
+tofu  -- OpenTofu
+
+$ airlock session revoke <TAB>
+7f3a9c  -- claude  ~/src/app    10:42
+b20e51  -- codex   ~/src/app    11:30
+c3d2e1  -- vscode  ~/src/infra  09:05
+```
+
+bash shows only the candidates themselves, which is a bash limitation.
+
+Tool names complete in any shell with a session: one started with
+`airlock run -- $SHELL`, or after `eval "$(airlock session start)"`. Agents
+do not press TAB, so completion is for the user's own shells.
+
+### Rules for the completer
+
+Completion runs on every TAB, so it has to be fast and have no side
+effects:
+
+- It never starts the daemon, resolves secrets, prompts, or checks
+  approval. It only asks a running daemon.
+- Each daemon request has a 300 ms timeout. On any error it offers no
+  candidates and prints nothing: output on stderr would garble the
+  prompt line.
+- It uses a blocking `std` socket, not a tokio runtime, and runs before
+  anything else in `main()`.
+- A `List` request from completion is not logged as an `exec`.
+
+**Delegated completion runs the tool's own completer directly.** For
+`airlock exec -- gh pr <TAB>`, zsh calls `_gh`, which runs `gh __complete`
+from the shell's `PATH`. That `gh` runs without Airlock's credentials and
+outside the tool sandbox. Subcommands and flags complete; anything that
+needs the API, such as PR numbers, completes to nothing. It runs no more
+than typing `gh` in the same shell would, so it adds no new exposure (the
+design's [B1](airlock-v2-design.md#blocking) non-goal covers a planted
+`gh` on the user's `PATH`).
+
+### Implementation
+
+- `clap_complete`'s `CompleteEnv` provides the call-back protocol
+  (`COMPLETE=zsh airlock -- …`). `ArgValueCandidates` supplies tool names
+  and session ids.
+- Both sit behind clap_complete's `unstable-dynamic` feature, so pin the
+  minor version.
+- The `--` delegation is not part of `CompleteEnv`. `airlock completions`
+  wraps its script in a few lines per shell that hand off to `_normal` or
+  `_command_offset` after `exec -- <tool>` and `run --`.
+- The fallback, if `unstable-dynamic` turns out to be unusable: static
+  `clap_complete::generate` scripts plus a hidden `airlock __complete
+  <tools|sessions>` that hand-written shell functions call.
+- Tests drive the completer with `COMPLETE=bash` and `COMPLETE=zsh` against
+  a mock daemon. They check the candidates with a session, without a
+  session, inside the sandbox, and when the daemon does not answer.
+
+`clap_complete` also supports fish, elvish and PowerShell through the same
+mechanism. They are not tested and not documented until someone needs
+them.
+
+### `airlock completions --help`
+
+```
+Print a shell completion script
+
+Usage: airlock completions <SHELL>
+
+The script calls back into airlock for candidates, so it completes your
+session's tool names after `airlock exec --` and session ids after
+`airlock session revoke`, and stays current across upgrades.
+
+Arguments:
+  <SHELL>  [possible values: bash, zsh]
+
+Install:
+  bash  source <(airlock completions bash)                 in ~/.bashrc
+  zsh   source <(airlock completions zsh)                  in ~/.zshrc, after compinit
+        or: airlock completions zsh > ~/.zfunc/_airlock    with fpath+=(~/.zfunc)
+```
+
 ## Help text
 
 The top-level help groups commands by who runs them. clap has no
@@ -674,22 +777,23 @@ Airlock — credential broker for AI agents. Tools get your secrets; the agent n
 Usage: airlock <COMMAND>
 
 Start an agent:
-  run      Run an AI agent with access to this project's tools
-  init     Create a starter config
-  trust    Review and approve this project's config files
-  config   Show the merged config and where each part comes from
-  status   Show the daemon, this project's config, and its sessions
+  run          Run an AI agent with access to this project's tools
+  init         Create a starter config
+  trust        Review and approve this project's config files
+  config       Show the merged config and where each part comes from
+  status       Show the daemon, this project's config, and its sessions
 
 Inside an agent:
-  exec     Run a declared tool
-  list     List the tools this session can run
-  check    Verify the session and self-test the sandbox
-  hook     Hook for an agent harness, e.g. Claude Code's SessionStart
+  exec         Run a declared tool
+  list         List the tools this session can run
+  check        Verify the session and self-test the sandbox
+  hook         Hook for an agent harness, e.g. Claude Code's SessionStart
 
 Manage:
-  session  Start, list, reload and end sessions
-  daemon   Start, stop or install the per-user daemon
-  logs     Show recent daemon log entries
+  session      Start, list, reload and end sessions
+  daemon       Start, stop or install the per-user daemon
+  logs         Show recent daemon log entries
+  completions  Print a bash or zsh completion script
 
 Options:
   -h, --help     Print help
@@ -831,20 +935,19 @@ Usage: airlock hook <HARNESS>
 
 Reads the harness's hook event from stdin, runs `airlock check` and
 `airlock list`, and answers in the harness's hook format. On session
-start the agent learns which tools to run through `airlock exec`. Before a
-shell command, a declared tool run directly is redirected to
-`airlock exec`. Prints nothing in a project that does not use Airlock.
+start the agent learns which tools to run through `airlock exec`. Prints
+nothing in a project that does not use Airlock.
 Always exits 0.
 
 Harnesses:
-  claude-code  SessionStart and PreToolUse(Bash) hooks
+  claude-code  SessionStart hook
   text         Plain text on session start, for any other harness
 
 Options:
       --print-settings  Print the hook configuration for the harness, then exit
   -h, --help            Print help
 
-`airlock run --profile claude` installs the claude-code hooks for you.
+`airlock run --profile claude` installs the claude-code hook for you.
 ```
 
 ### `airlock trust --help`
@@ -1291,8 +1394,8 @@ The `airlock daemon start` variants go away.
 
 ### Harness hooks (new section)
 
-What the SessionStart and PreToolUse hooks do, the fact that `--profile
-claude` installs them, and the `settings.json` block (the output of
+What the SessionStart hook does, the fact that `--profile claude`
+installs it, and the `settings.json` block (the output of
 `airlock hook claude-code --print-settings`) for everyone else.
 `airlock check` for verifying a harness's own sandbox. The README's
 "Where Airlock fits" list gains one line: the hook is how the agent learns
@@ -1328,7 +1431,14 @@ airlock hook claude-code           # Claude Code hook; `--print-settings` shows 
 airlock session start|list|reload|revoke
 airlock daemon start|run|stop|restart|install|uninstall
 airlock logs [--session ID]
+airlock completions bash|zsh       # shell completion; see "Shell completion"
 ```
+
+### Install
+
+After the binary, one line per shell for completion (the
+[Installing](#installing) table). Nix and release tarball users already
+have the file.
 
 ### Troubleshooting
 
@@ -1408,8 +1518,10 @@ Header comment for a single-file example:
   whose self-test failed. But the agent could simply skip the test, and an
   external harness sandbox cannot be tested from the hook, so it would be a
   convenience only.
-- **PreToolUse parsing.** First-word matching misses `cd x && gh …`.
-  Splitting on `&&`, `;` and `|` catches more, and would still be a
-  heuristic. This doc keeps the first word and says so.
+- **Completion inside the agent sandbox.** A sandboxed
+  `airlock run -- $SHELL` loads the user's `.zshrc` only if the sandbox
+  can read it. `claude-relaxed` allows that; `claude` does not. Either
+  document `--allow-read ~/.zshrc`, or accept that completion works only in
+  unsandboxed session shells.
 - **Policy diff (F3).** When it lands, the prompt shows the effective
   change above the byte diff, and a comment-only edit says so.
