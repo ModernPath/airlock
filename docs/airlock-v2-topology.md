@@ -207,6 +207,10 @@ The constraints a central daemon puts on v2, in one place:
 - The daemon owns a config layer of its own. Locally that is the global
   file; centrally it is the admin's.
 
+The implementation-level form of these constraints, for the design as it
+stands, is in
+[airlock-v2-technical-guidance.md](airlock-v2-technical-guidance.md).
+
 ## Open questions
 
 - **Relay or two sessions.** Either the local daemon forwards central

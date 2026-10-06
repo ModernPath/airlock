@@ -19,7 +19,9 @@ will be [README.md](../README.md) and [SKILL.md](../SKILL.md).
 
 The choice of one daemon per user is re-examined against a future central
 daemon in [airlock-v2-topology.md](airlock-v2-topology.md). Its proposals
-are not folded in yet.
+are not folded in yet. The protocol and data model shapes that keep that
+path open while implementing this design are in
+[airlock-v2-technical-guidance.md](airlock-v2-technical-guidance.md).
 
 ## Problem
 
