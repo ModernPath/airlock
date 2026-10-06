@@ -146,6 +146,10 @@ impl Prepared {
 /// review/approval and secret resolution — steps 1 through 5 of the
 /// launcher pipeline in the phase-2 contract. `cwd` is the directory the
 /// command was invoked from (not necessarily the project root).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "launcher-side: runs once in the user's terminal before Register, building the snapshot the daemon will use instead of its own environment"
+)]
 pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherError> {
     let home = home_dir()?;
     let runtime = RuntimeDir::locate()?;
@@ -225,6 +229,10 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     })
 }
 
+#[allow(
+    clippy::disallowed_methods,
+    reason = "launcher-side: runs in the user's terminal before Register"
+)]
 fn home_dir() -> Result<PathBuf, LauncherError> {
     std::env::var("HOME")
         .map(PathBuf::from)
@@ -274,6 +282,10 @@ fn wire_layers(loaded: &LoadedLayers) -> Vec<WireLayer> {
 /// unconditionally once the whole batch takes more than a second, since
 /// `collect_secrets_with` runs labels sequentially and we only learn a
 /// single command was slow after the fact.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "launcher-side: `source = \"env\"` secrets read the launcher's own environment, before Register, never the daemon's"
+)]
 fn resolve_secrets(
     config: &config::Config,
     ctx: &CommandContext,
@@ -582,6 +594,10 @@ struct PendingFile<'a> {
 /// start`, validates and merges (refusing before anything is shown, same as
 /// the launcher), then reviews and approves every repo/local/config-file
 /// layer that isn't already approved.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "launcher-side: `airlock trust` runs in the user's terminal, resolving anchors from its own environment"
+)]
 pub fn run_trust(
     cwd: &Path,
     config_path: Option<PathBuf>,

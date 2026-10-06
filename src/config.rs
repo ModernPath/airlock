@@ -959,6 +959,10 @@ pub(crate) fn current_euid() -> u32 {
 /// still detected.
 ///
 /// Returns `Err(HomeNotSet)` if the `HOME` environment variable is unset.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
+)]
 pub(crate) fn is_home_directory(path: &Path) -> Result<bool, ConfigError> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -1079,6 +1083,10 @@ pub(crate) fn read_config_securely(path: &Path, expected_uid: u32) -> Result<Str
 ///
 /// The starting directory is typically the process's current working directory,
 /// but accepting it as a parameter makes the function testable.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
+)]
 fn discover_config_file(start_dir: &Path) -> Result<(PathBuf, PathBuf), ConfigError> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -1142,6 +1150,10 @@ fn discover_config_file(start_dir: &Path) -> Result<(PathBuf, PathBuf), ConfigEr
 /// - Tilde (`~`) at the start is expanded to `$HOME`
 /// - Relative paths are resolved relative to the sandbox root
 /// - Absolute paths are left unchanged
+#[allow(
+    clippy::disallowed_methods,
+    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
+)]
 pub(crate) fn resolve_path(raw: &str, sandbox_root: &Path) -> Result<PathBuf, ConfigError> {
     let home = std::env::var("HOME")
         .map(PathBuf::from)
@@ -1277,10 +1289,10 @@ pub fn project_id(root: &Path) -> String {
 
 /// Validate that a tool name does not contain path separators.
 ///
-/// Both forward slash (`/`) and backslash (`\`) are rejected. This mirrors
-/// the same constraint enforced by `exec::resolve_binary` but catches it
-/// earlier at config load time, and additionally rejects `\` for
-/// cross-platform safety.
+/// Both forward slash (`/`) and backslash (`\`) are rejected, at config load
+/// time rather than request time, so a malformed tool name is a config error
+/// up front and `exec::resolve_binary_in` never has to consider it.
+/// `\` is also rejected for cross-platform safety.
 pub(crate) fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
     if name.contains('/') || name.contains('\\') {
         return Err(ConfigError::InvalidToolName {
@@ -1704,6 +1716,10 @@ fn parse_and_resolve_config(
 /// single-file loaders use this directly — once a launcher is in the
 /// picture, it resolves the tool-state base from the real anchors and
 /// passes the literal path down.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "config-loading runs launcher-side, before Register; never called by the daemon, which only resolves the already-loaded wire config"
+)]
 fn default_tool_state_base() -> Result<PathBuf, ConfigError> {
     if let Ok(xdg) = std::env::var("XDG_CACHE_HOME")
         && !xdg.is_empty()
@@ -2286,6 +2302,10 @@ pub fn local_stub(repo_labels: &[(String, Option<String>)], global_bound: &[Stri
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use std::fs;

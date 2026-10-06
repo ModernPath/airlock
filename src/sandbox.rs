@@ -149,6 +149,14 @@ pub struct AgentPolicy {
     /// previous `std::env::var("TMPDIR")` lookup did; silently skipped when
     /// `None` or when canonicalization fails.
     pub tmpdir: Option<PathBuf>,
+    /// The user's home directory, when known.
+    ///
+    /// Read from the process environment by the caller, not by this module
+    /// (see `tmpdir` above). Gates the `$HOME/Applications`,
+    /// `~/.CFUserTextEncoding`, and (for the `claude`/`claude-relaxed`
+    /// profiles) `~/.claude.json`-family, `GlobalPreferences`, and
+    /// shell-dotfile rules; each is silently skipped when `None`.
+    pub home: Option<PathBuf>,
     /// `<root>/.git/hooks`, when known. See [`ToolPolicy::git_hooks_deny`].
     pub git_hooks_deny: Option<PathBuf>,
 }
@@ -974,8 +982,8 @@ pub mod macos {
         // uses for user-scoped installs (e.g. Claude Code's URL handler
         // bundle). Resolved at profile-build time; skipped silently when HOME
         // is unset.
-        if let Ok(home) = std::env::var("HOME") {
-            let user_apps = std::path::PathBuf::from(&home).join("Applications");
+        if let Some(home) = &policy.home {
+            let user_apps = home.join("Applications");
             let escaped = escape_path(&user_apps)?;
             out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
         }
@@ -1038,8 +1046,8 @@ pub mod macos {
         // Contents are a single short numeric line (encoding id + region); no
         // credentials. Resolved at profile-build time from $HOME; skipped
         // silently if HOME is unset.
-        if let Ok(home) = std::env::var("HOME") {
-            let encoding_path = std::path::PathBuf::from(home).join(".CFUserTextEncoding");
+        if let Some(home) = &policy.home {
+            let encoding_path = home.join(".CFUserTextEncoding");
             let escaped = escape_path(&encoding_path)?;
             out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
         }
@@ -1050,7 +1058,7 @@ pub mod macos {
         // Extras that cannot be expressed as simple subpath allows and are
         // therefore not routed through `emit_filesystem_rules`.
         if let Some(kind) = profile {
-            emit_profile_rules(kind, &mut out)?;
+            emit_profile_rules(kind, policy.home.as_deref(), &mut out)?;
         }
 
         // The daemon connection is not part of the agent's general network
@@ -1096,12 +1104,16 @@ pub mod macos {
     /// These rules typically rely on regex patterns — Seatbelt-only — to grant
     /// access to file-name families that can't be covered by a single subpath
     /// rule (atomic-write lockfiles and per-pid temp files, for example).
-    fn emit_profile_rules(kind: AgentProfileKind, out: &mut String) -> Result<(), SandboxError> {
+    fn emit_profile_rules(
+        kind: AgentProfileKind,
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
         match kind {
-            AgentProfileKind::Claude => emit_claude_profile_rules(out),
+            AgentProfileKind::Claude => emit_claude_profile_rules(home, out),
             AgentProfileKind::ClaudeRelaxed => {
-                emit_claude_profile_rules(out)?;
-                emit_claude_relaxed_profile_rules(out)
+                emit_claude_profile_rules(home, out)?;
+                emit_claude_relaxed_profile_rules(home, out)
             }
         }
     }
@@ -1114,7 +1126,10 @@ pub mod macos {
     /// browser process, and the dotfiles often carry exported credentials
     /// (`AWS_*`, `GITHUB_TOKEN`). Gated by the explicit `claude-relaxed`
     /// profile choice rather than the standard `claude` profile.
-    fn emit_claude_relaxed_profile_rules(out: &mut String) -> Result<(), SandboxError> {
+    fn emit_claude_relaxed_profile_rules(
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
         // Keychain Mach endpoints. `com.apple.securityd.xpc` is the modern
         // `securityd`/Keychain Services entry point used by `SecItem*`;
         // `com.apple.SecurityServer` is the legacy alias the
@@ -1165,8 +1180,8 @@ pub mod macos {
         // host-specific and unknown at compile time, so match it with a
         // regex. No credentials live in these plists — they are
         // app-binding and locale preferences.
-        if let Ok(home) = std::env::var("HOME") {
-            let prefs = std::path::PathBuf::from(&home).join("Library/Preferences");
+        if let Some(home) = home {
+            let prefs = home.join("Library/Preferences");
             let pattern = format!(
                 "^{}/(ByHost/)?\\.GlobalPreferences.*\\.plist$",
                 regex_escape(&prefs.to_string_lossy())
@@ -1178,7 +1193,7 @@ pub mod macos {
         // interactive spawn — without them the shell starts in a bare
         // environment and the user's PATH, aliases, and prompt functions
         // are missing. Read-only; the agent cannot modify them.
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home {
             const DOTFILES: &[&str] = &[
                 ".bashrc",
                 ".bash_profile",
@@ -1190,9 +1205,8 @@ pub mod macos {
                 ".zlogin",
                 ".inputrc",
             ];
-            let home_path = std::path::PathBuf::from(&home);
             for name in DOTFILES {
-                let escaped = escape_path(&home_path.join(name))?;
+                let escaped = escape_path(&home.join(name))?;
                 out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
             }
         }
@@ -1205,12 +1219,15 @@ pub mod macos {
     /// config writes (`{path}.lock`, `{path}.tmp.{pid}.{ts}`), plus the
     /// top-level `~/.claude.lock` Claude Code uses to serialize concurrent
     /// instances. Skipped silently if `HOME` is unset.
-    fn emit_claude_profile_rules(out: &mut String) -> Result<(), SandboxError> {
-        let Ok(home) = std::env::var("HOME") else {
+    fn emit_claude_profile_rules(
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        let Some(home) = home else {
             return Ok(());
         };
 
-        let base = std::path::PathBuf::from(&home).join(".claude.json");
+        let base = home.join(".claude.json");
         // Reject control characters in the path (same invariant as
         // `escape_path`) — they would be unsafe inside the SBPL regex literal.
         for ch in base.to_string_lossy().chars() {
@@ -1231,7 +1248,7 @@ pub mod macos {
             "(allow file-read* file-write* (regex #\"{pattern}\"))\n"
         ));
 
-        let lock = std::path::PathBuf::from(&home).join(".claude.lock");
+        let lock = home.join(".claude.lock");
         let escaped_lock = escape_path(&lock)?;
         out.push_str(&format!(
             "(allow file-read* file-write* (literal \"{escaped_lock}\"))\n"
@@ -1979,6 +1996,22 @@ pub mod macos {
             }
         }
 
+        /// A fixed, fabricated `HOME` for tests that assert on `AgentPolicy::home`-
+        /// gated rules — avoids depending on (and serializing against mutation of)
+        /// the real test process's `HOME`.
+        const TEST_HOME: &str = "/Users/airlock-test";
+
+        fn agent_policy_with_home() -> super::super::AgentPolicy {
+            super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: true,
+                home: Some(PathBuf::from(TEST_HOME)),
+                ..Default::default()
+            }
+        }
+
         /// Extract the SBPL string from an agent profile for inspection in tests.
         fn sbpl_from_agent_profile(policy: &super::super::AgentPolicy) -> String {
             sbpl_from_agent_profile_with_kind(policy, None)
@@ -2277,12 +2310,9 @@ pub mod macos {
 
         #[test]
         fn agent_profile_includes_cf_user_text_encoding_when_home_set() {
-            // HOME is read by the profile generator; serialize against any
-            // other test that mutates HOME to avoid a flaky parallel race.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
-            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let expected = format!("(allow file-read* (literal \"{home}/.CFUserTextEncoding\"))");
+            let sbpl = sbpl_from_agent_profile(&agent_policy_with_home());
+            let expected =
+                format!("(allow file-read* (literal \"{TEST_HOME}/.CFUserTextEncoding\"))");
             assert!(
                 sbpl.contains(&expected),
                 "agent SBPL should grant read on $HOME/.CFUserTextEncoding, \
@@ -2292,15 +2322,13 @@ pub mod macos {
 
         #[test]
         fn agent_profile_claude_emits_dotclaude_json_regex() {
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::Claude),
             );
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
             // Build the expected ERE pattern the same way emit_claude_profile_rules
             // does: regex-escape the literal path and add the lock/tmp suffix.
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected = format!(
                 "(allow file-read* file-write* (regex #\"^{escaped_home}/\\.claude\\.json(\\.lock|\\.tmp\\..*)?$\"))"
             );
@@ -2310,7 +2338,7 @@ pub mod macos {
                  expected line: {expected}\ngot:\n{sbpl}"
             );
             let expected_lock =
-                format!("(allow file-read* file-write* (literal \"{home}/.claude.lock\"))");
+                format!("(allow file-read* file-write* (literal \"{TEST_HOME}/.claude.lock\"))");
             assert!(
                 sbpl.contains(&expected_lock),
                 "Claude profile SBPL should grant rw on ~/.claude.lock, \
@@ -2335,7 +2363,6 @@ pub mod macos {
             // otherwise `security` reads/writes fail under the relaxed
             // profile too and the `~/Library/Keychains/` write rule we add is
             // pointless.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let relaxed = sbpl_from_agent_profile_with_kind(
                 &agent_policy_empty(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
@@ -2366,13 +2393,11 @@ pub mod macos {
             // `ClaudeRelaxed` must be a superset of `Claude`: the base
             // `.claude.json` regex and `.claude.lock` literal must both appear,
             // alongside the relaxed extras.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
             );
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected_json = format!(
                 "(allow file-read* file-write* (regex #\"^{escaped_home}/\\.claude\\.json(\\.lock|\\.tmp\\..*)?$\"))"
             );
@@ -2382,7 +2407,7 @@ pub mod macos {
                  expected line: {expected_json}\ngot:\n{sbpl}"
             );
             let expected_lock =
-                format!("(allow file-read* file-write* (literal \"{home}/.claude.lock\"))");
+                format!("(allow file-read* file-write* (literal \"{TEST_HOME}/.claude.lock\"))");
             assert!(
                 sbpl.contains(&expected_lock),
                 "ClaudeRelaxed must inherit the base .claude.lock rule from Claude, \
@@ -2414,11 +2439,8 @@ pub mod macos {
 
         #[test]
         fn agent_profile_emits_relaxed_bundle_for_claude_relaxed_kind() {
-            // Lock ENV_MUTEX — the relaxed bundle consults HOME for both the
-            // GlobalPreferences regex and the shell-dotfile literal paths.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
             );
 
@@ -2445,8 +2467,7 @@ pub mod macos {
             );
 
             // GlobalPreferences plist regex.
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected_regex = format!(
                 "(allow file-read* (regex #\"^{escaped_home}/Library/Preferences/(ByHost/)?\\.GlobalPreferences.*\\.plist$\"))"
             );
@@ -2458,7 +2479,7 @@ pub mod macos {
 
             // Shell init dotfiles.
             for rc in [".bashrc", ".zshrc", ".profile", ".zshenv"] {
-                let expected = format!("(allow file-read* (literal \"{home}/{rc}\"))");
+                let expected = format!("(allow file-read* (literal \"{TEST_HOME}/{rc}\"))");
                 assert!(
                     sbpl.contains(&expected),
                     "ClaudeRelaxed SBPL should allow {rc}, got:\n{sbpl}"
@@ -2469,7 +2490,6 @@ pub mod macos {
         #[test]
         fn agent_profile_omits_relaxed_bundle_for_plain_claude_kind() {
             // The standard Claude profile must NOT emit any of the relaxed extras.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
                 &agent_policy_empty(),
                 Some(super::super::AgentProfileKind::Claude),
@@ -2824,7 +2844,6 @@ pub mod macos {
             // before the socket-access and network blocks; this proves the
             // final denies still land after them, not just after the
             // generic filesystem/network rules.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let tmp = tempfile::tempdir().unwrap();
             let base = std::fs::canonicalize(tmp.path()).unwrap();
             let git_hooks = PathBuf::from("/project/.git/hooks");
@@ -2839,6 +2858,7 @@ pub mod macos {
                     requires_terminal: true,
                     runtime_base: Some(base.clone()),
                     tmpdir: Some(base.clone()),
+                    home: Some(PathBuf::from(TEST_HOME)),
                     git_hooks_deny: Some(git_hooks.clone()),
                 };
                 let sbpl = sbpl_from_agent_profile_with_kind(&policy, Some(kind));
@@ -2932,6 +2952,7 @@ pub mod macos {
                 requires_terminal: false,
                 runtime_base: Some(base.clone()),
                 tmpdir: Some(tmp_path.clone()),
+                home: None,
                 git_hooks_deny: None,
             };
 
@@ -3709,6 +3730,7 @@ pub mod linux {
                 requires_terminal: false,
                 runtime_base: Some(base.clone()),
                 tmpdir: None,
+                home: None,
                 git_hooks_deny: None,
             };
             let profile = LinuxLandlock

@@ -6,6 +6,11 @@
 //! exec a tool, so — unlike `run_integration.rs`/`exec_integration.rs` —
 //! nothing here needs a nestable sandbox.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test harness drives the real binary via its own process env, not daemon request-path code"
+)]
+
 use std::path::Path;
 use std::process::Command;
 

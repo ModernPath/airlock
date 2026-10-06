@@ -341,6 +341,7 @@ pub fn run_agent(
     let mut policy = build_agent_policy(&prepared.config, &toolchain_paths);
     policy.runtime_base = Some(prepared.anchors.runtime_base.clone());
     policy.tmpdir = prepared.env_snapshot.get("TMPDIR").map(PathBuf::from);
+    policy.home = home.map(PathBuf::from);
     if let Some(p) = opts.profile {
         policy
             .read_write_paths

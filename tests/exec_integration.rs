@@ -8,14 +8,23 @@
 
 // Only compile on macOS or Linux — the sandbox backends are not available elsewhere.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
+// This test binary builds `ExecRequest`s by hand from the real process
+// environment and `PATH` — there is no session here to supply a snapshot —
+// so it is exempt from the session-isolation lint that binds daemon-side code.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test harness reads the real process env/PATH to build test fixtures, not request-path code"
+)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use airlock::exec::{
-    ExecRequest, SpawnedChild, build_env, kill_process_group, resolve_binary, spawn,
+    ExecRequest, FilteredPath, SpawnedChild, build_env_from, kill_process_group, resolve_binary_in,
+    spawn,
 };
 use airlock::sandbox::{NetworkAccess, SandboxBackend, ToolPolicy};
 
@@ -103,13 +112,46 @@ fn build_permissive_profile(tmp_dir: &Path) -> airlock::sandbox::SandboxProfile 
     }
 }
 
+/// Build a `FilteredPath` from the real process `PATH`, for tests that need
+/// a real binary and don't exercise the filtering/resolution logic itself.
+fn real_path() -> FilteredPath {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    FilteredPath {
+        entries: path_var.split(':').map(PathBuf::from).collect(),
+        dropped: Vec::new(),
+    }
+}
+
+/// Resolve `sh` against the real process `PATH`, for tests that build an
+/// `ExecRequest` by hand and don't exercise resolution/location-check
+/// behavior themselves.
+fn resolve_sh() -> PathBuf {
+    resolve_binary_in(
+        "sh",
+        &real_path(),
+        Path::new("/airlock-test-root-never-exists"),
+        &[],
+    )
+    .expect("sh should be in PATH")
+}
+
+/// Build a clean env map from the real process environment and `PATH`, for
+/// tests that don't exercise `build_env_from`'s snapshot/`PATH` plumbing
+/// itself.
+fn plain_env() -> std::collections::HashMap<String, String> {
+    let snapshot: BTreeMap<String, String> = std::env::vars().collect();
+    build_env_from(&snapshot, &real_path(), &[])
+}
+
 /// Build an `ExecRequest` for running a shell command with the permissive policy.
 fn shell_request(sh_cmd: &str, tmp_dir: &Path) -> ExecRequest {
+    let path = real_path();
+    let snapshot: BTreeMap<String, String> = std::env::vars().collect();
     ExecRequest {
-        binary: resolve_binary("sh").expect("sh should be in PATH"),
+        binary: resolve_binary_in("sh", &path, tmp_dir, &[]).expect("sh should be in PATH"),
         args: vec!["-c".to_string(), sh_cmd.to_string()],
         work_dir: tmp_dir.to_path_buf(),
-        env: build_env(&[]),
+        env: build_env_from(&snapshot, &path, &[]),
         sandbox_profile: build_permissive_profile(tmp_dir),
         timeout: Duration::from_secs(30),
     }
@@ -746,10 +788,10 @@ mod macos_sandbox {
 
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -805,10 +847,10 @@ mod macos_sandbox {
 
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -855,10 +897,10 @@ mod macos_sandbox {
         let denied_file = denied_dir.path().join("prohibited.txt");
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -928,10 +970,10 @@ mod linux_sandbox {
 
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -976,10 +1018,10 @@ mod linux_sandbox {
 
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -1020,10 +1062,10 @@ mod linux_sandbox {
         let denied_file = denied_dir.path().join("prohibited.txt");
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };

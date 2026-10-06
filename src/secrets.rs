@@ -3,26 +3,29 @@
 //! This module provides:
 //! - [`Secret<T>`] — a newtype wrapper that prevents accidental exposure of
 //!   secret values via logging or debug output
-//! - [`collect_secrets`] — resolves each `[secrets.<label>]` entry in the
-//!   config into a live value. `source = "env"` reads a daemon env var;
-//!   `source = "command"` spawns a process and captures its stdout. Errors
+//! - [`collect_secrets_with`] — resolves each `[secrets.<label>]` entry in the
+//!   config into a live value. `source = "env"` reads the launcher's own
+//!   environment (passed in as `env_lookup`), never the daemon's; `source =
+//!   "command"` spawns a process under a [`CommandContext`] — the session's
+//!   snapshot and filtered `PATH`, never the daemon's own environment. Errors
 //!   are batched: the operator sees every missing env var or failed command
 //!   in one message.
-//! - [`clear_secret_env_vars`] — removes the source env vars from the daemon
-//!   process after collection, preventing exposure via `/proc/<pid>/environ`
 //!
 //! # Security properties
 //!
 //! 1. Secret values never appear in debug output — [`Secret<T>`]'s `Debug` impl
 //!    always prints `[REDACTED]`.
-//! 2. Secret environment variables are cleared from the daemon process after
-//!    reading, preventing exposure via `/proc/<pid>/environ`.
+//! 2. A `source = "env"` secret's name is reported back as `consumed_env` so
+//!    the launcher can drop it from the snapshot it hands the daemon —
+//!    nothing in the daemon's own session state should carry a secret value
+//!    twice.
 //! 3. Secret values are only exposed at two controlled points: building the
-//!    child environment (`exec::build_env`) and building the redaction automaton.
-//!    Both points require an explicit `expose_secret()` call.
-//! 4. `source = "command"` runs with the daemon's environment and is **not**
-//!    sandboxed. `airlock.toml` is already trusted, so the command line is
-//!    too — but the operator should treat it with the same care.
+//!    child environment (`exec::build_env_from`) and building the redaction
+//!    automaton. Both points require an explicit `expose_secret()` call.
+//! 4. `source = "command"` runs under the session's [`CommandContext`] — its
+//!    snapshot and filtered `PATH`, never the daemon's own environment.
+//!    `airlock.toml` is already trusted, so the command line is too — but
+//!    the operator should treat it with the same care.
 
 use std::collections::{BTreeMap, HashMap};
 use std::fmt;
@@ -187,107 +190,9 @@ pub struct SecretSlot {
 /// load; only the contents of each `RwLock<SecretSlot>` change at runtime.
 pub type SecretStore = Arc<HashMap<String, RwLock<SecretSlot>>>;
 
-/// Build a [`SecretStore`] by running [`collect_secrets`] and wrapping each
-/// value in a [`SecretSlot`] (initially [`Health::Healthy`]).
-pub fn build_secret_store(config: &Config) -> Result<SecretStore, SecretsError> {
-    let resolved = collect_secrets(config)?;
-    let mut map: HashMap<String, RwLock<SecretSlot>> = HashMap::with_capacity(resolved.len());
-    for (label, secret) in resolved {
-        map.insert(
-            label,
-            RwLock::new(SecretSlot {
-                value: Arc::new(secret),
-                health: Health::Healthy,
-            }),
-        );
-    }
-    Ok(Arc::new(map))
-}
-
-// ─── Secret collection ───────────────────────────────────────────────────────
-
-/// Resolve every `[secrets.<label>]` entry in the config into a live value
-/// wrapped in [`Secret<String>`], keyed by label.
-///
-/// For `source = "env"` entries, reads the named daemon env var. For
-/// `source = "command"` entries, spawns the command, waits up to the
-/// configured timeout, and captures its stdout (trailing newlines trimmed).
-///
-/// Errors are batched: if any `env` sources are missing or any `command`
-/// sources fail, the function returns a single error describing every
-/// problem so the operator can fix them in one pass.
-///
-/// # Errors
-///
-/// - [`SecretsError::MissingSecrets`] — one or more `env` sources point at
-///   unset daemon env vars.
-/// - [`SecretsError::InvalidUtf8`] — an `env` source's value is not valid UTF-8.
-///   Returned eagerly, not batched (very rare and hard to recover from).
-/// - [`SecretsError::CommandFailures`] — one or more `command` sources failed
-///   (spawn error, non-zero exit, or timeout).
-pub fn collect_secrets(config: &Config) -> Result<HashMap<String, Secret<String>>, SecretsError> {
-    let mut labels: Vec<&String> = config.secrets.keys().collect();
-    labels.sort();
-
-    let mut secrets: HashMap<String, Secret<String>> = HashMap::with_capacity(labels.len());
-    let mut missing: Vec<String> = Vec::new();
-    let mut command_failures: Vec<(String, String)> = Vec::new();
-
-    for label in labels {
-        let spec = &config.secrets[label];
-        match &spec.source {
-            SecretSource::Env { from } => match std::env::var(from) {
-                Ok(value) => {
-                    secrets.insert(label.clone(), Secret::new(value));
-                }
-                Err(std::env::VarError::NotPresent) => {
-                    missing.push(from.clone());
-                }
-                Err(std::env::VarError::NotUnicode(_)) => {
-                    return Err(SecretsError::InvalidUtf8 { name: from.clone() });
-                }
-            },
-            SecretSource::Command {
-                argv, timeout, env, ..
-            } => {
-                // Initial fetches are synchronous and can take seconds
-                // (1Password, vault, AWS STS, etc.). Log before and after so
-                // the operator knows why startup is pausing.
-                let program = argv.first().map(String::as_str).unwrap_or("");
-                eprintln!("airlock: fetching secret {label:?} via {program}...");
-                let started = Instant::now();
-                match run_command_secret(argv, *timeout, env) {
-                    Ok(value) => {
-                        eprintln!(
-                            "airlock: fetched secret {label:?} in {}ms",
-                            started.elapsed().as_millis()
-                        );
-                        secrets.insert(label.clone(), Secret::new(value));
-                    }
-                    Err(reason) => {
-                        eprintln!("airlock: failed to fetch secret {label:?}: {reason}");
-                        command_failures.push((label.clone(), reason));
-                    }
-                }
-            }
-        }
-    }
-
-    if !missing.is_empty() {
-        return Err(SecretsError::MissingSecrets { missing });
-    }
-    if !command_failures.is_empty() {
-        return Err(SecretsError::CommandFailures {
-            failures: command_failures,
-        });
-    }
-
-    Ok(secrets)
-}
-
 /// The outcome of spawning a secret command and waiting for it, before any
-/// label- or UX-specific formatting is applied. Shared by the legacy
-/// (process-env) and [`CommandContext`]-based run paths.
+/// label- or UX-specific formatting is applied.
+#[derive(Debug)]
 pub(crate) enum CommandRunError {
     /// `Command::spawn` itself failed.
     Spawn(String),
@@ -303,8 +208,8 @@ pub(crate) enum CommandRunError {
 }
 
 impl CommandRunError {
-    /// Render as the single-line reason string the legacy (process-env)
-    /// callers have always returned.
+    /// Render as the single-line reason string callers have always
+    /// returned.
     pub(crate) fn to_flat(&self) -> String {
         match self {
             CommandRunError::Spawn(e) => format!("spawn failed: {e}"),
@@ -376,35 +281,6 @@ fn run_with_timeout(mut cmd: Command, timeout: Duration) -> Result<String, Comma
     }
 }
 
-/// Spawn `argv` and capture its stdout as a secret value, inheriting the
-/// daemon's own environment (so tools like `op` and `vault` can read
-/// `OP_SERVICE_ACCOUNT_TOKEN` / `VAULT_ADDR`).
-///
-/// This is the v1 daemon's path: `argv[0]` is resolved by `exec(3)` against
-/// the daemon's own `PATH`, with no location check. [`CommandContext`] and
-/// [`collect_secrets_with`] replace it for v2 sessions, which run with an
-/// explicit snapshot and filtered `PATH` instead.
-pub(crate) fn run_command_secret(
-    argv: &[String],
-    timeout: Duration,
-    env: &CommandEnv,
-) -> Result<String, String> {
-    let mut cmd = Command::new(&argv[0]);
-    cmd.args(&argv[1..])
-        .stdin(Stdio::null())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-
-    if env.clear {
-        cmd.env_clear();
-    }
-    for (name, value) in &env.set {
-        cmd.env(name, value);
-    }
-
-    run_with_timeout(cmd, timeout).map_err(|e| e.to_flat())
-}
-
 // ─── Session-scoped secret collection ────────────────────────────────────────
 
 /// Everything a session's secret commands need, in place of the daemon's
@@ -447,6 +323,7 @@ pub struct Collected {
 
 /// The outcome of resolving and running a `source = "command"` secret under
 /// a [`CommandContext`], before label-specific formatting.
+#[derive(Debug)]
 pub(crate) enum CommandCtxError {
     /// `argv[0]` (a bare name) was not found on `ctx.path`'s surviving
     /// entries.
@@ -572,8 +449,8 @@ pub(crate) fn run_command_with_ctx(
     run_with_timeout(cmd, timeout).map_err(CommandCtxError::Run)
 }
 
-/// Resolve every `[secrets.<label>]` entry into a live value, the
-/// [`CommandContext`]-based counterpart to [`collect_secrets`].
+/// Resolve every `[secrets.<label>]` entry in the config into a live value
+/// wrapped in [`Secret<String>`], keyed by label.
 ///
 /// `source = "env"` reads `env_lookup` — the launcher's own environment —
 /// instead of the daemon's. `source = "command"` runs under `ctx`: its
@@ -658,46 +535,13 @@ pub fn collect_secrets_with(
     })
 }
 
-// ─── Environment clearing ────────────────────────────────────────────────────
-
-/// Remove the daemon env vars referenced by `source = "env"` secrets from the
-/// daemon's process environment.
-///
-/// Leaves `PATH`, `HOME`, `TERM`, `LANG`, `USER`, and any vars not referenced
-/// by an `env` source alone. `source = "command"` entries have nothing to
-/// clear.
-///
-/// # Safety note on `std::env::remove_var`
-///
-/// In Rust 2024 edition, `std::env::remove_var` is `unsafe` because modifying
-/// the environment is not thread-safe. The caller must ensure no other thread
-/// is reading or writing environment variables concurrently. This function is
-/// intended to be called early in daemon startup, before any concurrent tasks
-/// are spawned.
-pub fn clear_secret_env_vars(config: &Config) {
-    let mut names: Vec<&str> = config
-        .secrets
-        .values()
-        .filter_map(|spec| match &spec.source {
-            SecretSource::Env { from } => Some(from.as_str()),
-            SecretSource::Command { .. } => None,
-        })
-        .collect();
-    names.sort();
-    names.dedup();
-
-    for name in names {
-        // SAFETY: Called early in daemon startup before any concurrent tasks
-        // are spawned. No other thread is reading or writing env vars.
-        unsafe {
-            std::env::remove_var(name);
-        }
-    }
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use std::collections::HashMap;
@@ -741,18 +585,6 @@ mod tests {
 
             Self {
                 vars: saved,
-                _lock: lock,
-            }
-        }
-
-        /// Acquire the env mutex without setting any variables. Useful when
-        /// we need to set and clear in a specific order within the test body.
-        fn lock_only() -> Self {
-            let lock = crate::test_support::ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            Self {
-                vars: Vec::new(),
                 _lock: lock,
             }
         }
@@ -923,56 +755,24 @@ mod tests {
         );
     }
 
-    // ── Secret collection tests ──────────────────────────────────────────
+    // ── collect_secrets_with: env source ─────────────────────────────────
 
     #[test]
-    fn collect_secrets_env_source_reads_from_daemon_env() {
-        let _guard = EnvGuard::new(&[("TEST_SECRET_A", "value_a"), ("TEST_SECRET_B", "value_b")]);
-
-        // Labels differ from the source env var names to confirm resolution
-        // goes through `from`.
-        let config = make_config_env(vec![("alpha", "TEST_SECRET_A"), ("beta", "TEST_SECRET_B")]);
-
-        let secrets = collect_secrets(&config).expect("should succeed");
-        assert_eq!(secrets.len(), 2);
-        assert_eq!(secrets["alpha"].expose_secret(), "value_a");
-        assert_eq!(secrets["beta"].expose_secret(), "value_b");
-    }
-
-    #[test]
-    fn collect_secrets_fails_one_missing() {
-        let _guard = EnvGuard::new(&[("TEST_COLL_PRESENT", "value")]);
-        unsafe { std::env::remove_var("TEST_COLL_MISSING") };
-
-        let config = make_config_env(vec![
-            ("present", "TEST_COLL_PRESENT"),
-            ("missing", "TEST_COLL_MISSING"),
-        ]);
-
-        let err = collect_secrets(&config).unwrap_err();
-        let msg = err.to_string();
-        assert!(
-            msg.contains("TEST_COLL_MISSING"),
-            "error should name the missing env var, got: {msg}"
+    fn collect_secrets_with_fails_all_missing_listed() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
         );
-    }
-
-    #[test]
-    fn collect_secrets_fails_all_missing_listed() {
-        let _guard = EnvGuard::lock_only();
-        unsafe {
-            std::env::remove_var("TEST_MULTI_MISS_A");
-            std::env::remove_var("TEST_MULTI_MISS_B");
-            std::env::remove_var("TEST_MULTI_MISS_C");
-        }
-
         let config = make_config_env(vec![
             ("a", "TEST_MULTI_MISS_A"),
             ("b", "TEST_MULTI_MISS_B"),
             ("c", "TEST_MULTI_MISS_C"),
         ]);
 
-        let err = collect_secrets(&config).unwrap_err();
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
         match &err {
             SecretsError::MissingSecrets { missing } => {
                 assert_eq!(missing.len(), 3, "should list all 3, got: {missing:?}");
@@ -992,88 +792,99 @@ mod tests {
     }
 
     #[test]
-    fn collect_secrets_empty_set_succeeds() {
-        let _guard = EnvGuard::lock_only();
+    fn collect_secrets_with_empty_set_succeeds() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
         let config = make_config_env(vec![]);
-        let secrets = collect_secrets(&config).expect("should succeed with empty set");
-        assert!(secrets.is_empty());
+        let collected =
+            collect_secrets_with(&config, &no_env, &ctx).expect("should succeed with empty set");
+        assert!(collected.values.is_empty());
     }
 
     #[test]
-    fn collect_secrets_preserves_special_characters() {
-        let _guard = EnvGuard::new(&[
-            ("TEST_SPECIAL_NEWLINE", "line1\nline2"),
-            ("TEST_SPECIAL_UNICODE", "caf\u{00E9} \u{1F600}"),
-        ]);
-
+    fn collect_secrets_with_preserves_special_characters() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
         let config = make_config_env(vec![
             ("nl", "TEST_SPECIAL_NEWLINE"),
             ("uni", "TEST_SPECIAL_UNICODE"),
         ]);
+        let lookup = |name: &str| match name {
+            "TEST_SPECIAL_NEWLINE" => Some("line1\nline2".to_string()),
+            "TEST_SPECIAL_UNICODE" => Some("caf\u{00E9} \u{1F600}".to_string()),
+            _ => None,
+        };
 
-        let secrets = collect_secrets(&config).expect("should succeed");
-        assert_eq!(secrets["nl"].expose_secret(), "line1\nline2");
-        assert_eq!(secrets["uni"].expose_secret(), "caf\u{00E9} \u{1F600}");
+        let collected = collect_secrets_with(&config, &lookup, &ctx).expect("should succeed");
+        assert_eq!(collected.values["nl"].expose_secret(), "line1\nline2");
+        assert_eq!(
+            collected.values["uni"].expose_secret(),
+            "caf\u{00E9} \u{1F600}"
+        );
     }
 
-    // ── Command-source collection ────────────────────────────────────────
+    // ── run_command_with_ctx: command-source collection ──────────────────
 
     #[test]
-    fn collect_secrets_command_source_captures_stdout() {
+    fn run_command_with_ctx_captures_stdout() {
         // `printf` is portable across macOS and Linux; emits no trailing newline.
-        let _guard = EnvGuard::lock_only();
-        let config = make_config_command(vec![("pw", vec!["printf", "%s", "s3cret-value"], 5)]);
-
-        let secrets = collect_secrets(&config).expect("should succeed");
-        assert_eq!(secrets["pw"].expose_secret(), "s3cret-value");
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let env = crate::config::CommandEnv::default();
+        let argv = vec![
+            "printf".to_string(),
+            "%s".to_string(),
+            "s3cret-value".to_string(),
+        ];
+        let out = run_command_with_ctx(&argv, Duration::from_secs(5), &env, &ctx).unwrap();
+        assert_eq!(out, "s3cret-value");
     }
 
     #[test]
-    fn collect_secrets_command_trims_trailing_newline() {
+    fn run_command_with_ctx_trims_trailing_newline() {
         // `echo` emits a trailing newline — the collector must strip it.
-        let _guard = EnvGuard::lock_only();
-        let config = make_config_command(vec![("pw", vec!["echo", "token-xyz"], 5)]);
-
-        let secrets = collect_secrets(&config).expect("should succeed");
-        assert_eq!(secrets["pw"].expose_secret(), "token-xyz");
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let env = crate::config::CommandEnv::default();
+        let argv = vec!["echo".to_string(), "token-xyz".to_string()];
+        let out = run_command_with_ctx(&argv, Duration::from_secs(5), &env, &ctx).unwrap();
+        assert_eq!(out, "token-xyz");
     }
 
     #[test]
-    fn collect_secrets_command_nonzero_exit_reports_failure() {
-        let _guard = EnvGuard::lock_only();
-        let config = make_config_command(vec![("pw", vec!["false"], 5)]);
-
-        let err = collect_secrets(&config).unwrap_err();
-        match err {
-            SecretsError::CommandFailures { failures } => {
-                assert_eq!(failures.len(), 1);
-                assert_eq!(failures[0].0, "pw");
-                assert!(
-                    failures[0].1.contains("exited with"),
-                    "reason should mention exit status, got: {:?}",
-                    failures[0].1
-                );
-            }
-            other => panic!("expected CommandFailures, got: {other:?}"),
-        }
-    }
-
-    #[test]
-    fn collect_secrets_command_spawn_failure_reports() {
-        let _guard = EnvGuard::lock_only();
-        let config = make_config_command(vec![("pw", vec!["/nonexistent/airlock/test/binary"], 5)]);
-
-        let err = collect_secrets(&config).unwrap_err();
-        matches!(err, SecretsError::CommandFailures { .. });
-    }
-
-    #[test]
-    fn collect_secrets_command_timeout_kills_child() {
-        let _guard = EnvGuard::lock_only();
-        let config = make_config_command(vec![("pw", vec!["sleep", "10"], 1)]);
+    fn run_command_with_ctx_timeout_kills_child() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let env = crate::config::CommandEnv::default();
+        let argv = vec!["sleep".to_string(), "10".to_string()];
 
         let start = Instant::now();
-        let err = collect_secrets(&config).unwrap_err();
+        let err = run_command_with_ctx(&argv, Duration::from_secs(1), &env, &ctx).unwrap_err();
         let elapsed = start.elapsed();
 
         assert!(
@@ -1081,24 +892,24 @@ mod tests {
             "timeout should fire well before the child completes, took {elapsed:?}"
         );
         match err {
-            SecretsError::CommandFailures { failures } => {
-                assert!(
-                    failures[0].1.contains("timed out"),
-                    "reason should mention timeout, got: {:?}",
-                    failures[0].1
-                );
-            }
-            other => panic!("expected CommandFailures, got: {other:?}"),
+            CommandCtxError::Run(CommandRunError::Timeout(_)) => {}
+            other => panic!("expected a Run(Timeout), got: {other:?}"),
         }
     }
 
-    // ── run_command_secret env override tests ────────────────────────────
+    // ── run_command_with_ctx: env override behavior ──────────────────────
 
     #[test]
-    fn run_command_secret_sets_env_for_child() {
-        let _guard = EnvGuard::lock_only();
+    fn run_command_with_ctx_sets_env_for_child() {
+        let root = tempdir().unwrap();
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
         let argv = vec![
-            "/bin/sh".to_string(),
+            "sh".to_string(),
             "-c".to_string(),
             "printf %s \"$AIRLOCK_TEST_OVERRIDE\"".to_string(),
         ];
@@ -1111,15 +922,26 @@ mod tests {
             .into_iter()
             .collect(),
         };
-        let out = run_command_secret(&argv, Duration::from_secs(5), &env).unwrap();
+        let out = run_command_with_ctx(&argv, Duration::from_secs(5), &env, &ctx).unwrap();
         assert_eq!(out, "child-saw-this");
     }
 
     #[test]
-    fn run_command_secret_env_clear_drops_inherited_env() {
-        let _guard = EnvGuard::new(&[("AIRLOCK_TEST_CLEARED", "parent-value")]);
+    fn run_command_with_ctx_env_clear_drops_snapshot() {
+        let root = tempdir().unwrap();
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert(
+            "AIRLOCK_TEST_CLEARED".to_string(),
+            "snapshot-value".to_string(),
+        );
+        let ctx = test_ctx(
+            snapshot,
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
         let argv = vec![
-            "/bin/sh".to_string(),
+            "sh".to_string(),
             "-c".to_string(),
             "printf %s \"${AIRLOCK_TEST_CLEARED-MISSING}\"".to_string(),
         ];
@@ -1127,15 +949,23 @@ mod tests {
             clear: true,
             set: std::collections::BTreeMap::new(),
         };
-        let out = run_command_secret(&argv, Duration::from_secs(5), &env).unwrap();
+        let out = run_command_with_ctx(&argv, Duration::from_secs(5), &env, &ctx).unwrap();
         assert_eq!(out, "MISSING");
     }
 
     #[test]
-    fn run_command_secret_env_clear_plus_set_only_exposes_set_var() {
-        let _guard = EnvGuard::new(&[("AIRLOCK_TEST_PARENT", "leaked")]);
+    fn run_command_with_ctx_env_clear_plus_set_only_exposes_set_var() {
+        let root = tempdir().unwrap();
+        let mut snapshot = std::collections::BTreeMap::new();
+        snapshot.insert("AIRLOCK_TEST_PARENT".to_string(), "leaked".to_string());
+        let ctx = test_ctx(
+            snapshot,
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
         let argv = vec![
-            "/bin/sh".to_string(),
+            "sh".to_string(),
             "-c".to_string(),
             "printf %s=%s/%s \"EXPLICIT\" \"${AIRLOCK_EXPLICIT}\" \"${AIRLOCK_TEST_PARENT-MISSING}\""
                 .to_string(),
@@ -1146,7 +976,7 @@ mod tests {
                 .into_iter()
                 .collect(),
         };
-        let out = run_command_secret(&argv, Duration::from_secs(5), &env).unwrap();
+        let out = run_command_with_ctx(&argv, Duration::from_secs(5), &env, &ctx).unwrap();
         assert_eq!(out, "EXPLICIT=seen/MISSING");
     }
 
@@ -1376,59 +1206,6 @@ mod tests {
             }
             other => panic!("expected CommandRunFailures, got: {other:?}"),
         }
-    }
-
-    // ── Environment clearing tests ───────────────────────────────────────
-
-    #[test]
-    fn clear_removes_env_source_vars() {
-        let _guard = EnvGuard::new(&[
-            ("TEST_CLEAR_SEC_A", "secret_a"),
-            ("TEST_CLEAR_SEC_B", "secret_b"),
-        ]);
-
-        let config = make_config_env(vec![("a", "TEST_CLEAR_SEC_A"), ("b", "TEST_CLEAR_SEC_B")]);
-
-        assert!(std::env::var("TEST_CLEAR_SEC_A").is_ok());
-        clear_secret_env_vars(&config);
-        assert!(std::env::var("TEST_CLEAR_SEC_A").is_err());
-        assert!(std::env::var("TEST_CLEAR_SEC_B").is_err());
-    }
-
-    #[test]
-    fn clear_does_not_remove_unrelated_vars() {
-        let _guard = EnvGuard::new(&[
-            ("TEST_CLEAR_KEEP", "keep_this"),
-            ("TEST_CLEAR_REMOVE", "remove_this"),
-        ]);
-
-        let config = make_config_env(vec![("r", "TEST_CLEAR_REMOVE")]);
-        clear_secret_env_vars(&config);
-
-        assert_eq!(std::env::var("TEST_CLEAR_KEEP").unwrap(), "keep_this");
-        assert!(std::env::var("TEST_CLEAR_REMOVE").is_err());
-    }
-
-    #[test]
-    fn clear_ignores_command_source_secrets() {
-        let _guard = EnvGuard::lock_only();
-
-        // A command-source secret has no env var to clear; the function must
-        // simply skip it without panicking.
-        let config = make_config_command(vec![("pw", vec!["echo", "x"], 5)]);
-        clear_secret_env_vars(&config);
-    }
-
-    #[test]
-    fn clear_deduplicates_when_two_labels_share_a_source() {
-        let _guard = EnvGuard::new(&[("TEST_CLEAR_DUP", "dup_value")]);
-
-        // Two different labels pointing at the same `from` — clearing must
-        // not panic on the duplicate `remove_var` attempt.
-        let config = make_config_env(vec![("one", "TEST_CLEAR_DUP"), ("two", "TEST_CLEAR_DUP")]);
-        clear_secret_env_vars(&config);
-
-        assert!(std::env::var("TEST_CLEAR_DUP").is_err());
     }
 
     // ── Error type tests ─────────────────────────────────────────────────

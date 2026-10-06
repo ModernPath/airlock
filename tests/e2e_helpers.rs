@@ -8,6 +8,10 @@
 //! not exist yet in this worktree.
 
 #![allow(dead_code)]
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test harness drives the real binary via its own process env (AIRLOCK_TEST_RUNTIME_DIR, etc.), not daemon request-path code"
+)]
 
 use std::io::{BufRead, Write};
 use std::os::unix::net::UnixStream;

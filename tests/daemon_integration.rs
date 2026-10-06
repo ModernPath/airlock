@@ -3,6 +3,11 @@
 //! deliberately not exercised here; see the note on
 //! `uninstall_when_nothing_installed_is_a_success_no_op`.
 
+#![allow(
+    clippy::disallowed_methods,
+    reason = "test harness drives the real binary via its own process env, not daemon request-path code"
+)]
+
 use std::os::unix::fs::PermissionsExt;
 use std::path::PathBuf;
 use std::process::Command;

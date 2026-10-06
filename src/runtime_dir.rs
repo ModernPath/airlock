@@ -45,6 +45,10 @@ impl RuntimeDir {
     /// Never reads `TMPDIR` or `XDG_RUNTIME_DIR`. Under `cfg(debug_assertions)`
     /// only, `AIRLOCK_TEST_RUNTIME_DIR` (an absolute path) replaces the base
     /// outright, for integration tests that need a predictable location.
+    #[allow(
+        clippy::disallowed_methods,
+        reason = "debug-only test override, read once at startup before any session exists, by both the daemon and the launcher/client locating the same socket"
+    )]
     pub fn locate() -> Result<Self, RuntimeDirError> {
         #[cfg(debug_assertions)]
         if let Some(value) = std::env::var_os(TEST_OVERRIDE_VAR) {
@@ -312,6 +316,10 @@ pub enum RuntimeDirError {
 }
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use crate::test_support::ENV_MUTEX;
