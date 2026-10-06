@@ -11,6 +11,7 @@ use e2e_helpers::*;
 
 // ─── Stdout from a tool is received correctly by the client ─────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_stdout_received_correctly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -21,7 +22,7 @@ fn exec_tool_stdout_received_correctly() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo hello world"],
         cwd.to_str().unwrap(),
@@ -39,6 +40,7 @@ fn exec_tool_stdout_received_correctly() {
 
 // ─── Stderr from a tool is received separately from stdout ──────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_stderr_separate_from_stdout() {
     let tmp = tempfile::tempdir().unwrap();
@@ -49,7 +51,7 @@ fn exec_tool_stderr_separate_from_stdout() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo stdout_data && echo stderr_data >&2"],
         cwd.to_str().unwrap(),
@@ -81,6 +83,7 @@ fn exec_tool_stderr_separate_from_stdout() {
 
 // ─── Non-zero exit codes are propagated faithfully ──────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_nonzero_exit_code_propagated() {
     let tmp = tempfile::tempdir().unwrap();
@@ -90,12 +93,7 @@ fn exec_tool_nonzero_exit_code_propagated() {
     let daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
-    let result = exec_tool(
-        &daemon.socket_path,
-        "sh",
-        &["-c", "exit 42"],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "sh", &["-c", "exit 42"], cwd.to_str().unwrap());
 
     assert_eq!(
         result.exit_code,
@@ -109,6 +107,7 @@ fn exec_tool_nonzero_exit_code_propagated() {
 
 // ─── Unknown tool name produces an error ────────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_unknown_tool_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -118,12 +117,7 @@ fn exec_unknown_tool_produces_error() {
     let daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
-    let result = exec_tool(
-        &daemon.socket_path,
-        "nonexistent_tool_xyz",
-        &[],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "nonexistent_tool_xyz", &[], cwd.to_str().unwrap());
 
     assert!(
         result.error.is_some(),
@@ -140,6 +134,7 @@ fn exec_unknown_tool_produces_error() {
 
 // ─── CWD outside sandbox root produces an error ─────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_cwd_outside_sandbox_root_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -148,7 +143,7 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
     let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
     let daemon = start_daemon(tmp.path());
 
-    let result = exec_tool(&daemon.socket_path, "sh", &["-c", "echo hi"], "/tmp");
+    let result = exec_tool(&daemon, "sh", &["-c", "echo hi"], "/tmp");
 
     assert!(
         result.error.is_some(),
@@ -165,6 +160,7 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
 
 // ─── Missing binary produces a clear error ──────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_missing_binary_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -181,7 +177,7 @@ fn exec_missing_binary_produces_error() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "nonexistent_binary_xyz",
         &[],
         cwd.to_str().unwrap(),

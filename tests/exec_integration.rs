@@ -119,6 +119,7 @@ fn shell_request(sh_cmd: &str, tmp_dir: &Path) -> ExecRequest {
 
 /// After spawn, the child's process group ID equals its own PID,
 /// confirming that `setpgid(0, 0)` ran in the `pre_exec` closure.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_pgid_equals_child_pid() {
     let tmp = tempfile::tempdir().unwrap();
@@ -145,6 +146,7 @@ async fn child_pgid_equals_child_pid() {
 /// The daemon (test runner) process's own process group ID differs from
 /// the child's process group ID — confirming the child is not in the
 /// daemon's group.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_pgid_differs_from_daemon_pgid() {
     let tmp = tempfile::tempdir().unwrap();
@@ -171,6 +173,7 @@ async fn child_pgid_differs_from_daemon_pgid() {
 // ─── Kill-tree tests ──────────────────────────────────────────────────────────
 
 /// Sending SIGTERM to the process group kills both the child and its grandchild.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_tree_terminates_child_and_grandchild() {
     let tmp = tempfile::tempdir().unwrap();
@@ -232,6 +235,7 @@ async fn kill_tree_terminates_child_and_grandchild() {
 }
 
 /// Killing one process group does not affect a second independent process group.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_tree_does_not_affect_other_groups() {
     let tmp = tempfile::tempdir().unwrap();
@@ -267,6 +271,7 @@ async fn kill_tree_does_not_affect_other_groups() {
 // ─── Standard output streaming tests ──────────────────────────────────────────
 
 /// Stdout receives the exact bytes written by the child.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdout_receives_known_string() {
     let tmp = tempfile::tempdir().unwrap();
@@ -287,6 +292,7 @@ async fn stdout_receives_known_string() {
 }
 
 /// Stderr receives the exact bytes written by the child.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stderr_receives_known_string() {
     let tmp = tempfile::tempdir().unwrap();
@@ -307,6 +313,7 @@ async fn stderr_receives_known_string() {
 
 /// When the child writes distinct content to stdout and stderr concurrently,
 /// each stream is received correctly without interleaving.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdout_and_stderr_distinct_content() {
     let tmp = tempfile::tempdir().unwrap();
@@ -332,6 +339,7 @@ async fn stdout_and_stderr_distinct_content() {
 
 /// Output larger than a typical pipe buffer (>= 128 KB) is fully received
 /// without truncation.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn large_output_not_truncated() {
     let tmp = tempfile::tempdir().unwrap();
@@ -357,6 +365,7 @@ async fn large_output_not_truncated() {
 
 /// `cat` reads from stdin and echoes to stdout; verify the echo matches
 /// the input exactly.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdin_cat_echoes_input() {
     let tmp = tempfile::tempdir().unwrap();
@@ -388,6 +397,7 @@ async fn stdin_cat_echoes_input() {
 
 /// When stdin is closed immediately (nothing written), the child sees EOF
 /// and exits normally.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdin_closed_immediately_child_exits_normally() {
     let tmp = tempfile::tempdir().unwrap();
@@ -421,6 +431,7 @@ async fn stdin_closed_immediately_child_exits_normally() {
 // ─── Exit code tests ─────────────────────────────────────────────────────────
 
 /// A command that exits with code 0 reports exit status 0.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn exit_code_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -433,6 +444,7 @@ async fn exit_code_zero() {
 }
 
 /// A command that exits with a non-zero code reports the exact code.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn exit_code_nonzero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -447,6 +459,7 @@ async fn exit_code_nonzero() {
 // ─── Timeout enforcement tests ────────────────────────────────────────────────
 
 /// A long-running child can be killed promptly with SIGTERM via the kill helper.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_long_running_child_promptly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -475,6 +488,7 @@ async fn kill_long_running_child_promptly() {
 
 /// A child that ignores SIGTERM can be terminated with SIGKILL via a second
 /// kill helper call.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn sigkill_after_sigterm_ignored() {
     let tmp = tempfile::tempdir().unwrap();
@@ -516,6 +530,7 @@ async fn sigkill_after_sigterm_ignored() {
 // ─── Concurrent execution tests ──────────────────────────────────────────────
 
 /// Two simultaneously spawned children have distinct PIDs and process group IDs.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn concurrent_children_distinct_pgids() {
     let tmp = tempfile::tempdir().unwrap();
@@ -552,6 +567,7 @@ async fn concurrent_children_distinct_pgids() {
 
 /// Killing one concurrent child's process group does not affect the other.
 /// The surviving child's stdout can still be read.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_one_concurrent_child_other_unaffected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -597,6 +613,7 @@ async fn kill_one_concurrent_child_other_unaffected() {
 
 /// Both children's output is received by their respective callers without
 /// cross-contamination.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn concurrent_output_no_cross_contamination() {
     let tmp = tempfile::tempdir().unwrap();
@@ -630,6 +647,7 @@ async fn concurrent_output_no_cross_contamination() {
 /// (daemon) beyond stdin/stdout/stderr — confirming CLOEXEC is applied to
 /// inherited descriptors.
 #[cfg(target_os = "linux")]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_does_not_inherit_parent_fds() {
     use std::os::unix::io::AsRawFd;
@@ -700,6 +718,7 @@ mod macos_sandbox {
     ///
     /// The denied path is a fresh temp directory that does not appear anywhere
     /// in the policy's allow lists.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_denies_read_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -760,6 +779,7 @@ mod macos_sandbox {
     }
 
     /// A file read from a path IN the policy succeeds.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_allows_read_inside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -808,6 +828,7 @@ mod macos_sandbox {
     }
 
     /// A file write to a path NOT in the policy's write list fails.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_denies_write_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -880,6 +901,7 @@ mod linux_sandbox {
     }
 
     /// A file read from a path NOT in the policy fails with permission denied.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_denies_read_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -929,6 +951,7 @@ mod linux_sandbox {
     }
 
     /// A file read from a path IN the policy succeeds.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_allows_read_inside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -972,6 +995,7 @@ mod linux_sandbox {
     }
 
     /// A file write to a path NOT in the policy's write list fails.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_denies_write_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();

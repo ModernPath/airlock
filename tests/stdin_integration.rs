@@ -6,11 +6,12 @@
 
 mod e2e_helpers;
 
-use airlock::protocol::v1::{ClientMessage, DaemonMessage};
+use airlock::protocol::{Auth, DaemonMessage, Request, RequestBody, SessionRequest, StdinFrame};
 use e2e_helpers::*;
 
 // ─── Piped stdin data flows through the daemon to the tool ──────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn stdin_data_flows_through_daemon_to_tool() {
     let tmp = tempfile::tempdir().unwrap();
@@ -24,22 +25,28 @@ fn stdin_data_flows_through_daemon_to_tool() {
     // Connect and send exec request for `cat` (reads stdin, echoes to stdout).
     let mut stream = connect_to_daemon(&daemon.socket_path, 30);
 
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "cat".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "cat".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     // Send stdin data.
-    let stdin_msg = ClientMessage::Stdin {
-        data: "hello from stdin\n".to_string(),
-    };
-    send_message(&mut stream, &stdin_msg);
+    send_message(
+        &mut stream,
+        &StdinFrame::Stdin {
+            data: "hello from stdin\n".to_string(),
+        },
+    );
 
     // Send stdin EOF to close the pipe.
-    let eof_msg = ClientMessage::StdinEof;
-    send_message(&mut stream, &eof_msg);
+    send_message(&mut stream, &StdinFrame::StdinEof);
 
     // Collect responses.
     let mut stdout = String::new();
@@ -54,7 +61,7 @@ fn stdin_data_flows_through_daemon_to_tool() {
                 exit_code = Some(code);
                 break;
             }
-            Some(DaemonMessage::Error { message }) => {
+            Some(DaemonMessage::Error { message, .. }) => {
                 panic!("unexpected error: {message}");
             }
             _ => break,
@@ -73,6 +80,7 @@ fn stdin_data_flows_through_daemon_to_tool() {
 
 // ─── EOF on client stdin causes EOF on tool stdin ───────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn stdin_eof_causes_tool_stdin_eof() {
     let tmp = tempfile::tempdir().unwrap();
@@ -86,21 +94,26 @@ fn stdin_eof_causes_tool_stdin_eof() {
     // `wc -l` reads all of stdin then prints the line count.
     let mut stream = connect_to_daemon(&daemon.socket_path, 30);
 
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "wc -l".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "wc -l".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     // Send two lines, then EOF.
     send_message(
         &mut stream,
-        &ClientMessage::Stdin {
+        &StdinFrame::Stdin {
             data: "line1\nline2\nline3\n".to_string(),
         },
     );
-    send_message(&mut stream, &ClientMessage::StdinEof);
+    send_message(&mut stream, &StdinFrame::StdinEof);
 
     // Collect responses.
     let mut stdout = String::new();
@@ -115,7 +128,7 @@ fn stdin_eof_causes_tool_stdin_eof() {
                 exit_code = Some(code);
                 break;
             }
-            Some(DaemonMessage::Error { message }) => {
+            Some(DaemonMessage::Error { message, .. }) => {
                 panic!("unexpected error: {message}");
             }
             _ => break,
@@ -134,6 +147,7 @@ fn stdin_eof_causes_tool_stdin_eof() {
 
 // ─── No stdin from client causes the tool's stdin to close ──────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn no_stdin_causes_tool_stdin_to_close() {
     let tmp = tempfile::tempdir().unwrap();
@@ -147,12 +161,7 @@ fn no_stdin_causes_tool_stdin_to_close() {
     // `echo hello` does not read stdin, so it should exit normally
     // even if no stdin messages are sent. The daemon's stdin auto-close
     // timer will close the pipe after 2 seconds.
-    let result = exec_tool(
-        &daemon.socket_path,
-        "sh",
-        &["-c", "echo hello"],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "sh", &["-c", "echo hello"], cwd.to_str().unwrap());
 
     assert_eq!(result.exit_code, Some(0), "tool should exit 0");
     assert!(

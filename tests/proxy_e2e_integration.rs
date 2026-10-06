@@ -44,6 +44,7 @@ fn curl_available() -> bool {
     Path::new("/usr/bin/curl").exists()
 }
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn daemon_publishes_and_removes_the_ca_certificate() {
     let tmp = tempfile::tempdir().unwrap();
@@ -54,7 +55,10 @@ fn daemon_publishes_and_removes_the_ca_certificate() {
     ]);
 
     let daemon = start_daemon(tmp.path());
-    let ca_path = tmp.path().join("airlock-ca.pem");
+    let ca_path = daemon
+        .ca_path
+        .clone()
+        .expect("a session with a proxy tool must get a ca_path");
 
     let pem = std::fs::read_to_string(&ca_path)
         .expect("a daemon with a proxy tool must publish its CA certificate");
@@ -71,6 +75,7 @@ fn daemon_publishes_and_removes_the_ca_certificate() {
     );
 }
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn a_daemon_without_proxy_tools_publishes_no_ca() {
     let tmp = tempfile::tempdir().unwrap();
@@ -78,29 +83,22 @@ fn a_daemon_without_proxy_tools_publishes_no_ca() {
     let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
 
     let daemon = start_daemon(tmp.path());
-    assert!(!tmp.path().join("airlock-ca.pem").exists());
-    daemon.shutdown();
-}
-
-#[test]
-fn a_stale_ca_certificate_is_cleaned_up_at_startup() {
-    let tmp = tempfile::tempdir().unwrap();
-    write_config(tmp.path(), &config_with_sh_no_secrets());
-    let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
-
-    // What a crashed daemon would leave behind.
-    let ca_path = tmp.path().join("airlock-ca.pem");
-    std::fs::write(&ca_path, "stale").unwrap();
-    std::fs::write(tmp.path().join("airlock.pid"), "999999").unwrap();
-
-    let daemon = start_daemon(tmp.path());
     assert!(
-        !ca_path.exists(),
-        "a leftover CA certificate must not survive the stale-state sweep"
+        daemon.ca_path.is_none(),
+        "a session with no proxy tool must get no ca_path"
     );
     daemon.shutdown();
 }
 
+// A v1 test here covered a stale `airlock-ca.pem` surviving a crashed
+// daemon's startup sweep. In v2 the CA lives per *session*
+// (`<runtime base>/ca/<session id>.pem`), not per project, and a session
+// only ever exists in daemon memory — there is no project-directory file
+// for a crash to leave behind, and no central CA file for startup to sweep.
+// `runtime_dir.rs`'s own tests cover the runtime base's stale-state
+// validation; nothing proxy-specific survives to port here.
+
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn an_unrouted_host_is_refused_by_the_proxy() {
     if !curl_available() {
@@ -119,7 +117,7 @@ fn an_unrouted_host_is_refused_by_the_proxy() {
     // No route covers this host, so the proxy answers the CONNECT with 403 and
     // never resolves or dials anything — the check is hermetic.
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "curl",
         &["-sS", "--max-time", "20", "https://unrouted.example.org/"],
         cwd.to_str().unwrap(),
@@ -140,6 +138,7 @@ fn an_unrouted_host_is_refused_by_the_proxy() {
     daemon.shutdown();
 }
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn going_around_the_proxy_is_stopped_by_the_sandbox() {
     if !curl_available() {
@@ -160,7 +159,7 @@ fn going_around_the_proxy_is_stopped_by_the_sandbox() {
     // profile permits no DNS and no destination but the proxy port, so this
     // fails without a packet leaving the machine.
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "curl",
         &[
             "-sS",
@@ -190,6 +189,7 @@ fn going_around_the_proxy_is_stopped_by_the_sandbox() {
     daemon.shutdown();
 }
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn a_direct_tcp_connect_is_denied_not_timed_out() {
     if !curl_available() {
@@ -211,7 +211,7 @@ fn a_direct_tcp_connect_is_denied_not_timed_out() {
     // sandbox this connect would hang until `--max-time` and exit 28. A
     // sandbox denial fails the connect() itself: exit 7, immediately.
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "curl",
         &[
             "-sS",

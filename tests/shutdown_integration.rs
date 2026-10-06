@@ -9,18 +9,19 @@ mod e2e_helpers;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
-use airlock::protocol::v1::{ClientMessage, DaemonMessage};
+use airlock::protocol::{Auth, DaemonMessage, Request, RequestBody, SessionRequest};
 use e2e_helpers::*;
 
 // ─── SIGTERM during active tool execution kills tool and exits cleanly ───────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn sigterm_during_active_tool_kills_tool_and_exits_cleanly() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), &config_with_sh_no_secrets());
 
     let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
-    let daemon = start_daemon(tmp.path());
+    let mut daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let socket_path = daemon.socket_path.clone();
@@ -29,12 +30,17 @@ fn sigterm_during_active_tool_kills_tool_and_exits_cleanly() {
 
     // Start a long-running tool that prints its PID.
     let mut stream = connect_to_daemon(&socket_path, 30);
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     // Read the child PID from stdout.
     let mut child_pid: Option<u32> = None;
@@ -72,19 +78,16 @@ fn sigterm_during_active_tool_kills_tool_and_exits_cleanly() {
     // Wait for the daemon to shut down.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if daemon.join_handle.is_finished() {
+        if daemon.try_wait().is_some() {
             break;
         }
         if std::time::Instant::now() > deadline {
-            panic!("daemon thread did not finish after SIGTERM");
+            panic!("daemon process did not exit after SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
 
-    daemon.join_handle.join().expect("daemon thread clean exit");
-
     // Verify the child process is killed.
-    // Give a brief moment for process cleanup.
     std::thread::sleep(Duration::from_millis(500));
     assert!(
         !is_process_alive(child_pid),
@@ -104,18 +107,20 @@ fn sigterm_during_active_tool_kills_tool_and_exits_cleanly() {
 
 // ─── Multiple active tools are all terminated during shutdown ────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn multiple_active_tools_terminated_during_shutdown() {
     let tmp = tempfile::tempdir().unwrap();
     write_config(tmp.path(), &config_with_sh_no_secrets());
 
     let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
-    let daemon = start_daemon(tmp.path());
+    let mut daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let socket_path = daemon.socket_path.clone();
     let pid_path = daemon.pid_path.clone();
     let daemon_pid = daemon.daemon_pid;
+    let token = daemon.token.clone();
 
     // Start two long-running tools on separate connections.
     let collect_pid = |conn: &mut UnixStream| -> u32 {
@@ -139,26 +144,23 @@ fn multiple_active_tools_terminated_during_shutdown() {
         }
     };
 
-    let mut stream1 = connect_to_daemon(&socket_path, 30);
-    send_message(
-        &mut stream1,
-        &ClientMessage::Exec {
+    let exec_req = || Request {
+        auth: Auth::Session {
+            token: token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
             tool: "sh".to_string(),
             args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
-            cwd: cwd.to_str().unwrap().to_string(),
-        },
-    );
+            cwd: cwd.clone(),
+        }),
+    };
+
+    let mut stream1 = connect_to_daemon(&socket_path, 30);
+    send_message(&mut stream1, &exec_req());
     let child1_pid = collect_pid(&mut stream1);
 
     let mut stream2 = connect_to_daemon(&socket_path, 30);
-    send_message(
-        &mut stream2,
-        &ClientMessage::Exec {
-            tool: "sh".to_string(),
-            args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
-            cwd: cwd.to_str().unwrap().to_string(),
-        },
-    );
+    send_message(&mut stream2, &exec_req());
     let child2_pid = collect_pid(&mut stream2);
 
     assert!(is_process_alive(child1_pid), "child 1 should be alive");
@@ -172,16 +174,14 @@ fn multiple_active_tools_terminated_during_shutdown() {
     // Wait for daemon shutdown.
     let deadline = std::time::Instant::now() + Duration::from_secs(15);
     loop {
-        if daemon.join_handle.is_finished() {
+        if daemon.try_wait().is_some() {
             break;
         }
         if std::time::Instant::now() > deadline {
-            panic!("daemon thread did not finish after SIGTERM");
+            panic!("daemon process did not exit after SIGTERM");
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-
-    daemon.join_handle.join().expect("daemon thread clean exit");
 
     // Verify both children are killed.
     std::thread::sleep(Duration::from_millis(500));
