@@ -1,3 +1,4 @@
+pub mod admin;
 pub mod anchors;
 pub mod client;
 pub mod config;
