@@ -9,7 +9,7 @@ mod e2e_helpers;
 
 use std::time::Duration;
 
-use airlock::protocol::v1::{ClientMessage, DaemonMessage};
+use airlock::protocol::{Auth, DaemonMessage, Request, RequestBody, SessionRequest};
 
 use e2e_helpers::*;
 
@@ -18,6 +18,7 @@ const SECRET_VALUE: &str = "SuperS3cret!@#Value";
 
 // ─── Raw secret values are redacted in stdout ───────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn raw_secret_redacted_in_stdout() {
     let tmp = tempfile::tempdir().unwrap();
@@ -31,7 +32,7 @@ fn raw_secret_redacted_in_stdout() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", &format!("echo '{SECRET_VALUE}'")],
         cwd.to_str().unwrap(),
@@ -53,6 +54,7 @@ fn raw_secret_redacted_in_stdout() {
 
 // ─── Raw secret values are redacted in stderr ───────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn raw_secret_redacted_in_stderr() {
     let tmp = tempfile::tempdir().unwrap();
@@ -66,7 +68,7 @@ fn raw_secret_redacted_in_stderr() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", &format!("echo '{SECRET_VALUE}' >&2")],
         cwd.to_str().unwrap(),
@@ -88,6 +90,7 @@ fn raw_secret_redacted_in_stderr() {
 
 // ─── Base64-encoded secret values are redacted ──────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn base64_encoded_secret_redacted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -103,7 +106,7 @@ fn base64_encoded_secret_redacted() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", &format!("echo '{b64}'")],
         cwd.to_str().unwrap(),
@@ -125,6 +128,7 @@ fn base64_encoded_secret_redacted() {
 
 // ─── URL-encoded secret values are redacted ─────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn url_encoded_secret_redacted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -140,7 +144,7 @@ fn url_encoded_secret_redacted() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", &format!("echo '{url_encoded}'")],
         cwd.to_str().unwrap(),
@@ -162,6 +166,7 @@ fn url_encoded_secret_redacted() {
 
 // ─── Hex-encoded secret values are redacted ─────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn hex_encoded_secret_redacted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -177,7 +182,7 @@ fn hex_encoded_secret_redacted() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", &format!("echo '{hex}'")],
         cwd.to_str().unwrap(),
@@ -199,6 +204,7 @@ fn hex_encoded_secret_redacted() {
 
 // ─── Output without secrets passes through unchanged ────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn output_without_secrets_passes_through() {
     let tmp = tempfile::tempdir().unwrap();
@@ -212,7 +218,7 @@ fn output_without_secrets_passes_through() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo 'this is totally harmless output'"],
         cwd.to_str().unwrap(),
@@ -234,6 +240,7 @@ fn output_without_secrets_passes_through() {
 
 // ─── Secrets split across chunk boundaries are still redacted ───────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn secret_split_across_chunks_is_redacted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -263,12 +270,7 @@ fn secret_split_across_chunks_is_redacted() {
     }
     script.push_str("echo ''"); // Final newline.
 
-    let result = exec_tool(
-        &daemon.socket_path,
-        "sh",
-        &["-c", &script],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "sh", &["-c", &script], cwd.to_str().unwrap());
 
     assert_eq!(result.exit_code, Some(0));
     assert!(
@@ -286,6 +288,7 @@ fn secret_split_across_chunks_is_redacted() {
 
 // ─── Secret env vars are cleared from daemon's environment ──────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn secret_env_vars_cleared_from_daemon_environment() {
     let tmp = tempfile::tempdir().unwrap();
@@ -322,7 +325,7 @@ fn secret_env_vars_cleared_from_daemon_environment() {
     // works correctly while being cleared from the daemon's process environment.
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo $TEST_E2E_SECRET"],
         cwd.to_str().unwrap(),
@@ -346,6 +349,7 @@ fn secret_env_vars_cleared_from_daemon_environment() {
 /// between accepting the connection and building the tool's environment.
 /// The tool's output must be redacted against the value it was given, not
 /// against whatever the daemon knew when the connection opened.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn secret_refreshed_before_the_request_is_redacted() {
     let tmp = tempfile::tempdir().unwrap();
@@ -370,14 +374,17 @@ fn secret_refreshed_before_the_request_is_redacted() {
     std::thread::sleep(Duration::from_millis(2500));
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
-    send_message(
-        &mut stream,
-        &ClientMessage::Exec {
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
             tool: "sh".to_string(),
             args: vec!["-c".to_string(), "echo \"$TEST_E2E_SECRET\"".to_string()],
-            cwd: cwd.to_str().unwrap().to_string(),
-        },
-    );
+            cwd: cwd.clone(),
+        }),
+    };
+    send_message(&mut stream, &req);
 
     let mut stdout = String::new();
     let mut reader = std::io::BufReader::new(&mut stream);
@@ -388,7 +395,7 @@ fn secret_refreshed_before_the_request_is_redacted() {
                 assert_eq!(code, 0);
                 break;
             }
-            Some(DaemonMessage::Error { message }) => panic!("exec failed: {message}"),
+            Some(DaemonMessage::Error { message, .. }) => panic!("exec failed: {message}"),
             Some(_) => {}
             None => panic!("connection closed before exit"),
         }

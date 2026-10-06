@@ -8,11 +8,12 @@ mod e2e_helpers;
 
 use std::time::Duration;
 
-use airlock::protocol::v1::{ClientMessage, DaemonMessage};
+use airlock::protocol::{Auth, DaemonMessage, Request, RequestBody, SessionRequest};
 use e2e_helpers::*;
 
 // ─── Timed-out tool is killed and client receives timeout error ─────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn timed_out_tool_killed_and_client_gets_timeout_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -36,12 +37,17 @@ timeout = 2
     // Use `sh -c 'echo $$; exec sleep 600'` to get the PID for later checks.
     let mut stream = connect_to_daemon(&daemon.socket_path, 30);
 
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     // Collect responses.
     let mut stdout = String::new();
@@ -52,7 +58,7 @@ timeout = 2
         match try_read_response(&mut reader) {
             Some(DaemonMessage::Stdout { data }) => stdout.push_str(&data),
             Some(DaemonMessage::Stderr { .. }) => {}
-            Some(DaemonMessage::Error { message }) => {
+            Some(DaemonMessage::Error { message, .. }) => {
                 error_msg = Some(message);
                 break;
             }
@@ -90,6 +96,7 @@ timeout = 2
 
 // ─── A tool finishing before timeout completes normally ──────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn tool_finishing_before_timeout_completes_normally() {
     let tmp = tempfile::tempdir().unwrap();
@@ -109,7 +116,7 @@ timeout = 60
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo done quickly"],
         cwd.to_str().unwrap(),
@@ -134,6 +141,7 @@ timeout = 60
 
 // ─── Per-tool timeout override is respected over the global timeout ─────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn per_tool_timeout_override_respected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -158,12 +166,17 @@ timeout = 2
 
     let mut stream = connect_to_daemon(&daemon.socket_path, 30);
 
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "sleep 600".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "sleep 600".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     let mut error_msg = None;
 
@@ -172,7 +185,7 @@ timeout = 2
         match try_read_response(&mut reader) {
             Some(DaemonMessage::Stdout { .. }) => {}
             Some(DaemonMessage::Stderr { .. }) => {}
-            Some(DaemonMessage::Error { message }) => {
+            Some(DaemonMessage::Error { message, .. }) => {
                 error_msg = Some(message);
                 break;
             }
