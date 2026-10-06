@@ -21,13 +21,17 @@ Paths in transcripts use `~`. The macOS runtime dir is shortened to
 - **The terminal is where decisions happen.** Approval, secret prompts and
   error explanations reach the user in the terminal they typed the command
   in. Nothing the agent does produces a prompt.
-- **The agent gets messages it can relay.** Every error `exec` and `list`
+- **The agent gets messages it can relay.** Every error `exec` and `tools list`
   print says what happened and what the user has to do, in words the agent
   can pass on verbatim.
 - **Quiet when it works.** `airlock run` prints nothing before the agent
   starts unless something needs the user. `-v` shows the steps.
 - **No state in the project.** `git status` shows `airlock.toml` and, if
   someone forgot `.gitignore`, `airlock.local.toml`. Nothing else.
+- **Agent commands are separate from the user's.** What the agent and its
+  harness run sits under `airlock agent`. `exec` and `tools list` serve
+  both. Inside the sandbox, help hides what only works in the user's
+  terminal, and says that it does.
 - **The agent learns its tools from the harness, not only from the skill.**
   A harness hook tells the agent at start which tools it must run through
   Airlock. See [Harness hooks](#harness-hooks).
@@ -36,10 +40,11 @@ Paths in transcripts use `~`. The macOS runtime dir is shortened to
 
 | Where | Commands | Needs |
 |---|---|---|
-| User's terminal | `run`, `init`, `trust`, `config`, `status`, `session …`, `daemon …`, `logs`, `completions` | nothing; the daemon starts on demand |
-| Inside the agent (sandboxed) | `exec`, `list`, `status`, `check` | `AIRLOCK_ADDR` and `AIRLOCK_SESSION`, set by the session |
-| The harness, as a hook | `hook claude-code` | same; prints nothing in a project without Airlock |
-| Refused inside the sandbox | `run`, `trust`, `session`, `daemon` | — |
+| User's terminal | `run`, `init`, `trust`, `config`, `status`, `session …`, `daemon …`, `completions` | nothing; the daemon starts on demand |
+| Both | `exec`, `tools list` | a session; or, for `tools list --session`, the user's terminal |
+| The agent | `agent check` | `AIRLOCK_ADDR` and `AIRLOCK_SESSION`, set by the session |
+| The harness, as a hook | `agent hook claude-code` | same; prints nothing in a project without Airlock |
+| Refused inside the sandbox | `run`, `trust`, `status`, `session`, `daemon` | — |
 
 `init` and `config` are allowed inside the sandbox. `init` writes a file
 that still needs approval, so an agent can draft a config for the user to
@@ -54,13 +59,12 @@ airlock init [--local | --global]            write a starter config
 airlock trust [-y]                           review and approve project config
 airlock config                               merged config, with the layer each part comes from
 airlock status                               daemon, project config and sessions
-airlock exec -- TOOL [ARGS...]               (agent) run a declared tool
-airlock list                                 (agent) tools this session serves
-airlock check                                (agent) verify the session and self-test the sandbox
-airlock hook claude-code                     (harness) SessionStart hook
+airlock exec -- TOOL [ARGS...]               run a declared tool through the session
+airlock tools list [--session ID]            tools a session serves
+airlock agent check                          (agent) verify the session, self-test the sandbox
+airlock agent hook claude-code               (harness) SessionStart hook
 airlock session start | list | reload | revoke
-airlock daemon start | run | stop | restart | install | uninstall
-airlock logs [--session ID]
+airlock daemon start [--foreground] | stop | restart | logs | install | uninstall
 airlock completions <bash|zsh>               shell completion script
 ```
 
@@ -74,9 +78,12 @@ Changes from today:
 | — | `airlock run --no-sandbox`, for a harness with its own sandbox. Replaces the design's `session exec` (U2). |
 | `airlock run --no-config` + `AIRLOCK_SANDBOX_ROOT` | `--no-project-config` |
 | `--config` on every command | Only on commands that discover config: `run`, `trust`, `config`, `status`, `session start/reload` (U10) |
-| `airlock list` reads `airlock.toml` | `list` asks the daemon and needs a session. Humans use `airlock config` (U4). |
-| `airlock status`: is a daemon up | `status` shows daemon, project layers, approval state and sessions (U5) |
-| — | `trust`, `config`, `session`, `daemon install/uninstall`, `check`, `hook` |
+| `airlock list` reads `airlock.toml` | `airlock tools list` asks the daemon about the current session, or any session with `--session` (U5). `airlock config` reads the files (U4). |
+| `airlock status`: is a daemon up | `status` shows daemon, project layers, approval state and sessions |
+| `airlock daemon run` | `airlock daemon start --foreground` (U15) |
+| `airlock logs` | `airlock daemon logs` (U15) |
+| — | `trust`, `config`, `session`, `daemon install/uninstall`, `agent check`, `agent hook` |
+| Help is the same everywhere | Inside the sandbox, help lists only the commands that work there, and names the hidden ones (U16) |
 | No shell completion | `completions bash/zsh`, with tool names and session ids completed from the daemon (U14) |
 | The agent learns about Airlock from SKILL.md alone | A SessionStart hook puts the session state and tool list in the agent's context (U13) |
 | `daemon status` (in the design) | Dropped; `airlock status` covers it (U10) |
@@ -89,19 +96,21 @@ decided or left open. If accepted, the design doc is updated to match.
 | # | Change | Design today | Why |
 |---|---|---|---|
 | U1 | `airlock run` and `session start` show the diff and ask `Trust this version and continue? [y/N]` on a terminal. On a non-terminal they refuse as the design says. | Refuse, print the diff, point to `airlock trust`; "interactive prompt at start" rejected. | Refuse → `trust` → run again is three commands for one decision, and it is the most common path: every edit of the user's own local file goes through it. The prompt is exactly as safe as `airlock trust`'s: the control is that no sandbox can write the trust store, not the terminal. Startup stays non-interactive for scripts. |
-| U2 | Fold `session exec` into `airlock run --no-sandbox`. Rename `--no-daemon` to `--no-session`. | `session exec -- <harness>` next to `run`. | `airlock exec` runs a tool; `airlock session exec` would run an agent. Two meanings of `exec` in one CLI. `run` with two switches (sandbox, session) covers all four cases with one verb. Resolves F8: under `--no-session` there is no session, so `list` fails with the same message as anywhere else. |
+| U2 | Fold `session exec` into `airlock run --no-sandbox`. Rename `--no-daemon` to `--no-session`. | `session exec -- <harness>` next to `run`. | `airlock exec` runs a tool; `airlock session exec` would run an agent. Two meanings of `exec` in one CLI. `run` with two switches (sandbox, session) covers all four cases with one verb. Resolves F8: under `--no-session` there is no session, so `tools list` fails with the same message as anywhere else. |
 | U3 | `airlock init --local` writes `airlock.local.toml` with a binding stub per repo secret label, using `from = "global"` where the global layer binds the label. Validation runs before the approval prompt. | Not covered. | Joining a team repo otherwise means reading the repo file, finding unbound labels, and writing TOML by hand. Validating first means the user is never asked to approve a file that would fail anyway. |
-| U4 | New `airlock config`: the merged config with the layer each item comes from and each file's approval state. Reads the files; no daemon or session. | `list` asks the daemon; nothing for the human side. | Three layers raise "where does this come from?" (as `git config --show-origin` answers). `list` is the agent's view of a session and needs one. |
-| U5 | `airlock status` shows the admin view in the terminal and the session view inside a session. The session view uses the session token, not `admin.token`. | `status` needs `admin.token`. | SKILL.md tells the agent to use `status` to diagnose. With `admin.token` required it would always fail inside the sandbox. |
+| U4 | New `airlock config`: the merged config with the layer each item comes from and each file's approval state. Reads the files; no daemon or session. | `list` asks the daemon; nothing for the human side. | Three layers raise "where does this come from?" (as `git config --show-origin` answers). `tools list` shows what a session serves, not what the files say. |
+| U5 | Commands are grouped by audience. `list` becomes `tools list`, which serves the current session, or with `--session <ID or name>` any session from the user's terminal. The agent's own commands go under `airlock agent`: `agent check` and `agent hook`. `status` stays the user's view. | `list` at the top level, session only; `status` for both. | The agent's plumbing should not sit next to the user's commands, and the user should be able to see what a running agent can use. The session's view of itself belongs to `agent check`, so `status` needs no second mode. |
 | U6 | `airlock session reload [ID…]`, run by the user: loads and approves config, resolves secrets, swaps the session's config. The token stays valid. | Non-goal: running sessions keep their config until they end. | An agent that adds a tool to `airlock.toml` otherwise has to be restarted to use it, losing its context. The design's concern, that tools change under a running agent, holds: they change only when the user asks. |
 | U7 | `exec` and `run` exit with 125 when Airlock itself fails, 126 when a declared tool's binary cannot be used, and 127 when no such tool is declared. | Exit 1 for every Airlock error. | 1 is also the most common tool failure. Same convention as `docker run`, `env` and `chroot`. SKILL.md can say "125 means tell the user". |
 | U8 | `session start` takes `--ttl` (default 12h; `0` means until revoked). | Ends on revoke or daemon stop only. | A forgotten `session start` keeps a token valid, and an automatic daemon running, indefinitely. |
 | U9 | Version handshake on connect. A launcher that finds an idle daemon of another version restarts it. A busy one keeps serving, with a note, unless the protocol is incompatible. | Not covered. | An automatic daemon outlives the binary it was started from. |
-| U10 | `--config` is not global; `daemon status` is dropped. | `--config` global; `daemon status` kept. | `exec` and `list` ignore files, so a `--config` there is a silent no-op. One status command is enough. |
+| U10 | `--config` is not global; `daemon status` is dropped. | `--config` global; `daemon status` kept. | `exec` and `tools list` ignore files, so a `--config` there is a silent no-op. One status command is enough. |
 | U11 | `--name` on `run` and `session start`. Default: the harness command's base name, or `shell`. | Sessions have only an id. | `session list` and `trust` notes need something a person recognizes. |
 | U12 | Optional `description` on `[secrets.<label>]`. | Not in the schema. | A repo label without a source is a request to each user. The description tells them what to supply. |
-| U13 | `airlock check` (session check and sandbox self-test) and `airlock hook claude-code` (SessionStart: check, then list tools into the agent's context). The session records whether the agent runs in Airlock's sandbox or an external one. `--profile claude` installs the hook. | Not covered. | Whether the agent uses `airlock exec` depends on it reading SKILL.md. A hook delivers the same facts on every start and after every compaction, and catches a broken sandbox before the agent's first `exec`. |
+| U13 | `airlock agent check` (session check and sandbox self-test) and `airlock agent hook claude-code` (SessionStart: check, then list tools into the agent's context). The session records whether the agent runs in Airlock's sandbox or an external one. `--profile claude` installs the hook. | Not covered. | Whether the agent uses `airlock exec` depends on it reading SKILL.md. A hook delivers the same facts on every start and after every compaction, and catches a broken sandbox before the agent's first `exec`. |
 | U14 | `airlock completions <bash\|zsh>`: a dynamic completion script that asks the daemon for tool names and session ids, and hands off to the tool's own completion after `exec -- <tool>`. Nix and release tarballs install it. | Not covered. | `exec -- <TAB>` is where completion helps most, and only the session knows the tool names. A static script also goes stale on upgrade. |
+| U15 | `airlock daemon run` becomes `airlock daemon start --foreground`; `airlock logs` becomes `airlock daemon logs`. | `daemon run`; `logs` at the top level. | "run" then always means starting an agent. Logs are daemon administration, rarely needed, and do not belong at the top level. |
+| U16 | With `AIRLOCK_SANDBOX=1`, `airlock --help` and completion list only the commands that work there. The help says so and names the hidden commands. A hidden command's own `--help` still works, and starts by saying it needs the user's terminal. | Same help everywhere. | An agent that reads the help should not be shown commands it cannot use. A user in a sandboxed shell has to see why a command is missing. |
 
 ## Journeys
 
@@ -165,7 +174,7 @@ session is active, the self-test passed, and `gh` runs through
 Inside the agent:
 
 ```
-$ airlock list
+$ airlock tools list
 gh
   GitHub CLI
   GH_TOKEN = <secret "GH_TOKEN">
@@ -293,6 +302,19 @@ sessions  2 here, 3 in total
   b20e51  codex   11:30   2 execs
 ```
 
+To see what a running agent can use, from the user's terminal:
+
+```
+$ airlock tools list --session codex
+session b20e51 "codex" for ~/src/app
+gh
+  GitHub CLI
+  GH_TOKEN = <secret "GH_TOKEN">
+  ...
+```
+
+`--session` takes an ID, a unique ID prefix, or a unique session name.
+
 ### The agent changes the config
 
 The agent adds a `psql` tool to `airlock.toml` and tries it:
@@ -337,7 +359,7 @@ reloaded 7f3a9c "claude": tools +psql
 reloaded b20e51 "codex": tools +psql
 ```
 
-The agent's next `airlock list` shows `psql`. Without U6, the user would
+The agent's next `airlock tools list` shows `psql`. Without U6, the user would
 end the agent and start it again. With Claude Code, `airlock run --profile
 claude -- claude --continue` keeps the conversation.
 
@@ -475,22 +497,23 @@ airlock: this session has ended (revoked by the user, or the daemon stopped).
 
 ## Harness hooks
 
-SKILL.md tells the agent to run `airlock list` and use `airlock exec`. An
+SKILL.md tells the agent to run `airlock tools list` and use `airlock exec`. An
 agent that does not load the skill, or loses it in a compaction, runs `gh`
 directly, gets "not logged in", and works around it. A harness hook puts
 the facts in the agent's context without relying on the agent (U13).
 
-Two commands:
+Two commands, both under `airlock agent` because the agent and its
+harness run them, not the user:
 
-- **`airlock check`** is the engine, and works anywhere: it verifies the
-  session and self-tests the sandbox of the process that runs it. The agent
-  or the user can run it by hand.
-- **`airlock hook <harness>`** adapts `check` and `list` to one harness's
-  hook protocol. It reads the hook event from stdin and writes what that
-  harness expects. `claude-code` is the first adapter. Others follow the
-  harnesses that have hooks.
+- **`airlock agent check`** is the engine, and works anywhere: it verifies
+  the session and self-tests the sandbox of the process that runs it. The
+  agent can run it by hand, and so can the user in a session shell.
+- **`airlock agent hook <harness>`** adapts `check` and `tools list` to
+  one harness's hook protocol. It reads the hook event from stdin and
+  writes what that harness expects. `claude-code` is the first adapter.
+  Others follow the harnesses that have hooks.
 
-### What `airlock check` verifies
+### What `airlock agent check` verifies
 
 | Check | Passes when | Why |
 |---|---|---|
@@ -509,7 +532,7 @@ from the XDG variables. Every probe is a single `open` that is expected to
 fail. Nothing is read.
 
 **What a pass means.** The checks run in the process that runs
-`airlock check`, with that process's sandbox. They catch a misconfigured
+`airlock agent check`, with that process's sandbox. They catch a misconfigured
 sandbox. They do not prove anything against a hostile agent, which could
 fake the output. The guarantees still come from the sandbox itself.
 
@@ -522,13 +545,13 @@ fake the output. The guarantees still come from the sandbox itself.
 - Under an external sandbox, a hook may run outside that sandbox. Claude
   Code's own sandbox applies to the commands the agent runs, not
   necessarily to hooks. The hook then skips the probes, lists the tools,
-  and asks the agent to run `airlock check` once with its own shell tool,
+  and asks the agent to run `airlock agent check` once with its own shell tool,
   which is sandboxed.
 
-### `airlock check`
+### `airlock agent check`
 
 ```
-$ airlock check
+$ airlock agent check
 session   7f3a9c "claude" for ~/src/app
 daemon    answers, airlock 0.6.0
 sandbox   Airlock's
@@ -543,7 +566,7 @@ tools     gh, psql, tofu
 A failure names the check and what the user has to fix:
 
 ```
-$ airlock check
+$ airlock agent check
 session   7f3a9c "vscode" for ~/src/app
 daemon    answers, airlock 0.6.0
 sandbox   external
@@ -558,13 +581,13 @@ $ echo $?
 Exit status: 0 if every check passes, 1 if a check fails, 125 if there is
 no session or the daemon does not answer.
 
-### `airlock hook claude-code`
+### `airlock agent hook claude-code`
 
 Handles Claude Code's SessionStart event. It reads the event JSON from stdin and
 always exits 0, so its output reaches Claude as context, not as a hook
 error.
 
-**SessionStart.** Runs `check`, then `list`. Claude Code fires it on
+**SessionStart.** Runs `check`, then `tools list`. Claude Code fires it on
 startup, on resume, after `/clear` and after compaction, so the tool list
 comes back after the context is compacted. When everything passes:
 
@@ -572,7 +595,7 @@ comes back after the context is compacted. When everything passes:
 {
   "hookSpecificOutput": {
     "hookEventName": "SessionStart",
-    "additionalContext": "Airlock is active for this project (session 7f3a9c, sandbox self-test passed).\n\nThese tools hold credentials. Run them only through Airlock, as `airlock exec -- <tool> [args...]`:\n\n  gh    GitHub CLI\n  psql  Postgres shell\n  tofu  OpenTofu\n\nRunning them directly fails: their credentials are not in your environment. Secrets in their output appear as [REDACTED:NAME]; that is expected. `airlock list` shows details. Other commands run directly as usual."
+    "additionalContext": "Airlock is active for this project (session 7f3a9c, sandbox self-test passed).\n\nThese tools hold credentials. Run them only through Airlock, as `airlock exec -- <tool> [args...]`:\n\n  gh    GitHub CLI\n  psql  Postgres shell\n  tofu  OpenTofu\n\nRunning them directly fails: their credentials are not in your environment. Secrets in their output appear as [REDACTED:NAME]; that is expected. `airlock tools list` shows details. Other commands run directly as usual."
   }
 }
 ```
@@ -585,7 +608,7 @@ The other outcomes:
 | No session, but the project has `airlock.toml` | "This project uses Airlock, but this agent was not started with `airlock run`, so tools that need credentials are unavailable. Tell the user. Do not look for credentials yourself." | "Airlock: this agent has no session. Start it with `airlock run`." |
 | Session ended, or the daemon does not answer | the `exec` error message, and "tell the user" | the same message |
 | A self-test check fails | "Airlock's sandbox self-test failed: <check>. Do not use `airlock exec` until the user fixes it. Tell the user." No tool list. | "Airlock sandbox self-test failed: <check>" |
-| External sandbox | the tool list, plus "Before your first `airlock exec`, run `airlock check` with your shell tool and report any FAIL to the user." | none |
+| External sandbox | the tool list, plus "Before your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user." | none |
 | Config changed since the session started | the tool list, plus the config-changed note from [The agent changes the config](#the-agent-changes-the-config) | none |
 
 Printing nothing outside Airlock projects means the hook can sit in the
@@ -615,13 +638,13 @@ team):
 {
   "hooks": {
     "SessionStart": [
-      { "hooks": [{ "type": "command", "command": "airlock hook claude-code" }] }
+      { "hooks": [{ "type": "command", "command": "airlock agent hook claude-code" }] }
     ]
   }
 }
 ```
 
-`airlock hook claude-code --print-settings` prints this block, so the docs
+`airlock agent hook claude-code --print-settings` prints this block, so the docs
 and the binary cannot drift apart.
 
 The agent can edit a project's `.claude/settings.json` and remove the hook.
@@ -634,7 +657,7 @@ Without a hook adapter, the generic form works in any harness that runs a
 command at start and shows its output to the agent:
 
 ```
-$ airlock hook text
+$ airlock agent hook text
 ```
 
 It prints the same context as the SessionStart hook, as plain text, and
@@ -667,7 +690,7 @@ Packages install the file, so most users never run `completions`:
 
 | Position | Candidates | From |
 |---|---|---|
-| `airlock <TAB>` | subcommands; inside a sandbox (`AIRLOCK_SANDBOX=1`) only the ones that work there: `exec`, `list`, `status`, `check`, `config`, `init`, `hook` | static |
+| `airlock <TAB>` | subcommands; inside a sandbox (`AIRLOCK_SANDBOX=1`) only the ones that work there: `exec`, `tools`, `agent`, `config`, `init`, `completions` (U16) | static |
 | `airlock exec -- <TAB>` | the session's tools, with descriptions | a `List` request with the session token; nothing without a session |
 | `airlock exec -- gh <TAB>` | `gh`'s own completion, as if the line started with `gh` | delegation: zsh `_normal`, bash `_command_offset` |
 | `airlock run -- <TAB>` | commands, then that command's own completion | delegation |
@@ -675,8 +698,8 @@ Packages install the file, so most users never run `completions`:
 | `--config` | `*.toml` files | the shell's file completion |
 | `--allow-read`, `--allow-write` | paths | the shell's file completion |
 | `--passthrough-env` | names of exported variables | the shell |
-| `session reload`, `session revoke`, `logs --session` | session ids, with name, project and start time | the daemon, with `admin.token`; outside the sandbox only |
-| `hook` | `claude-code`, `text` | static |
+| `session reload`, `session revoke`, `tools list --session`, `daemon logs --session` | session ids, with name, project and start time | the daemon, with `admin.token`; outside the sandbox only |
+| `agent hook` | `claude-code`, `text` | static |
 | `session start --format` | `sh`, `fish`, `json` | static |
 
 In zsh, descriptions appear next to candidates:
@@ -783,17 +806,17 @@ Start an agent:
   config       Show the merged config and where each part comes from
   status       Show the daemon, this project's config, and its sessions
 
-Inside an agent:
-  exec         Run a declared tool
-  list         List the tools this session can run
-  check        Verify the session and self-test the sandbox
-  hook         Hook for an agent harness, e.g. Claude Code's SessionStart
+Use tools:
+  exec         Run a declared tool through your session
+  tools        List the tools a session can run
 
 Manage:
   session      Start, list, reload and end sessions
-  daemon       Start, stop or install the per-user daemon
-  logs         Show recent daemon log entries
+  daemon       Start, stop or install the per-user daemon; its logs
   completions  Print a bash or zsh completion script
+
+For the agent and its harness:
+  agent        Check the session and sandbox; answer harness hooks
 
 Options:
   -h, --help     Print help
@@ -802,6 +825,51 @@ Options:
 Get started: `airlock init`, then `airlock run --profile claude`.
 Docs: https://github.com/ModernPath/airlock
 ```
+
+### `airlock --help` inside the sandbox
+
+With `AIRLOCK_SANDBOX=1`, the help lists only the commands that work there.
+It says so first and names what it hid (U16):
+
+```
+Airlock — credential broker for AI agents. Tools get your secrets; the agent never does.
+
+You are inside an Airlock sandbox (AIRLOCK_SANDBOX=1), so this help lists
+only the commands that work here. Hidden because they need your own
+terminal: run, trust, status, session, daemon.
+
+Usage: airlock <COMMAND>
+
+Use tools:
+  exec         Run a declared tool through your session
+  tools        List the tools a session can run
+
+For the agent and its harness:
+  agent        Check the session and sandbox; answer harness hooks
+
+Config:
+  init         Create a starter config
+  config       Show the merged config and where each part comes from
+  completions  Print a bash or zsh completion script
+
+Options:
+  -h, --help     Print help
+  -V, --version  Print version
+```
+
+A hidden command's own help still works, so a user who knows the command
+is not left guessing:
+
+```
+$ airlock session --help
+Not available inside an Airlock sandbox: run it from your own terminal.
+
+Start, list, reload and end sessions
+…
+```
+
+Under `airlock run --no-sandbox`, `AIRLOCK_SANDBOX` is not set, and the
+help is the full one.
 
 ### `airlock run --help`
 
@@ -813,8 +881,8 @@ Usage: airlock run [OPTIONS] [-- <COMMAND>...]
 Loads this project's config (your global config, airlock.toml and
 airlock.local.toml), asks you to approve any file that changed, resolves
 its secrets and starts a session. The agent runs in an OS sandbox with
-AIRLOCK_ADDR and AIRLOCK_SESSION set, so `airlock exec` and `airlock list`
-work inside it. The session ends when the agent exits.
+AIRLOCK_ADDR and AIRLOCK_SESSION set, so `airlock exec` and
+`airlock tools list` work inside it. The session ends when the agent exits.
 
 The daemon starts if it is not running.
 
@@ -890,25 +958,56 @@ Examples:
 A tool can also exit with 125 to 127. Airlock's own errors always start
 with `airlock:` on stderr.
 
-### `airlock list --help`
+### `airlock tools --help`
 
 ```
-List the tools this session can run
+List the tools a session can run
 
-Usage: airlock list
+Usage: airlock tools <COMMAND>
 
-Asks the daemon, so the list matches what `airlock exec` accepts. Needs a
-session. To read the config files instead, use `airlock config`.
+Commands:
+  list  List the tools a session can run
+
+`airlock tools` with no command is `airlock tools list`.
 ```
 
-The output format does not change.
+```
+List the tools a session can run
 
-### `airlock check --help`
+Usage: airlock tools list [OPTIONS]
+
+Asks the daemon, so the list matches what `airlock exec` accepts. Inside a
+session, lists that session's tools. From your own terminal, pass
+--session to see what a running agent can use. To read the config files
+instead, use `airlock config`.
+
+Options:
+      --session <SESSION>  A session ID, unique ID prefix or unique name; needs your own terminal
+  -h, --help               Print help
+```
+
+Inside a session, the output format does not change. With `--session`, a
+first line names the session.
+
+### `airlock agent --help`
+
+```
+Check the session and sandbox; answer harness hooks
+
+The agent and its harness run these, not you. You can run `agent check`
+yourself in a session shell to test a sandbox.
+
+Usage: airlock agent <COMMAND>
+
+Commands:
+  check  Verify the session and self-test the sandbox
+  hook   Answer a harness hook, e.g. Claude Code's SessionStart
+```
 
 ```
 Verify the session and self-test the sandbox
 
-Usage: airlock check [OPTIONS]
+Usage: airlock agent check [OPTIONS]
 
 Checks that this process has a working Airlock session, and that its
 sandbox keeps it away from Airlock's own files: it cannot read admin.token
@@ -926,18 +1025,15 @@ Options:
 Exit status: 0 if all checks pass, 1 if one fails, 125 without a session.
 ```
 
-### `airlock hook --help`
-
 ```
-Hook for an agent harness
+Answer a harness hook
 
-Usage: airlock hook <HARNESS>
+Usage: airlock agent hook <HARNESS>
 
-Reads the harness's hook event from stdin, runs `airlock check` and
-`airlock list`, and answers in the harness's hook format. On session
+Reads the harness's hook event from stdin, runs `airlock agent check` and
+`airlock tools list`, and answers in the harness's hook format. On session
 start the agent learns which tools to run through `airlock exec`. Prints
-nothing in a project that does not use Airlock.
-Always exits 0.
+nothing in a project that does not use Airlock. Always exits 0.
 
 Harnesses:
   claude-code  SessionStart hook
@@ -1042,8 +1138,8 @@ Show the daemon, this project's config, and its sessions
 
 Usage: airlock status [OPTIONS]
 
-Inside a session, shows that session instead: its project, whether the
-daemon answers, and whether the config files changed after it started.
+Needs your own terminal. Inside a session, `airlock agent check` shows the
+session.
 
 Exit status: 0 if the daemon is running, 3 if it is not.
 
@@ -1055,16 +1151,6 @@ Options:
 
 Exit status 3 follows the LSB and `systemctl status` convention. A daemon
 that is not running is normal in v2, not an error.
-
-Inside a session:
-
-```
-$ airlock status
-session   7f3a9c "claude" for ~/src/app, started 10:42
-daemon    answers at unix://$RUNTIME/airlock.sock
-config    airlock.toml changed after this session started; it applies once the
-          user approves it and reloads the session
-```
 
 ### `airlock session --help`
 
@@ -1153,32 +1239,42 @@ daemon when it is not running, and a daemon started that way exits after
 Usage: airlock daemon <COMMAND>
 
 Commands:
-  start      Start the daemon in the background; it keeps running without sessions
-  run        Run the daemon in the foreground, for service managers and debugging
+  start      Start the daemon; it keeps running without sessions
   stop       Stop the daemon. Ends every session
   restart    Stop the daemon and start it again. Ends every session
+  logs       Show recent daemon log entries
   install    Run the daemon as a launchd agent (macOS) or systemd user service (Linux)
   uninstall  Remove the service that `install` set up
 ```
 
-`stop` and `restart` take `-y, --yes`.
+```
+Start the daemon; it keeps running without sessions
 
-### `airlock logs --help`
+Usage: airlock daemon start [OPTIONS]
+
+Options:
+      --foreground  Stay in the foreground and log to stderr, for service managers
+                    and debugging
+  -h, --help        Print help
+```
 
 ```
 Show recent daemon log entries
 
-Usage: airlock logs [OPTIONS]
+Usage: airlock daemon logs [OPTIONS]
 
 Options:
-      --session <ID>  Only entries for this session
-  -h, --help          Print help
+      --session <SESSION>  Only entries for this session
+  -h, --help               Print help
 ```
+
+`stop` and `restart` take `-y, --yes`. The launchd agent and the systemd
+unit that `install` writes run `airlock daemon start --foreground`.
 
 ## Messages
 
 The user sees the messages for launcher commands, and the agent sees the
-ones for `exec` and `list`. Every agent-facing message names the user
+ones for `exec`, `tools list` and `agent check`. Every agent-facing message names the user
 action, so the agent can relay it without interpreting it.
 
 ### Launcher (`run`, `session start`, `session reload`)
@@ -1198,8 +1294,9 @@ action, so the agent can relay it without interpreting it.
 | Runtime dir check fails | `error: runtime dir <path> is owned by uid 502, not you (501)`, and similar per check | 125 |
 | Daemon version skew | note or error as in [Upgrading Airlock](#upgrading-airlock) | 0 / 125 |
 | Run inside the sandbox | `error: \`airlock run\` cannot run inside an Airlock sandbox; run it from your own terminal` | 125 |
+| `status` inside the sandbox | `error: \`airlock status\` needs your own terminal. Inside a session, \`airlock agent check\` shows this session.` | 125 |
 
-### Agent (`exec`, `list`, `status`)
+### Agent (`exec`, `tools list`, `agent check`)
 
 | Situation | Message | Exit |
 |---|---|---|
@@ -1211,18 +1308,18 @@ action, so the agent can relay it without interpreting it.
 | Binary in the project | `airlock: tool "gh" resolves to ~/src/app/bin/gh, inside the project; refusing to run it` | 126 |
 | Stale secret | `airlock: secret "X" is stale (last refresh failed: …). The user needs to fix its source; Airlock retries on its own.` | 125 |
 | Working dir outside root | `airlock: <cwd> is outside this session's project ~/src/app` | 125 |
-| Self-test failure (`check`) | `FAIL <what> can be <read/written>.` + the fix, as in [`airlock check`](#airlock-check) | 1 |
+| Self-test failure (`agent check`) | `FAIL <what> can be <read/written>.` + the fix, as in [`airlock agent check`](#airlock-agent-check) | 1 |
 
 ## Agent-facing guide (SKILL.md)
 
-The commands an agent uses do not change. What changes is where the
-daemon comes from, what the errors mean, and what happens after the agent
-edits the config. Draft of the changed SKILL.md sections:
+`exec` does not change. `list` becomes `tools list`, and the agent's own
+check is `agent check`. What also changes is where the daemon comes from,
+what the errors mean, and what happens after the agent edits the config. Draft of the changed SKILL.md sections:
 
 > ### List available tools
 >
 > ```
-> airlock list
+> airlock tools list
 > ```
 >
 > Shows the tools your session can run, with their descriptions and the
@@ -1241,7 +1338,7 @@ edits the config. Draft of the changed SKILL.md sections:
 > |---|---|---|
 > | 125 | No session, session ended, daemon unreachable, stale secret | Report the message to the user verbatim. Do not retry in a loop. |
 > | 126 | The tool is declared but its binary cannot be used | Report the message to the user. |
-> | 127 | No tool by that name | Check `airlock list`. Run tools that are not listed directly, without Airlock. |
+> | 127 | No tool by that name | Check `airlock tools list`. Run tools that are not listed directly, without Airlock. |
 >
 > ### Your session
 >
@@ -1253,8 +1350,8 @@ edits the config. Draft of the changed SKILL.md sections:
 > If `AIRLOCK_SESSION` is not set, you were not started through Airlock, and
 > `airlock exec` cannot work. Tell the user.
 >
-> `airlock status` shows your session's project and whether the config
-> changed after it started.
+> `airlock agent check` shows your session's project, tests your sandbox,
+> and says whether the config changed after the session started.
 >
 > ### Changing the Airlock config
 >
@@ -1269,14 +1366,15 @@ edits the config. Draft of the changed SKILL.md sections:
 > airlock session reload
 > ```
 >
-> Do not run `airlock trust`, `airlock run`, `airlock session` or
-> `airlock daemon` yourself. They are refused inside the sandbox, and they
-> would not work anyway.
+> Do not run `airlock trust`, `airlock run`, `airlock status`,
+> `airlock session` or `airlock daemon` yourself. They need the user's
+> terminal: `airlock --help` inside the sandbox hides them and says so, and
+> running them anyway is refused.
 >
 > ### Checking your setup
 >
 > ```
-> airlock check
+> airlock agent check
 > ```
 >
 > Verifies your session and tests that your sandbox keeps you away from
@@ -1287,14 +1385,14 @@ edits the config. Draft of the changed SKILL.md sections:
 >
 > ## Workflow for AI Agents
 >
-> 1. Run `airlock list` to discover available tools, unless your harness
+> 1. Run `airlock tools list` to discover available tools, unless your harness
 >    already listed them at start.
 > 2. Run `airlock exec -- <tool> [args...]` to invoke a tool.
 > 3. If you see `[REDACTED:NAME]` in output, that is expected. Do not try
 >    to recover or work around redacted values.
 > 4. If `airlock exec` exits with 125 or 126, report its message to the
 >    user verbatim. Do not try to start the daemon or a session.
-> 5. For tools not listed by `airlock list`, run them directly without
+> 5. For tools not listed by `airlock tools list`, run them directly without
 >    Airlock.
 > 6. If you need a tool that is not declared, propose the config change,
 >    make it if the user agrees, and ask the user to approve it and reload
@@ -1302,7 +1400,7 @@ edits the config. Draft of the changed SKILL.md sections:
 
 The skill's frontmatter description also changes, from "run `airlock list`
 to discover available tools" to: "Use when a task needs a tool that
-`airlock list` shows; works inside an agent started with `airlock run`."
+`airlock tools list` shows; works inside an agent started with `airlock run`."
 
 ## README.md
 
@@ -1396,8 +1494,8 @@ The `airlock daemon start` variants go away.
 
 What the SessionStart hook does, the fact that `--profile claude`
 installs it, and the `settings.json` block (the output of
-`airlock hook claude-code --print-settings`) for everyone else.
-`airlock check` for verifying a harness's own sandbox. The README's
+`airlock agent hook claude-code --print-settings`) for everyone else.
+`airlock agent check` for verifying a harness's own sandbox. The README's
 "Where Airlock fits" list gains one line: the hook is how the agent learns
 which tools go through Airlock.
 
@@ -1425,12 +1523,11 @@ airlock trust                      # review and approve airlock.toml / airlock.l
 airlock config                     # merged config and where each part comes from
 airlock status                     # daemon, approval state, sessions
 airlock exec -- <tool> [args...]   # (inside a session) run a declared tool
-airlock list                       # (inside a session) tools you can run
-airlock check                      # (inside a session) verify the session, self-test the sandbox
-airlock hook claude-code           # Claude Code hook; `--print-settings` shows how to install it
+airlock tools list [--session ID]  # tools a session can run
+airlock agent check                # (inside a session) verify the session, self-test the sandbox
+airlock agent hook claude-code     # Claude Code hook; `--print-settings` shows how to install it
 airlock session start|list|reload|revoke
-airlock daemon start|run|stop|restart|install|uninstall
-airlock logs [--session ID]
+airlock daemon start [--foreground]|stop|restart|logs|install|uninstall
 airlock completions bash|zsh       # shell completion; see "Shell completion"
 ```
 
@@ -1511,7 +1608,7 @@ Header comment for a single-file example:
   `claude --settings` merges hooks with the user's own settings rather than
   replacing them. Also decide what happens when the user has also
   installed the hook in `settings.json`: the tool list would arrive twice.
-  `airlock hook` could set a marker variable on its first run and stay
+  `airlock agent hook` could set a marker variable on its first run and stay
   silent on the second.
 - **Should a failed self-test block `exec`?** Today the hook only tells
   the agent and the user. The daemon could refuse `exec` for a session

@@ -12,7 +12,7 @@ described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
 This document is the design record: what changes, why, and which
 alternatives were rejected. The user-facing surface (commands, help text,
 messages, harness hooks, and drafts of the doc changes) is in
-[airlock-v2-ux.md](airlock-v2-ux.md), which also proposes changes U1–U14
+[airlock-v2-ux.md](airlock-v2-ux.md), which also proposes changes U1–U16
 to this design. When it ships, the user-facing reference will
 be [README.md](../README.md) and [SKILL.md](../SKILL.md).
 
