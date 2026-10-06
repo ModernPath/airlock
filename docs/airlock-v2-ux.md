@@ -6,9 +6,10 @@ harness hooks, and the examples. The README, SKILL.md and SECURITY.md
 changes are listed in the design doc's
 [Docs to update when this ships](airlock-v2-design.md#docs-to-update-when-this-ships).
 
-**Status:** proposal, companion to [airlock-v2-design.md](airlock-v2-design.md).
-The design doc decides the mechanism. This doc decides the surface. Where
-the surface needed the mechanism to change, the change is listed in
+**Status:** implemented, companion to [airlock-v2-design.md](airlock-v2-design.md).
+The design doc decides the mechanism. This doc decides the surface, and the
+surface described here has shipped. Where the surface needed the mechanism
+to change, the change is listed in
 [Changes to the design](#changes-to-the-design) and marked **(U<n>)** where
 it appears. U1–U16 are accepted and incorporated into the design doc,
 except U14, which is [planned for v2.1](airlock-v2-design.md#planned-for-v21).

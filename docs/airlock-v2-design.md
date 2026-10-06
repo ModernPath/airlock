@@ -3,11 +3,13 @@
 One daemon per user with sessions, a runtime directory outside the
 project, layered config, and approval of project config.
 
-**Status:** proposal. The blocking items in [Open questions and
-follow-ups](#open-questions-and-follow-ups) are resolved. Nothing here is
-implemented yet. Today's behavior is
-described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
-[SECURITY.md](../SECURITY.md).
+**Status:** implemented. The blocking items in [Open questions and
+follow-ups](#open-questions-and-follow-ups) are resolved, and this design has
+shipped. Current behavior is described in [ARCHITECTURE.md](../ARCHITECTURE.md),
+[SECURITY.md](../SECURITY.md), [README.md](../README.md) and
+[SKILL.md](../SKILL.md); this document and
+[airlock-v2-ux.md](airlock-v2-ux.md) remain the design and surface record of
+why it looks the way it does.
 
 This document is the design record: what changes, why, and which
 alternatives were rejected. The user-facing surface (commands and their
@@ -1534,6 +1536,11 @@ with no review step, and agents rarely need to write them. Seatbelt can deny
 B7. This is defense in depth, not a guarantee: Linux cannot express it, and
 `core.fsmonitor` in `.git/config` stays open. Worktrees keep hooks in the
 common dir, which may lie outside the root.
+
+**Implemented**, in scope for the first release rather than deferred: see
+[macOS — Apple Seatbelt](../SECURITY.md#macos--apple-seatbelt-sbpl) and
+["`.git/hooks` write denial (F9)"](../SECURITY.md#git-hooks-write-denial-f9)
+in SECURITY.md.
 
 **F10. Run each session's proxy in its own process.** The proxy parses HTTP
 and TLS from sandboxed tools and from upstream servers. In the shared daemon,

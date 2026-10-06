@@ -1,9 +1,63 @@
 # Airlock TODO
 
+## Airlock v2 follow-ups
+
+[docs/airlock-v2-design.md](docs/airlock-v2-design.md) tracks the items that
+came out of designing and implementing v2 but weren't blocking. Each has its
+own write-up there; this is just the index so they aren't lost:
+
+- **[F1](docs/airlock-v2-design.md#follow-ups) — ownership checks and XDG
+  handling for the anchors.** "Owned by the effective uid" proves nothing
+  against the agent, which runs as the same uid; only "outside every write
+  grant" actually protects an anchor from it. Revisit whether the ownership
+  and mode checks pull their weight, or whether anchors should come from the
+  passwd home directory instead of honoring XDG at all.
+- **[F2](docs/airlock-v2-design.md#follow-ups) — the global config under
+  home-manager.** home-manager links `~/.config/airlock/airlock.toml` into
+  `/nix/store`, root-owned, so the ownership check refuses it today. Decide
+  whether to accept root ownership or check only that no sandbox can write
+  the file.
+- **[F3](docs/airlock-v2-design.md#follow-ups) — review a policy diff, not
+  only a byte diff.** A unified diff hides which TOML table a line belongs
+  to and doesn't catch confusable characters. Show the effective merged-policy
+  change next to the byte diff; mark comment-only edits as no-op.
+- **[F6](docs/airlock-v2-design.md#follow-ups) — every git worktree needs
+  its own first approval.** Agent workflows create worktrees often. Consider
+  accepting a file whose bytes match a copy already approved for the same
+  git common dir.
+- **[F7](docs/airlock-v2-design.md#follow-ups) — runtime dir lifetime.**
+  `systemd-logind` deletes `/run/user/<uid>` at logout, orphaning a daemon
+  started over ssh; a systemd user service stops at logout without
+  `loginctl enable-linger`. Check macOS's periodic temp cleanup against a
+  long-running daemon's PID file too.
+- **[F10](docs/airlock-v2-design.md#follow-ups) — run each session's proxy
+  in its own process.** The proxy is the largest piece of untrusted-input
+  parsing (hyper, rustls) in a daemon that now holds every project's
+  secrets, not just one. A per-session proxy process would need only the
+  credentials for its own routes.
+- **[F11](docs/airlock-v2-design.md#follow-ups) — network transport.** The
+  v2 protocol keeps this possible (see
+  [airlock-v2-technical-guidance.md](docs/airlock-v2-technical-guidance.md))
+  but doesn't implement it. Needs TLS, tokens bound to a client TLS identity
+  instead of a process tree, and an answer for where tools run.
+- **[V1](docs/airlock-v2-design.md#planned-for-v21) — dynamic shell
+  completion.** Designed in
+  [airlock-v2-ux.md](docs/airlock-v2-ux.md#shell-completion) but deferred:
+  `airlock completions <bash|zsh>` calling back into the daemon on every
+  TAB for tool names and session ids. Pins `clap_complete`'s
+  `unstable-dynamic` feature.
+
 ## Security backlog
 
 These items came out of the April 2026 security review. See
 `~/.claude/plans/expressive-squishing-conway.md` for the full review context.
+
+Airlock v2 resolved the socket peer-authentication item in this section (a
+session token, checked against the caller's process tree, replaces
+uid-only socket trust — see [SECURITY.md](SECURITY.md#sessions)) and added a
+peer-uid check as part of resolving the auth principal on every connection.
+The items below are unrelated to the v2 session/config work and are still
+open.
 
 ### Per-child resource limits (`setrlimit`)
 
@@ -24,22 +78,6 @@ existing pre-exec blocks on Linux and macOS.
 
 **Config schema.** Likely a `[tools.X.limits]` table in `airlock.toml`; see
 [src/config.rs](src/config.rs).
-
-### Peer credential check on socket accept
-
-**What.** On each `accept()`, verify the peer UID matches the daemon's EUID
-and reject otherwise. Airlock currently relies entirely on socket mode `0700`
-(verified at startup) for peer authentication.
-
-- Linux: `getsockopt(SO_PEERCRED)`.
-- macOS: `getpeereid` / `LOCAL_PEERCRED`.
-
-**Why defer.** Defense-in-depth only: a same-UID attacker who can bypass the
-socket mode already has significant access. Worth adding eventually but not
-urgent given the existing mode check and the `verify_socket_permissions`
-refusal at startup.
-
-Ref: [src/daemon.rs:606-621](src/daemon.rs#L606-L621).
 
 ### Set `PR_SET_DUMPABLE = 0` in the child (Linux)
 
