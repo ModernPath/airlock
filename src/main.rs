@@ -396,6 +396,7 @@ fn build_after_help(cmd: &clap::Command, sandboxed: bool) -> String {
             hidden.join(", ")
         ));
         out.push_str(&render_command_list(cmd, SANDBOX_VISIBLE));
+        out.push('\n');
     } else {
         for (title, names) in HELP_GROUPS {
             out.push_str(title);
@@ -420,6 +421,10 @@ fn customize_help(mut cmd: clap::Command, sandboxed: bool) -> clap::Command {
             let notice = hidden_command_notice(name);
             cmd = cmd.mut_subcommand(name, |c| c.hide(true).before_help(notice));
         }
+        // `init` itself works inside the sandbox, but `--global` needs the
+        // user's own terminal (sandbox_refusal refuses it) — hide the arg
+        // so a sandboxed `init --help` doesn't list a flag it then refuses.
+        cmd = cmd.mut_subcommand("init", |c| c.mut_arg("global", |a| a.hide(true)));
     }
     cmd = cmd.mut_subcommand("daemon", |c| {
         c.after_help(
