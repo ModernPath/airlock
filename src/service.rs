@@ -390,6 +390,7 @@ pub fn uninstall_cmd() -> ExitCode {
 
 // ─── XML / systemd escaping ─────────────────────────────────────────────────
 
+#[cfg(target_os = "macos")]
 fn escape_xml(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
@@ -1183,6 +1184,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(target_os = "macos")]
     fn escape_xml_escapes_all_five_special_characters() {
         assert_eq!(
             escape_xml("a&b<c>d\"e'f"),
