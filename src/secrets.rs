@@ -797,6 +797,7 @@ mod tests {
             secrets: secret_map,
             tools: HashMap::new(),
             agent: None,
+            tool_state_dirs: Vec::new(),
         }
     }
 
@@ -829,6 +830,7 @@ mod tests {
             secrets: secret_map,
             tools: HashMap::new(),
             agent: None,
+            tool_state_dirs: Vec::new(),
         }
     }
 

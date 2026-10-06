@@ -504,6 +504,7 @@ fn resolve_config(
         secrets: HashMap::new(),
         tools: HashMap::new(),
         agent: None,
+        tool_state_dirs: Vec::new(),
     })
 }
 
