@@ -553,25 +553,43 @@ fn self_test_failed_output(check: &str) -> (String, String) {
     )
 }
 
-fn external_output(tools: &[ToolInfo]) -> String {
+/// The preamble plus tool table shared by `success_output`,
+/// `external_output` and `config_changed_output` — they differ only in
+/// the first sentence (whether the self-test ran) and in what, if
+/// anything, follows the table.
+fn preamble_and_table(preamble: &str, tools: &[ToolInfo]) -> String {
     format!(
-        "{}\n\nBefore your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user.",
-        tool_table(tools)
-    )
-}
-
-fn config_changed_output(tools: &[ToolInfo]) -> String {
-    format!("{}\n\n{CONFIG_CHANGED_NOTE}", tool_table(tools))
-}
-
-fn success_output(session_id: &str, tools: &[ToolInfo]) -> String {
-    format!(
-        "Airlock is active for this project (session {session_id}, sandbox self-test passed).\n\n\
+        "{preamble}\n\n\
          These tools hold credentials. Run them only through Airlock, as `airlock exec -- <tool> [args...]`:\n\n\
          {}\n\n\
          Running them directly fails: their credentials are not in your environment. Secrets in their output appear as [REDACTED:NAME]; that is expected. `airlock tools list` shows details. Other commands run directly as usual.",
         tool_table(tools)
     )
+}
+
+fn external_output(session_id: &str, tools: &[ToolInfo]) -> String {
+    let preamble = format!(
+        "Airlock is active for this project (session {session_id}; your harness provides the sandbox, so Airlock did not self-test it)."
+    );
+    format!(
+        "{}\n\nBefore your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user.",
+        preamble_and_table(&preamble, tools)
+    )
+}
+
+fn config_changed_output(session_id: &str, tools: &[ToolInfo]) -> String {
+    format!(
+        "{}\n\n{CONFIG_CHANGED_NOTE}",
+        preamble_and_table(&success_preamble(session_id), tools)
+    )
+}
+
+fn success_preamble(session_id: &str) -> String {
+    format!("Airlock is active for this project (session {session_id}, sandbox self-test passed).")
+}
+
+fn success_output(session_id: &str, tools: &[ToolInfo]) -> String {
+    preamble_and_table(&success_preamble(session_id), tools)
 }
 
 /// The first line of a probe message — everything before the first
@@ -677,7 +695,11 @@ async fn hook_cmd_async(harness: Harness) {
     };
 
     if session.sandbox == SandboxKind::External {
-        print_rendered(harness, Some(&external_output(&tools)), None);
+        print_rendered(
+            harness,
+            Some(&external_output(&session.id.to_string(), &tools)),
+            None,
+        );
         return;
     }
 
@@ -713,7 +735,11 @@ async fn hook_cmd_async(harness: Harness) {
     }
 
     if client::layers_changed(&session.layers) {
-        print_rendered(harness, Some(&config_changed_output(&tools)), None);
+        print_rendered(
+            harness,
+            Some(&config_changed_output(&session.id.to_string(), &tools)),
+            None,
+        );
         return;
     }
 
@@ -1096,17 +1122,45 @@ mod tests {
 
     #[test]
     fn external_output_lists_tools_and_asks_for_manual_check() {
-        let out = external_output(&sample_tools());
+        let out = external_output("7f3a9c", &sample_tools());
         assert!(out.contains("gh    GitHub CLI"));
         assert!(out.contains("run `airlock agent check` with your shell tool"));
     }
 
     #[test]
+    fn external_output_has_the_same_preamble_and_table_as_success_but_does_not_claim_self_test() {
+        let tools = sample_tools();
+        let out = external_output("7f3a9c", &tools);
+        assert!(
+            out.starts_with(
+                "Airlock is active for this project (session 7f3a9c; your harness provides the sandbox, so Airlock did not self-test it).\n\n\
+                 These tools hold credentials. Run them only through Airlock, as `airlock exec -- <tool> [args...]`:\n\n"
+            ),
+            "{out}"
+        );
+        assert!(!out.contains("self-test passed"));
+        assert!(out.contains(&tool_table(&tools)));
+        assert!(out.contains(
+            "Running them directly fails: their credentials are not in your environment."
+        ));
+    }
+
+    #[test]
     fn config_changed_output_lists_tools_and_note() {
-        let out = config_changed_output(&sample_tools());
+        let out = config_changed_output("7f3a9c", &sample_tools());
         assert!(out.contains("gh    GitHub CLI"));
         assert!(out.contains("airlock trust"));
         assert!(out.contains("airlock session reload"));
+    }
+
+    #[test]
+    fn config_changed_output_has_the_same_preamble_as_success() {
+        let tools = sample_tools();
+        let out = config_changed_output("7f3a9c", &tools);
+        assert!(out.starts_with(&success_preamble("7f3a9c")), "{out}");
+        assert!(out.contains(
+            "Running them directly fails: their credentials are not in your environment."
+        ));
     }
 
     #[test]
