@@ -10,6 +10,12 @@
 //! Build systems that know the revision but cannot run git can supply either
 //! value directly as `AIRLOCK_GIT_HASH` / `AIRLOCK_GIT_DIRTY`. The Nix build
 //! does: its sandbox has no git and builds from a store copy with no `.git`.
+//!
+//! It also sets the `no_nested_sandbox` cfg when the build runs where an OS
+//! sandbox cannot be applied: inside an Airlock sandbox (`AIRLOCK_SANDBOX=1`;
+//! macOS refuses to nest Seatbelt profiles) or wherever the builder says so
+//! with `AIRLOCK_NO_NESTED_SANDBOX=1` (the Nix build sandbox). Tests that
+//! apply a sandbox are ignored under that cfg and run everywhere else.
 
 use std::env;
 use std::process::Command;
@@ -20,6 +26,14 @@ fn main() {
     println!("cargo:rerun-if-changed=.git/index");
     println!("cargo:rerun-if-env-changed=AIRLOCK_GIT_HASH");
     println!("cargo:rerun-if-env-changed=AIRLOCK_GIT_DIRTY");
+    println!("cargo:rerun-if-env-changed=AIRLOCK_SANDBOX");
+    println!("cargo:rerun-if-env-changed=AIRLOCK_NO_NESTED_SANDBOX");
+    println!("cargo:rustc-check-cfg=cfg(no_nested_sandbox)");
+
+    let flag_set = |name: &str| env::var(name).is_ok_and(|v| v == "1");
+    if flag_set("AIRLOCK_SANDBOX") || flag_set("AIRLOCK_NO_NESTED_SANDBOX") {
+        println!("cargo:rustc-cfg=no_nested_sandbox");
+    }
 
     let hash = env::var("AIRLOCK_GIT_HASH").unwrap_or_else(|_| {
         Command::new("git")
