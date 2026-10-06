@@ -116,10 +116,15 @@ pub enum Profile {
 /// `sandbox-exec` wrapper (nesting Seatbelt profiles is rejected by the
 /// kernel — airlock's outer profile already confines the agent) and
 /// installs the SessionStart hook described in
-/// `docs/airlock-v2-ux.md`, "Installing the hook". Phase 3 (`agent hook
-/// claude-code --print-settings`) prints the `hooks` portion of this same
-/// object so the two never drift apart.
-pub const CLAUDE_HOOK_SETTINGS_JSON: &str = r#"{"sandbox":{"enabled":false},"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"airlock agent hook claude-code"}]}]}}"#;
+/// `docs/airlock-v2-ux.md`, "Installing the hook". The `hooks` portion
+/// comes from [`crate::agent::claude_code_hooks_value`] — the same object
+/// `agent hook claude-code --print-settings` prints — so the hook actually
+/// installed and the one the docs show can never drift apart.
+pub fn claude_hook_settings_json() -> String {
+    let mut value = crate::agent::claude_code_hooks_value();
+    value["sandbox"] = serde_json::json!({ "enabled": false });
+    serde_json::to_string(&value).expect("hook settings JSON always serializes")
+}
 
 impl Profile {
     /// Default command and arguments to invoke when `airlock run --profile <P>`
@@ -130,7 +135,7 @@ impl Profile {
                 "claude".to_string(),
                 "--dangerously-skip-permissions".to_string(),
                 "--settings".to_string(),
-                CLAUDE_HOOK_SETTINGS_JSON.to_string(),
+                claude_hook_settings_json(),
             ],
         }
     }

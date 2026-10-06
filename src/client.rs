@@ -21,14 +21,16 @@ use crate::protocol::{
 use crate::runtime_dir;
 
 /// No `AIRLOCK_SESSION` (or `AIRLOCK_ADDR`) is set — this process was not
-/// started under a session.
-const NO_SESSION_MESSAGE: &str = "no Airlock session. The user starts one with `airlock run`; this process was not started that way.";
+/// started under a session. `pub(crate)`: `agent.rs`'s `check`/`hook`
+/// reuse the exact wording.
+pub(crate) const NO_SESSION_MESSAGE: &str = "no Airlock session. The user starts one with `airlock run`; this process was not started that way.";
 
 /// Reads `AIRLOCK_ADDR` and `AIRLOCK_SESSION`, returning the socket path and
 /// parsed token, or `None` if either is missing or malformed — both cases
 /// collapse to the same "no session" message (docs/airlock-v2-ux.md,
-/// "Messages → Agent").
-fn session_from_env() -> Option<(PathBuf, SessionToken)> {
+/// "Messages → Agent"). `pub(crate)`: shared with `agent.rs`'s `check`/
+/// `hook`, which read the same two variables and nothing else.
+pub(crate) fn session_from_env() -> Option<(PathBuf, SessionToken)> {
     let addr = std::env::var("AIRLOCK_ADDR").ok()?;
     let session = std::env::var("AIRLOCK_SESSION").ok()?;
     let socket_path = runtime_dir::parse_addr(&addr).ok()?;
@@ -82,6 +84,37 @@ async fn write_frame<T: serde::Serialize, W: tokio::io::AsyncWriteExt + Unpin>(
     value: &T,
 ) -> std::io::Result<()> {
     writer.write_all(&crate::protocol::encode_line(value)).await
+}
+
+/// Opens a fresh connection, handshakes, and sends `request` authorized
+/// with `token`, returning the first [`DaemonMessage`] the daemon sends
+/// back (which may itself be an `Error` — callers decide how to handle
+/// that). A connection carries exactly one request (docs/airlock-v2-
+/// technical-guidance.md), so every one-shot session request —
+/// `tools list`'s own `List`, and `agent check`'s `Check`/`List` probes —
+/// goes through this one connection-handling path and sees the same
+/// connection-level failures (`connect`/`handshake`/`read_one`'s messages,
+/// already matching docs/airlock-v2-ux.md, "Messages → Agent").
+pub(crate) async fn session_request(
+    socket_path: &Path,
+    token: &SessionToken,
+    request: SessionRequest,
+) -> Result<DaemonMessage, String> {
+    let mut stream = connect(socket_path).await?;
+    handshake(&mut stream).await?;
+    let (reader_half, mut writer) = stream.into_split();
+    let mut reader = BufReader::new(reader_half);
+    read_one(&mut reader).await?; // Hello
+    let req = Request {
+        auth: Auth::Session {
+            token: token.clone(),
+        },
+        body: RequestBody::Session(request),
+    };
+    write_frame(&mut writer, &req)
+        .await
+        .map_err(|e| format!("socket write failed: {e}"))?;
+    read_one(&mut reader).await
 }
 
 // ─── exec ─────────────────────────────────────────────────────────────────────
@@ -282,7 +315,9 @@ async fn print_config_changed_hint_if_any(socket_path: &Path, token: &SessionTok
     }
 }
 
-fn layers_changed(layers: &[WireLayer]) -> bool {
+/// `pub(crate)`: shared with `agent.rs`'s config-changed note in both
+/// `agent check`'s report and `agent hook`'s outcomes.
+pub(crate) fn layers_changed(layers: &[WireLayer]) -> bool {
     layers.iter().any(|layer| match std::fs::read(&layer.path) {
         Ok(bytes) => config::sha256_hex(&bytes) != layer.sha256,
         Err(_) => false,
@@ -305,32 +340,7 @@ async fn tools_list_own_session() -> i32 {
         eprintln!("airlock: {NO_SESSION_MESSAGE}");
         return 125;
     };
-    let mut stream = match connect(&socket_path).await {
-        Ok(s) => s,
-        Err(message) => {
-            eprintln!("airlock: {message}");
-            return 125;
-        }
-    };
-    if let Err(message) = handshake(&mut stream).await {
-        eprintln!("airlock: {message}");
-        return 125;
-    }
-    let (reader_half, mut writer) = stream.into_split();
-    let mut reader = BufReader::new(reader_half);
-    if let Err(message) = read_one(&mut reader).await {
-        eprintln!("airlock: {message}");
-        return 125;
-    }
-    let request = Request {
-        auth: Auth::Session { token },
-        body: RequestBody::Session(SessionRequest::List),
-    };
-    if let Err(e) = write_frame(&mut writer, &request).await {
-        eprintln!("airlock: socket write failed: {e}");
-        return 125;
-    }
-    match read_one(&mut reader).await {
+    match session_request(&socket_path, &token, SessionRequest::List).await {
         Ok(DaemonMessage::Tools { tools, .. }) => {
             print_tools(&tools);
             0
