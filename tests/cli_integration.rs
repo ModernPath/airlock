@@ -499,6 +499,42 @@ fn init_global_refuses_inside_the_sandbox() {
 }
 
 #[test]
+fn sandboxed_help_has_a_blank_line_before_options() {
+    let home = tempfile::tempdir().unwrap();
+    let output = sandboxed_cmd(home.path()).arg("--help").output().unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("\n\nOptions:\n"),
+        "sandboxed --help should have a blank line before Options:, like the normal help:\n{text}"
+    );
+}
+
+#[test]
+fn init_help_hides_global_inside_the_sandbox() {
+    let home = tempfile::tempdir().unwrap();
+    let sandboxed = sandboxed_cmd(home.path())
+        .args(["init", "--help"])
+        .output()
+        .unwrap();
+    assert!(sandboxed.status.success(), "{sandboxed:?}");
+    let text = String::from_utf8_lossy(&sandboxed.stdout);
+    assert!(
+        !text.contains("--global"),
+        "sandboxed init --help should hide --global:\n{text}"
+    );
+
+    // Outside the sandbox the flag still works normally.
+    let normal = base_cmd(home.path())
+        .args(["init", "--help"])
+        .output()
+        .unwrap();
+    assert!(normal.status.success(), "{normal:?}");
+    let text = String::from_utf8_lossy(&normal.stdout);
+    assert!(text.contains("--global"), "{text}");
+}
+
+#[test]
 fn init_plain_is_allowed_inside_the_sandbox() {
     let home = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
