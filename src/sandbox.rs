@@ -3621,6 +3621,8 @@ pub mod linux {
             // nothing in the default baseline grants either path — the
             // anchor check (anchors.rs) refuses any config or `--allow-write`
             // that would.
+            use super::{LINUX_AGENT_BASELINE_READ_PATHS, LINUX_BASELINE_READ_PATHS};
+
             for path in LINUX_BASELINE_READ_PATHS
                 .iter()
                 .chain(LINUX_AGENT_BASELINE_READ_PATHS.iter())
