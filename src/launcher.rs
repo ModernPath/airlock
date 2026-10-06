@@ -233,7 +233,14 @@ fn home_dir() -> Result<PathBuf, LauncherError> {
 
 fn create_dir_0700(dir: &Path) -> Result<(), LauncherError> {
     use std::os::unix::fs::DirBuilderExt;
-    match std::fs::DirBuilder::new().mode(0o700).create(dir) {
+    // `{tool_state}` nests under `$XDG_CACHE_HOME/airlock/<project-id>/`, which
+    // doesn't exist yet on a project's first session — recursive(true) creates
+    // those parents too, not just the tool's own leaf directory.
+    match std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+    {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
         Err(e) => Err(LauncherError::Io(e)),
