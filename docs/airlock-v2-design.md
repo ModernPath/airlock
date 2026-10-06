@@ -10,7 +10,10 @@ described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
 [SECURITY.md](../SECURITY.md).
 
 This document is the design record: what changes, why, and which
-alternatives were rejected. When it ships, the user-facing reference will
+alternatives were rejected. The user-facing surface (commands, help text,
+messages, harness hooks, and drafts of the doc changes) is in
+[airlock-v2-ux.md](airlock-v2-ux.md), which also proposes changes U1–U14
+to this design. When it ships, the user-facing reference will
 be [README.md](../README.md) and [SKILL.md](../SKILL.md).
 
 ## Problem
