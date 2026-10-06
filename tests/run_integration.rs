@@ -112,7 +112,7 @@ fn run_no_command_and_no_profile_errors() {
 // ─── Trust, then run (reaches the sandbox — needs a nestable sandbox) ───────
 
 #[test]
-#[ignore = "needs a nestable sandbox; run outside Airlock with: cargo test -- --ignored"]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 fn run_no_session_after_trust_runs_the_command() {
     let fx = Fixture::new();
     fx.write_config(minimal_config());
