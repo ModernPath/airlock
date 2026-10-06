@@ -2,7 +2,7 @@
 
 Credential broker for AI agents — tools get your secrets, the agent never does.
 
-An AI coding agent needs `gh`, `tofu`, `gcloud`, `kubectl` to do real work, and those tools need credentials. Hand the agent a token and it sits in the agent's environment, its shell history, and every line of output it reads. Airlock takes the token out of the agent's reach: a trusted daemon holds secrets in memory and injects them only into the specific tool processes that need them, runs each tool in an OS sandbox, and redacts its output before the agent sees it.
+An AI coding agent needs `gh`, `tofu`, `gcloud`, `kubectl` to do real work, and those tools need credentials. Hand the agent a token and it sits in the agent's environment, its shell history, and every line of output it reads. Airlock takes the token out of the agent's reach: a per-user daemon holds secrets in memory and injects them only into the specific tool processes that need them, runs each tool in an OS sandbox, and redacts its output before the agent sees it.
 
 Airlock brokers credentials for the tools your agent *runs*, not just the APIs it *calls*. The CLI authenticates exactly as it always has — the agent simply never holds the key.
 
@@ -14,6 +14,11 @@ Airlock brokers credentials for the tools your agent *runs*, not just the APIs i
 - [Security model](#security-model)
 - [Quick start](#quick-start)
 - [Supplying secrets](#supplying-secrets)
+- [Team and personal config](#team-and-personal-config)
+- [Approving config](#approving-config)
+- [Sessions](#sessions)
+- [Harness hooks](#harness-hooks)
+- [An always-on daemon](#an-always-on-daemon)
 - [Minting scoped credentials](#minting-scoped-credentials)
 - [Configuration](#configuration)
 - [Command reference](#command-reference)
@@ -28,25 +33,29 @@ Airlock brokers credentials for the tools your agent *runs*, not just the APIs i
 - **Tool secrets never reach the agent.** They exist in the daemon's memory (zeroized on drop) and in the tool process's environment — nowhere else. Not in the agent's env, not in its output.
 - **Scoped, short-lived credentials without long-lived keys.** The daemon can *mint* a token from your own session — impersonate a read-only service account, for instance — and re-mint it before it expires. Your admin login never enters the sandbox; the tool gets a token that can only do what you decided; the agent gets neither. See [Minting scoped credentials](#minting-scoped-credentials).
 - **Redacted output.** Secret values are stripped from stdout/stderr — raw, base64, URL-encoded, and hex forms — and replaced with `[REDACTED:NAME]`.
-- **Sandboxed tools.** Every tool runs with deny-by-default filesystem access (macOS Seatbelt, Linux Landlock) and a minimal environment.
+- **Sandboxed tools and agent.** Every tool, and the agent itself under `airlock run`, gets deny-by-default filesystem access (macOS Seatbelt, Linux Landlock) and a minimal environment.
+- **Nothing in the project but config.** The daemon's socket, PID file and proxy CA live in a per-user runtime directory outside any project. `git status` shows only `airlock.toml` and, if you forgot to ignore it, `airlock.local.toml`.
 - **Any secret source.** 1Password, Vault, cloud secret managers, plain env vars, or any command that prints a token.
 
 What Airlock does *not* do: stop the agent from doing destructive things *through* a tool. If the token can delete repos, `gh repo delete` works. Airlock keeps the token from leaking; the token's scope decides what it can do — which is why minting narrow tokens matters. Full threat model in [SECURITY.md](SECURITY.md).
 
 ## How it works
 
+One daemon per user serves every project on your machine. `airlock run` is a **launcher**: it runs in your terminal, loads and approves a project's config, resolves its secrets, and hands the result to the daemon as a **session**. The agent gets a session token and a sandbox; the daemon serves that session only the one project.
+
 ```
 ┌──────────────────────────────┐    ┌──────────────────────────────────┐
-│  env vars at daemon start    │    │  command sources                 │
-│  op run · secretspec · vault │    │  op read · gcloud auth           │
-│  · plain exports             │    │  print-access-token · …          │
+│  env vars at `airlock run`   │    │  command sources                 │
+│  op run · secretspec · vault │    │  op read · gcloud auth            │
+│  · plain exports             │    │  print-access-token · …           │
 └──────────────┬───────────────┘    └────────────────┬─────────────────┘
-               │ read once, then                     │ spawned by the daemon;
-               │ cleared from the process            │ re-run every `refresh` seconds
-               ▼                                     ▼
+               │ read once by the launcher,           │ spawned by the launcher,
+               │ held only for `Register`              │ re-run by the daemon on
+               ▼                                       │ its own `refresh` schedule
           ┌──────────────────────────────────────────────────┐
-          │                  airlock daemon                  │  ← secrets live here (in memory)
-          │                 Unix socket API                  │
+          │              airlock daemon (per user)            │  ← secrets live here (in memory)
+          │         one session per registered project        │
+          │                 Unix socket API                   │
           └─────────────────────────┬────────────────────────┘
                                     │ spawns tool in sandbox with secrets injected;
                                     │ streams back redacted stdout/stderr
@@ -58,7 +67,7 @@ What Airlock does *not* do: stop the agent from doing destructive things *throug
 ```
 
 1. Declare tools and the secrets they need in `airlock.toml`.
-2. The daemon collects secrets at startup: `env` sources are read from its environment and **immediately cleared** from the process; `command` sources are spawned and their stdout captured, re-run on a schedule if `refresh` is set.
+2. `airlock run` resolves every secret in your terminal: `env` sources are read from the launcher's own environment, `command` sources are spawned there, re-run on a schedule by the daemon if `refresh` is set. Neither reaches the daemon's own environment — the launcher sends values once, over the socket, and the daemon never reads its own `$PATH` or env for this.
 3. The agent runs `airlock exec -- gh pr list`. The daemon injects the secrets into a minimal child environment, spawns `gh` inside the sandbox, and streams back redacted output.
 
 Only tools that need credentials go through Airlock. `grep`, `cargo`, `npm`, `make` and the rest run directly through the agent's own sandbox. `git` goes either way: run it directly for reads and local commits; declare it as a tool when signed commits or HTTPS pushes need a GPG key or credential-helper token.
@@ -70,7 +79,7 @@ Airlock is one layer of a defense-in-depth stack:
 1. **Secret storage** — 1Password, Vault, a cloud secret manager. Never `.env` files or shell history.
 2. **Scoped tokens** — fine-grained PATs, least-privilege service accounts. **This is the layer that limits damage.** Airlock can mint these for you ([below](#minting-scoped-credentials)).
 3. **Airlock** — credential isolation at runtime: secrets in memory, injected per tool, output redacted.
-4. **Agent harness sandbox** — `airlock run`, Claude Code's `--sandbox`, Docker, nsjail, bubblewrap. Without it, the agent could read the daemon's memory or connect to the socket directly.
+4. **Agent harness sandbox** — `airlock run`, Claude Code's `--sandbox`, Docker, nsjail, bubblewrap. Without it, the agent could read the daemon's memory or connect to the socket directly. `airlock run` provides this directly; a harness with its own sandbox gets a session a different way — see [Sessions](#sessions).
 
 ## Security model
 
@@ -90,15 +99,14 @@ Airlock splits your machine into three zones with different levels of trust:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
-- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over the Unix socket.
+- **The daemon is trusted and runs unsandboxed, as you.** That is deliberate: it needs your real `gcloud` login or `op` session to mint scoped tokens, and it is the one place raw secrets live. The agent can reach it only over a Unix socket, and only with a **session token** it was handed at start — the socket's permissions alone are not the authorization boundary, because every process on your machine shares your uid. See [Sessions](#sessions).
 - **The agent gets a sandbox shaped for an agent.** Read/write to the project and its own state directory, nothing else — no `~/.ssh`, no keychain, no daemon memory. `airlock run` provides this; Claude Code's own `--sandbox` or a container works too.
 - **Each tool gets its own sandbox, shaped for that tool.** This is the part most setups skip. `gh` sees the repo and its own config dir but not `~/.config/gcloud`; `gcloud` gets the reverse. A compromised or misbehaving tool can expose at most the one secret it was handed — and even that is redacted before the agent reads it.
+- **The project holds only config.** No socket, no PID file, no CA certificate, and no record of what you've approved. Those live in a per-user runtime directory, a trust store and a global config file, all outside the project and outside every sandbox's write grants.
 
-Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool usually needs one credential plus its own config files. Even the config files can be kept out of your real home directory — point `CLOUDSDK_CONFIG` or `KUBECONFIG` at a project-local path (as in [Minting scoped credentials](#minting-scoped-credentials)) and `gcloud` or `kubectl` runs with only the minted token, never your privileged global login.
+Two sandboxes because the agent and the tools have different jobs: the agent needs wide read access to reason about code but no credentials; a tool usually needs one credential plus its own config files. Even the config files can be kept out of your real home directory, and out of the project — `{tool_state}` (see [Configuration](#configuration)) gives each tool a private directory the agent can't read and `git status` never sees.
 
-Under the hood, the daemon clears secret env vars from its own process after reading them, keeps values in memory that is zeroed on drop, disables core dumps, hands each tool a minimal environment with a timeout, and refuses to start if the OS sandbox is unavailable rather than run without it. Redaction is streaming and covers raw, base64, URL-encoded, and hex forms.
-
-Known limits: redaction is best-effort (a tool can transform a secret in ways the redactor doesn't recognize), tools have unrestricted network access, and a local root user can read daemon memory. See [SECURITY.md](SECURITY.md) for the full threat model and mitigations.
+Full threat model, the external-sandbox requirements for a harness like Claude Code's own `--sandbox`, and what Airlock does *not* protect against: [SECURITY.md](SECURITY.md).
 
 ## Quick start
 
@@ -111,51 +119,65 @@ A minimal `airlock.toml`:
 
 ```toml
 [secrets.GH_TOKEN]
-source = "env"                 # read GH_TOKEN from the daemon's environment at start
+source = "env"                 # read GH_TOKEN from the launcher's environment
 
 [tools.gh]
 description = "GitHub CLI"
 
 [tools.gh.env]
 GH_TOKEN      = { secret = "GH_TOKEN" }
-GH_CONFIG_DIR = "{sandbox_root}/.config/gh"   # project-local gh state, not ~/.config/gh
+GH_CONFIG_DIR = "{tool_state}"   # project-local gh state, outside the project and the agent's reach
 ```
 
-Start the daemon with the secret from wherever you keep it, then use the tool:
+Edit it, then start the agent:
 
 ```bash
-$ GH_TOKEN="op://Employee/GH_TOKEN/credential" op run -- airlock daemon start
+$ GH_TOKEN="ghp_xxxx" airlock run --profile claude
+airlock.toml is not trusted yet. Contents:
 
+    [secrets.GH_TOKEN]
+    source = "env"
+    …
+
+Trust this file and continue? [y/N] y
+trusted airlock.toml
+```
+
+That's it: no `airlock daemon start`, nothing to add to `.gitignore`. The first `airlock run` in a project starts the daemon on demand (it exits again once nothing uses it) and asks you to approve `airlock.toml`, once per version of the file. Claude starts inside its own sandbox with a session already registered; `gh` runs through `airlock exec`.
+
+Inside the agent:
+
+```
 $ airlock exec -- gh auth status
 github.com
   ✓ Logged in to github.com account acme (GH_TOKEN)
   - Token: [REDACTED:GH_TOKEN]
 ```
 
-To run the agent itself inside Airlock's sandbox with an embedded daemon:
+Every later `airlock run` in the project is quiet unless something changed:
 
 ```bash
-airlock run --profile claude
+$ airlock run --profile claude
 ```
 
 More configs in [`examples/`](examples/).
 
 ## Supplying secrets
 
-Each `[secrets.<label>]` entry is either read from the daemon's environment at startup (`source = "env"`) or produced by a command the daemon runs (`source = "command"`). Either way, the daemon clears secret variables from its own process right after reading them.
+Each `[secrets.<label>]` entry is either read from the launcher's environment at session start (`source = "env"`) or produced by a command the launcher runs (`source = "command"`). Either way, the value is sent to the daemon once, over the socket, and never touches the daemon's own process environment.
 
 ```bash
 # 1Password CLI
-GH_TOKEN="op://Employee/GH_TOKEN/credential" op run -- airlock daemon start
+GH_TOKEN="op://Employee/GH_TOKEN/credential" op run -- airlock run --profile claude
 
 # secretspec
-secretspec run -- airlock daemon start
+secretspec run -- airlock run --profile claude
 
 # Hashicorp Vault, or any shell
-GH_TOKEN=$(vault kv get -field=token secret/github) airlock daemon start
+GH_TOKEN=$(vault kv get -field=token secret/github) airlock run --profile claude
 ```
 
-Or skip the environment entirely and let the daemon fetch the value:
+Or skip the environment entirely and let the launcher fetch the value:
 
 ```toml
 [secrets.GH_TOKEN]
@@ -163,7 +185,145 @@ source  = "command"
 command = ["op", "read", "op://Employee/GH_TOKEN/credential"]   # argv list, no shell
 ```
 
-Add `refresh` and the same mechanism mints short-lived tokens.
+Add `refresh` and the daemon re-runs the same command in the background to mint short-lived tokens. See [`examples/secret-sources.toml`](examples/secret-sources.toml) for ready-made `command` sources (1Password, Vault, `gh auth token`, `gcloud`) and the `op run -- airlock run` pattern.
+
+## Team and personal config
+
+A real project has three layers, lowest to highest precedence:
+
+| Layer | Path | Checked in? | Approved? |
+|---|---|---|---|
+| **global** | `~/.config/airlock/airlock.toml` | no, it's yours | no — protected by anchor checks instead |
+| **repo** | `airlock.toml` | yes | yes |
+| **local** | `airlock.local.toml` | no, gitignored | yes |
+
+The repo file is the team's: it declares tools and the secret labels they need, but it does not have to say *where* your copy of a secret comes from — one teammate reads `GH_TOKEN` from 1Password, another runs `gh auth token`. Leave `source` out of a repo `[secrets.<label>]` and add a `description`; each user binds it locally:
+
+```toml
+# airlock.toml (repo, checked in)
+[secrets.GH_TOKEN]
+description = "GitHub token with read access to acme/app"
+```
+
+Your global config binds things you use in every project:
+
+```toml
+# ~/.config/airlock/airlock.toml (global, yours)
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["op", "read", "op://Private/GitHub/token"]
+```
+
+A global binding does not automatically apply to a repo label — that would let a PR reach into your password manager without your say. You opt in per project, per label, in the local file:
+
+```bash
+$ cd ~/src/app && airlock init --local
+created ~/src/app/airlock.local.toml
+  GH_TOKEN  from = "global" (your global config binds it)
+airlock.local.toml is ignored by git
+```
+
+`airlock init --local` writes a stub: `from = "global"` for any label your global config already binds, and a commented `command`/`env` example for the rest. Edit it, approve it like any other file. In a repo whose team hasn't adopted Airlock, `airlock init --local` instead writes a standalone skeleton — a commented secret and tool, like `airlock init` writes for `airlock.toml` — and nothing lands in the team's `.gitignore`.
+
+Since `airlock.local.toml` is personal, ignore it once for every repo instead of editing each project's `.gitignore`:
+
+```bash
+echo airlock.local.toml >> ~/.config/git/ignore
+```
+
+(`airlock init --local` warns if it isn't ignored yet, and prints this line.)
+
+A tool defined in both the repo and local files is a config error unless the local tool sets `override = true` — the user approves that line along with the file. A personal tool in your global config quietly gives way to a project tool of the same name; `airlock config` shows the layer each tool and secret comes from.
+
+## Approving config
+
+The daemon never acts on a project config file you haven't approved — including one the agent edited. `airlock.toml` and `airlock.local.toml` are each approved on their own, by the exact bytes.
+
+```bash
+$ airlock trust
+~/src/app/airlock.toml has changed since you last trusted it:
+
+--- trusted
++++ ~/src/app/airlock.toml
+@@ -14,3 +14,8 @@
+ ...
++[tools.psql]
++description = "Postgres shell"
+
+Trust this version? [y/N] y
+trusted ~/src/app/airlock.toml
+```
+
+`airlock run` and `airlock session start` ask the same question inline, the first time they see an unapproved file, so you don't need a separate `trust` step for every edit of your own `airlock.local.toml`. On a non-interactive shell they refuse instead and point you at `airlock trust`.
+
+Control characters, ANSI escapes and bidirectional/zero-width Unicode in the diff are shown escaped (`\u{202e}`), so an agent can't hide a change by making the diff read differently from what it does.
+
+For scripts and CI:
+
+```bash
+airlock trust --yes                              # approve every changed file, no prompt
+airlock trust --expect-sha256 <hash>             # approve only if the file matches exactly
+```
+
+In CI the trust store is usually empty on every run, so `trust --yes` there means the review of the commit under test *is* the approval — run it before any agent starts in the job. `--expect-sha256` pins the exact bytes a workflow expects, closing even that window.
+
+The global file needs no approval: it's yours, outside every project, and protected the same way the runtime directory and trust store are — no sandbox can write it or redirect Airlock to a copy it wrote. See [SECURITY.md](SECURITY.md) for the anchor checks behind that.
+
+A running agent keeps the config it started with even after you approve a change — nothing changes under it until you ask:
+
+```bash
+$ airlock session reload
+reloaded 7f3a9c "claude": tools +psql
+```
+
+## Sessions
+
+`airlock run` is a **launcher**: it loads and approves config, resolves secrets, registers a session with the daemon, and runs the agent inside Airlock's own sandbox for as long as the session lasts. Several agents can run against the same project at once, each with its own session and its own resolved secrets.
+
+A harness with its own sandbox — Claude Code's own `--sandbox`, or an IDE extension `airlock run` can't wrap — gets a session a different way:
+
+```bash
+$ eval "$(airlock session start --name claude)"
+session 7f3a9c "claude" for ~/src/app, expires in 12h
+note: this harness runs in its own sandbox, or none. It must deny reads of
+      the runtime directory and keep the agent away from your credential
+      stores; see SECURITY.md#external-sandboxes
+$ claude --sandbox
+```
+
+`session start` prints `export AIRLOCK_ADDR=...` / `export AIRLOCK_SESSION=...` on stdout (so `eval` picks them up) and the note above on stderr. Everything started from that shell inherits the session — every extension, every integrated terminal in an editor launched from it. It lasts 12 hours by default (`--ttl`, `0` for until revoked); `airlock session renew` restarts the clock without changing the token.
+
+| Command | Does |
+|---|---|
+| `airlock session start` | Registers a session, prints the exports. |
+| `airlock session renew <ID>` | Restarts a `session start` session's TTL. |
+| `airlock session list` | Lists sessions: id, name, project, started, number of `exec`s, what ends it, whether the config has changed. |
+| `airlock session reload [ID...]` | Applies approved config to running sessions, without restarting the agent. |
+| `airlock session revoke <ID...>` / `--here` / `--all` | Ends sessions. |
+
+A token is bound to the process tree it was issued to, so copying it out of another process's environment is useless outside that tree — see [SECURITY.md](SECURITY.md#token-binding).
+
+## Harness hooks
+
+`airlock run --profile claude` installs a Claude Code `SessionStart` hook that tells the agent, in its own context, that Airlock is active and which tools to use — on every start, resume, `/clear` and compaction, not only when it happens to read [SKILL.md](SKILL.md). Starting Claude another way, add it to `~/.claude/settings.json` or the project's `.claude/settings.json` yourself:
+
+```bash
+airlock agent hook claude-code --print-settings
+```
+
+prints the exact JSON block to paste in, so the docs and the binary can't drift apart. The agent can remove the hook; nothing security-relevant depends on it.
+
+## An always-on daemon
+
+By default the daemon starts on the first `airlock run` or `session start` and exits a few minutes after its last session ends. For a daemon that survives across sessions — useful if you use `session start` from several shells across a day — install it as a service:
+
+```bash
+$ airlock daemon install
+wrote ~/Library/LaunchAgents/ai.modernpath.airlock.plist
+loaded it: the daemon now starts at login and keeps running without sessions
+```
+
+On Linux this writes a systemd user unit; `loginctl enable-linger` keeps it running after you log out. `airlock daemon uninstall` removes it. `airlock status` shows how the daemon was started.
 
 ## Minting scoped credentials
 
@@ -172,8 +332,9 @@ You are logged into your cloud provider with broad permissions. You want an agen
 With Airlock you skip the key. The daemon uses your session to mint a token *as* the read-only account, hands only that token to the sandboxed tools, and re-mints it before it expires:
 
 ```toml
-# Runs at daemon start, then every 50 min. Executes on the trusted side with the
-# daemon's environment, so it can read ~/.config/gcloud — the sandboxed tools cannot.
+# Resolved once at session registration, then re-run by the daemon every
+# 50 min. Runs on the trusted side with the launcher's environment, so it
+# can read ~/.config/gcloud — the sandboxed tools cannot.
 [secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
 source  = "command"
 command = [
@@ -187,13 +348,15 @@ refresh_max_backoff = 600
 
 [tools.gcloud.env]
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"   # sandboxed gcloud never sees ~/.config/gcloud
+CLOUDSDK_CONFIG = "{tool_state}"   # sandboxed gcloud never sees ~/.config/gcloud
 
 [tools.kubectl.env]                                    # GKE auth plugin resolves the same env
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
-KUBECONFIG      = "{sandbox_root}/.config/kubeconfig"
+CLOUDSDK_CONFIG = "{tool_state}"
+KUBECONFIG      = "{sandbox_root}/.kube/config"   # written by gcloud, read by kubectl — see below
 ```
+
+`{tool_state}` is exclusive to the tool that declares it — nothing else, not even another tool, can read it. `CLOUDSDK_CONFIG` only needs to be its own tool's cache, so each tool above gets a private one. `KUBECONFIG`, written once by `gcloud container clusters get-credentials` and read by `kubectl`, has to be shared between the two tools, so it stays under `{sandbox_root}` — the project directory, which every tool can already reach.
 
 | | Your admin credentials | The minted read-only token |
 |---|---|---|
@@ -209,9 +372,9 @@ The pattern fits any CLI that prints one short-lived token to stdout — GitHub 
 
 ## Configuration
 
-Airlock looks for `airlock.toml` by walking up from the current directory toward `$HOME`, using the first file owned by the current user. Its directory becomes the **sandbox root**: always read-write for tools, and home to the Unix socket and PID file.
+A project needs `airlock.toml` or `airlock.local.toml` somewhere between the current directory and `$HOME` (discovery walks up, as today); its directory is the **sandbox root** — always read-write for tools, and the base every relative path in the config resolves against. `--no-project-config` runs with only your global config, for a directory with no project file.
 
-> Don't put `airlock.toml` directly in `$HOME` — that makes your entire home directory the sandbox root. Airlock refuses to start unless the config sets `allow_home_root = true`.
+> Don't put `airlock.toml` directly in `$HOME` — that makes your entire home directory the sandbox root. Airlock refuses to start unless the config sets `allow_home_root = true` (only honored in the global or local layer).
 
 ```toml
 timeout = 120                  # global tool timeout in seconds (default: 300)
@@ -243,30 +406,34 @@ CLOUDFLARE_API_TOKEN = { secret = "CLOUDFLARE_API_TOKEN" }
 TF_INPUT             = "0"
 ```
 
+Unknown keys are a config error at every level, in every layer — a typo fails loudly instead of being silently ignored.
+
 ### `[secrets.<label>]`
 
 | Field                 | Applies to | Description |
 |-----------------------|------------|-------------|
-| `source`              | all        | `"env"` or `"command"`. |
-| `from`                | `env`      | Daemon env var to read. Defaults to the label. |
+| `source`              | all        | `"env"` or `"command"`. Optional in the repo layer only: a label with no `source` says "this project needs this secret" and leaves the binding to each user — see [Team and personal config](#team-and-personal-config). |
+| `from`                | `env`; or any layer as `from = "global"` | For `source = "env"`, the launcher env var to read; defaults to the label. In the local layer only, `from = "global"` instead reuses the global config's binding of the same label, and is mutually exclusive with `source`. |
 | `command`             | `command`  | Argv list to spawn; trimmed stdout becomes the value. No shell. |
 | `timeout`             | `command`  | Seconds to wait for the command. Default 10. |
-| `refresh`             | `command`  | Seconds between background re-runs. Omit to fetch once at startup. |
+| `refresh`             | `command`  | Seconds between background re-runs. Omit to fetch once at session start. |
 | `refresh_max_backoff` | `command`  | Cap on backoff between failed refreshes. Defaults to `refresh`. |
 | `env`                 | `command`  | `NAME = "value"` map applied when spawning the command. |
 | `env_clear`           | `command`  | `true` gives the command a completely empty environment — no `PATH`, no `HOME`. Add back what it needs via `env`. |
+| `description`         | all        | Shown in the "needs a source" error and by `airlock init --local`. |
 
-> **Command sources run unsandboxed, on the trusted side**, with the daemon's environment and filesystem. That is what lets them derive narrow credentials from broad ones. Only configure commands you would run yourself at the shell.
+> **Command sources run unsandboxed, on the trusted side**, with the launcher's environment and filesystem (never the daemon's own). That is what lets them derive narrow credentials from broad ones. Only configure commands you would run yourself at the shell.
 
 ### `[tools.<name>]`
 
 | Field         | Description |
 |---------------|-------------|
 | `env`         | `NAME = value` map. A bare string is static; `{ secret = "label" }` resolves a secret. |
-| `description` | Shown by `airlock list`. |
+| `description` | Shown by `airlock tools list`. |
 | `extra_read`  | Additional read-only paths. |
 | `extra_write` | Additional read-write paths. |
 | `timeout`     | Per-tool timeout in seconds; overrides the global value. |
+| `override`    | Local layer only. Replaces the repo's tool of the same name whole; a config error if the repo defines no such tool. |
 | `proxy`       | `true` marks a *proxy tool*. See [Proxy tools](#proxy-tools). A proxy tool needs at least one route and may not have secrets in `env`. |
 | `routes`      | `[[tools.<name>.routes]]`. Each route names a host the proxy tool may reach, an optional credential header to attach, and optional `METHOD /path` allow/deny rules. |
 
@@ -346,47 +513,52 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 | `env`             | `NAME = value` map, same syntax as tool `env`. |
 | `filesystem`      | `read = [...]` / `write = [...]` paths beyond the sandbox root. |
 
+`[agent.env]` may reference secrets. This is the one deliberate exception to "the agent never sees secrets": it is for credentials the agent itself must hold — its own LLM API key, typically — not for tool credentials, which belong in `[tools.<name>.env]`.
+
 ### Paths and templating
 
-- `~/foo` → `$HOME/foo`; relative paths resolve against the sandbox root; absolute paths are used as-is.
-- Static `env` strings may use `{sandbox_root}`, the canonicalized config directory — handy for keeping tool state project-local (`GH_CONFIG_DIR = "{sandbox_root}/.config/gh"`). Escape literal braces as `\{` `\}`. No other placeholders exist; this is not shell interpolation.
+- `~/foo` → `$HOME/foo`; relative paths resolve against the sandbox root (an error in the global layer, since it applies to every project); absolute paths are used as-is.
+- Static `env` strings may use `{sandbox_root}` (the canonicalized project directory), or `{tool_state}` (a per-project, per-tool directory under `$XDG_CACHE_HOME/airlock`, created on first use, writable only by that one tool — nothing else, not even another tool or the agent, can reach it). Use `{tool_state}` for a tool's own config directory (`GH_CONFIG_DIR`, `CLOUDSDK_CONFIG`); use `{sandbox_root}` only when two tools genuinely need to share a path, as `KUBECONFIG` does above. Escape literal braces as `\{` `\}`. No other placeholders exist; this is not shell interpolation.
 - **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System` and `/Library` on macOS, `/usr/bin`, `/bin`, `/lib*` on Linux). Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
 
 ## Command reference
 
 ```bash
-airlock init                       # create a starter airlock.toml
-airlock daemon start               # background daemon; returns once it accepts connections
-airlock daemon run                 # foreground, for debugging
-airlock daemon stop | restart
-airlock exec -- <tool> [args...]   # run a declared tool; everything after -- is passed unchanged
-airlock status                     # is a daemon serving on the socket?
-airlock list                       # declared tools and their env bindings (no daemon needed)
-airlock logs                       # recent daemon log entries
-airlock run [flags] -- <cmd>       # run an agent in the sandbox, with an embedded daemon
+# Start an agent
+airlock run [--profile NAME] [-- CMD...]     # start an agent with a session, sandboxed
+airlock init [--local | --global]            # write a starter config
+airlock trust [-y]                           # review and approve project config
+airlock config                               # merged config, with the layer each part comes from
+airlock status                               # daemon, project config and sessions
+
+# Use tools
+airlock exec -- TOOL [ARGS...]               # run a declared tool through the session
+airlock tools list [--session ID]            # tools a session serves
+
+# For the agent and its harness
+airlock agent check                          # verify the session, self-test the sandbox
+airlock agent hook claude-code               # SessionStart hook
+
+# Manage
+airlock session start | renew | list | reload | revoke
+airlock daemon start [--foreground] | stop | restart | logs | install | uninstall
 ```
 
-`--config <path>` on any command bypasses discovery.
+`airlock run` and `session start` always sandbox the agent, or hand it a session for its own; there is no flag that runs an agent with neither. `--config <path>` works only on commands that discover config (`run`, `trust`, `config`, `status`, `session start`/`reload`) — `exec` and `tools list` use their session and ignore it.
 
-### `airlock run`
-
-```bash
-airlock run --profile claude                       # default command: claude --dangerously-skip-permissions
-airlock run --profile claude-relaxed               # wider sandbox for interactive use
-airlock run -- <agent-command> [args...]           # any command
-airlock run --no-daemon -- claude                  # sandbox only; airlock exec will fail inside
-```
-
-`airlock run` launches the agent inside an OS-level sandbox (Seatbelt / Landlock), starts an embedded daemon so `airlock exec` works without a separate `daemon start`, and tears the daemon down when the agent exits. `--allow-read`, `--allow-write`, and `--passthrough-env` extend the `[agent]` config from the command line; `--no-config` runs without an `airlock.toml` at all (set `AIRLOCK_SANDBOX_ROOT`).
-
-`[agent.env]` may reference secrets. This is the one deliberate exception to "the agent never sees secrets": it is for credentials the agent itself must hold — its own LLM API key, typically — not for tool credentials, which belong in `[tools.<name>.env]`.
-
-Profiles bundle sandbox rules for a known agent:
-
-- **`claude`** — read/write to `~/.claude/`, `~/.claude.json`, `~/.local/share/claude/`. The macOS keychain is unreachable, so Claude Code stores its OAuth token in `~/.claude/.credentials.json` (mode `0600`). Also disables Claude Code's own `sandbox-exec` wrapper, which cannot nest inside Airlock's profile.
-- **`claude-relaxed`** — `claude` plus keychain access, clipboard, `open <url>`, and read access to shell dotfiles. Each widens the data-leak surface; see [SECURITY.md](SECURITY.md#built-in-agent-profiles).
+Inside the agent's own sandbox, `--help` lists only the commands that work there (`exec`, `tools`, `agent`, `init`, `config`) and names the ones it hides; `run`, `trust`, `status`, `session` and `daemon` refuse there even if called directly, since approval and registration need your own terminal.
 
 ## Troubleshooting
+
+Start with:
+
+```bash
+airlock status        # is the daemon up, is this project's config approved, what sessions exist
+airlock agent check    # from inside the agent: is this session healthy, does its sandbox pass self-test
+airlock daemon logs    # recent daemon activity, optionally --session <ID>
+```
+
+`exec`, `tools list` and `agent check` use the exit codes 125 (Airlock itself couldn't run the request — no session, daemon unreachable, stale secret, …), 126 (the tool is declared but its binary can't be used — install it outside the project) and 127 (no such tool in this session). Airlock's own messages on stderr start with `airlock:`, which is how you tell them from a tool that happens to exit in that range itself.
 
 If a sandboxed tool or agent misbehaves — "Operation not permitted", garbled interactive output, TLS failing silently — the cause is usually a sandbox rule that's too narrow. On macOS, Seatbelt logs every denial:
 
@@ -405,12 +577,12 @@ cargo build --release
 cargo test
 ```
 
-Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](https://landlock.io/) (kernel 5.13+). Release tarballs for Linux amd64 and macOS arm64 are attached to each GitHub release.
+Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](https://landlock.io/) (kernel 5.13+). A `nix develop` shell provides the toolchain if you use Nix. Release tarballs for Linux amd64 and macOS arm64 are attached to each GitHub release.
 
 ## Further reading
 
 - [SKILL.md](SKILL.md) — the agent-facing guide: what to run, what to expect, what not to try.
-- [ARCHITECTURE.md](ARCHITECTURE.md) — daemon/client split, fork sequence, wire protocol, redaction pipeline.
+- [ARCHITECTURE.md](ARCHITECTURE.md) — daemon/session model, config layering, wire protocol, redaction pipeline.
 - [SECURITY.md](SECURITY.md) — threat model, trust boundaries, tool selection rules.
 
 ## How Airlock compares
