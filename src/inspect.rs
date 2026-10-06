@@ -70,7 +70,7 @@ pub fn table(rows: &[Vec<String>]) -> String {
     out
 }
 
-fn layer_label(kind: LayerKind) -> &'static str {
+pub(crate) fn layer_label(kind: LayerKind) -> &'static str {
     match kind {
         LayerKind::Global => "global",
         LayerKind::Repo => "repo",
