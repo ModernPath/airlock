@@ -28,7 +28,6 @@ The gaps are collected in [Gaps](#gaps) at the end.
    start, no `.gitignore` lines. The `claude` profile keeps `~/.config/gh`
    and the keychain out of the agent's reach.
    ([UX: First run](airlock-v2-ux.md#first-run-in-a-personal-project),
-   [UX: README Quick start](airlock-v2-ux.md#quick-start),
    [README: Security model](../README.md#security-model))
 
    **Covered.** See gap G13 on `GH_CONFIG_DIR` inside the project.
@@ -41,7 +40,7 @@ The gaps are collected in [Gaps](#gaps) at the end.
    exits 0 when it runs, 3 when it does not. Inside the agent,
    `airlock agent check` shows whether the daemon answers.
    ([Design: Lifecycle](airlock-v2-design.md#lifecycle),
-   [UX: `airlock status --help`](airlock-v2-ux.md#airlock-status---help))
+   [UX: Options](airlock-v2-ux.md#options))
 
    **Covered.**
 
@@ -51,11 +50,9 @@ The gaps are collected in [Gaps](#gaps) at the end.
    Two sources, as in v1: `source = "command"` runs a command in your
    terminal at session start, and `source = "env"` reads the environment
    of `airlock run` (not the daemon's any more). A local file can also bind
-   a repo label to your global binding with `from = "global"`. The UX
-   draft calls `command` "the recommended way".
+   a repo label to your global binding with `from = "global"`.
    ([README: Supplying secrets](../README.md#supplying-secrets),
-   [Design: Registering a session](airlock-v2-design.md#registering-a-session),
-   [UX: Supplying secrets](airlock-v2-ux.md#supplying-secrets))
+   [Design: Registering a session](airlock-v2-design.md#registering-a-session))
 
    **Partial.** The docs list the options but do not say why `command` is
    preferred or when `env` is the better fit (G9).
@@ -94,7 +91,7 @@ The gaps are collected in [Gaps](#gaps) at the end.
    secrets resolved for it, and a token. `exec` and `tools list` work only
    with a session token.
    ([Design: Sessions](airlock-v2-design.md#sessions),
-   [UX: `airlock session --help`](airlock-v2-ux.md#airlock-session---help))
+   [UX: Options](airlock-v2-ux.md#options))
 
    **Covered.**
 
@@ -262,17 +259,16 @@ The gaps are collected in [Gaps](#gaps) at the end.
     ([Design: `airlock trust`](airlock-v2-design.md#airlock-trust),
     [UX: Messages](airlock-v2-ux.md#messages))
 
-    **Partial.** The UX troubleshooting entry says "or pin the file", which
-    nothing defines. Nobody says whether `--yes` in CI defeats the purpose
-    when the config comes from the PR under test, or that an ephemeral CI
-    trust store makes every run a first approval (G14).
+    **Covered** after G14: `--expect-sha256` pins the content, and the
+    design says `--yes` must run before any agent starts in the job, and
+    why an ephemeral CI trust store makes every run a first approval.
 
 19. How do I see the merged config, and which layer each setting came from?
 
     `airlock config`. It reads the files, needs no daemon, and shows each
     layer's approval state and the layer behind every secret, tool and
     setting. `--paths` prints the layer, trust store and runtime paths.
-    ([UX: `airlock config --help`](airlock-v2-ux.md#airlock-config---help), [Design: Inspecting config and sessions](airlock-v2-design.md#inspecting-config-and-sessions))
+    ([UX: Options](airlock-v2-ux.md#options), [Design: Inspecting config and sessions](airlock-v2-design.md#inspecting-config-and-sessions))
 
     **Partial.** When a file changed since approval, the docs do not say
     whether `config` merges the current bytes or the approved copy (G15).
@@ -353,7 +349,7 @@ The gaps are collected in [Gaps](#gaps) at the end.
     global map holds them. Process-environment reads after startup are
     linted out. A last-pass redactor built from every live session's
     secrets masks any that leak into another session's output. Each session
-    has its own limits. The proxy is the remaining shared risk, and F10
+    has its own cap on concurrent `exec`s. The proxy is the remaining shared risk, and F10
     moves it to its own process.
     ([Design: Session isolation](airlock-v2-design.md#session-isolation), [Design: Q1](airlock-v2-design.md#q1-one-daemon-per-user))
 
@@ -419,7 +415,7 @@ The gaps are collected in [Gaps](#gaps) at the end.
     This follows `docker run`, `env` and `chroot`. Airlock's own messages
     start with `airlock:`.
     ([Design: Clients](airlock-v2-design.md#clients),
-    [UX: `airlock exec --help`](airlock-v2-ux.md#airlock-exec---help))
+    [UX: Options](airlock-v2-ux.md#options))
 
     **Covered.** See G19 on `run` exiting 1 when you decline approval.
 
@@ -431,7 +427,7 @@ The gaps are collected in [Gaps](#gaps) at the end.
     `admin.token` or write the trust store, which no sandbox can. A hidden
     command's own `--help` still works.
     ([Design: Commands refused inside the sandbox](airlock-v2-design.md#commands-refused-inside-the-sandbox),
-    [UX: `airlock --help` inside the sandbox](airlock-v2-ux.md#airlock---help-inside-the-sandbox))
+    [UX: Options](airlock-v2-ux.md#options))
 
     **Covered.**
 
@@ -467,6 +463,6 @@ decisions are written into the [design](airlock-v2-design.md) and
 ### Answered only in the design record
 
 Q4, Q7, Q13, Q24 and Q25 are answered in the design doc's decisions and
-blocking items, which a user will not read. The UX doc plans README and
-SECURITY.md sections for them ("Approving config", "Team and personal
-config", the SECURITY.md list in the design doc), but drafts none of them.
+blocking items, which a user will not read. The design doc's
+[Docs to update when this ships](airlock-v2-design.md#docs-to-update-when-this-ships)
+lists the README and SECURITY.md sections that will carry them.

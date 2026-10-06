@@ -10,11 +10,16 @@ described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
 [SECURITY.md](../SECURITY.md).
 
 This document is the design record: what changes, why, and which
-alternatives were rejected. The user-facing surface (commands, help text,
-messages, harness hooks, and drafts of the doc changes) is in
+alternatives were rejected. The user-facing surface (commands and their
+options, messages, harness hooks, and the examples) is in
 [airlock-v2-ux.md](airlock-v2-ux.md). Its changes U1–U16 to this design are
-accepted and incorporated here. When it ships, the user-facing reference
+accepted and incorporated here, except U14, which is
+[planned for v2.1](#planned-for-v21). When it ships, the user-facing reference
 will be [README.md](../README.md) and [SKILL.md](../SKILL.md).
+
+The choice of one daemon per user is re-examined against a future central
+daemon in [airlock-v2-topology.md](airlock-v2-topology.md). Its proposals
+are not folded in yet.
 
 ## Problem
 
@@ -748,8 +753,8 @@ property rather than a matter of care, and implementation must hold them.
   Redaction only removes text, so it discloses nothing. It does not cover a
   secret leaked into another session's tool environment, which the first
   rule has to prevent.
-- **Per-session limits** on concurrent `exec`s and output rate, so one agent
-  cannot starve the others. A panic unwinds and ends only its task.
+- **A per-session cap on concurrent `exec`s**, so one agent cannot starve
+  the others. A panic unwinds and ends only its task.
 
 The proxy is the largest attack surface in the process: hyper and rustls
 parse input from sandboxed tools and from upstream servers. A memory-safety
@@ -834,8 +839,8 @@ only. What actually stops the agent is that it cannot write the trust store
 create its socket in the runtime base, and anywhere else it runs with the
 agent's own access, so it gains nothing.
 
-With `AIRLOCK_SANDBOX=1`, `airlock --help` and shell completion list only
-the commands that work there. The help says so and names the hidden
+With `AIRLOCK_SANDBOX=1`, `airlock --help` lists only the commands that
+work there. The help says so and names the hidden
 commands, so a user in a sandboxed shell sees why one is missing. A hidden
 command's own `--help` still works and starts by saying it needs the
 user's terminal. In a `session start` shell the variable is not set, and
@@ -948,9 +953,14 @@ Two commands put the facts in the agent's context through its harness:
   | Credential stores | opening each tool's `extra_read` paths and the well-known stores (`~/.config/gh`, `~/.config/gcloud`, `~/.aws`, `~/.kube`) for reading fails; a warning, not a failure, since `claude-relaxed` opens some on purpose. A path that does not exist is skipped. |
   | Config | the project files' hashes match the session's; reported, not a failure |
 
-  The client computes the runtime base and anchor paths the way the
-  launcher does. Exit 0 if every check passes, 1 if one fails, 125 without
-  a session.
+  The client computes none of the paths. The launcher records the runtime
+  base, the trust store and the global config path it validated in the
+  session at `Register`, and the daemon returns them with the session
+  check, so the probes test exactly the paths the launcher used. An agent
+  environment that lacks the XDG variables cannot send the probes to the
+  wrong place. The probes assume the client runs on the daemon's host; a
+  network transport ([F11](#follow-ups)) skips them. Exit 0 if every check
+  passes, 1 if one fails, 125 without a session.
 - **`airlock agent hook <harness>`** adapts `check` and `tools list` to
   one harness's hook protocol. It reads the hook event from stdin, always
   exits 0, and prints nothing in a project without Airlock config, so it
@@ -977,26 +987,6 @@ it.
 A PreToolUse hook that denies a direct `gh` and suggests the `airlock exec`
 form is left out. It costs a daemon round trip per shell command and needs
 a command parser that is never complete.
-
-## Shell completion
-
-`airlock completions <bash|zsh>` prints a script that calls back into
-`airlock` on each TAB (clap_complete's `CompleteEnv`). The candidates for
-`exec -- <TAB>` come from the session's `List`, and session ids from the
-daemon with `admin.token`, outside the sandbox only. After
-`exec -- <tool>` and `run --`, it hands off to the tool's own completion.
-
-The completer runs on every keypress, inside `main()` before anything else:
-
-- It never starts the daemon, resolves secrets, prompts or checks
-  approval. It only asks a running daemon.
-- It uses a blocking `std` socket, not a tokio runtime, with a 300 ms
-  timeout. On any error it offers nothing and prints nothing.
-- A `List` from completion is not logged as an `exec`.
-
-Delegated completion runs the tool's completer from the shell's `PATH`,
-without credentials and outside the tool sandbox. It runs nothing that
-typing the tool's name in the same shell would not, so it adds no exposure.
 
 ## Threat walkthrough
 
@@ -1200,7 +1190,7 @@ whole config.
 |---|---|---|---|
 | Why move runtime files | Tamper resistance; keep them out of the repo | Filesystem quirks, sharing across worktrees | The first two are the problems we actually have. |
 | Runtime dir location | Per-user temp root, not from the environment (`/run/user/<uid>`, macOS `confstr`) | `XDG_RUNTIME_DIR` / `TMPDIR`; `~/.local/state`; configurable path | Cleared on reboot, per-user, short enough for `sun_path`, and the same in every shell of the user. |
-| Daemon topology | One daemon per user; sessions bound to a root and its approved config | One daemon per project; a relay router with per-session worker processes | One listener per host, which a network transport needs, and config changes apply to new sessions without a restart. Isolation between sessions is structural (see [Session isolation](#session-isolation)). |
+| Daemon topology | One daemon per user; sessions bound to a root and its approved config | One daemon per project; a relay router with per-session worker processes | One listener per host, which a network transport needs, and config changes apply to new sessions without a restart. Isolation between sessions is structural (see [Session isolation](#session-isolation)). Compared against a central daemon in [airlock-v2-topology.md](airlock-v2-topology.md). |
 | Session state | Per session, resolved by the launcher in the user's terminal | Shared per root and config; resolved by the daemon | Secret prompts reach the user, `source = "env"` sees the project's shell, and sessions stay independent. |
 | Daemon lifecycle | Automatic start and idle exit by default; optional launchd/systemd service | Only one of them | No setup by default; an always-on service for users who want it and for a future network listener. |
 | Proxy placement | In the daemon for now | Per-session process in the first cut | Keeps the first cut small. The proxy parses untrusted input, so moving it out is tracked as F10. |
@@ -1559,6 +1549,9 @@ it needs:
   checkout there, through a shared filesystem with path mapping. Proxy tools
   need only HTTP, so they are the natural first remote case.
 
+[airlock-v2-topology.md](airlock-v2-topology.md) describes the central
+daemon this transport serves, and what v2 keeps possible for it.
+
 ### Q1. One daemon per user
 
 **Resolved: one daemon per user.** Sessions (B4) made a per-project daemon
@@ -1574,8 +1567,8 @@ The costs, and how the design answers them:
 
 - **One process holds every project's secrets.** See [Session
   isolation](#session-isolation): the session handle as the only path, no
-  process env after startup, a global last-pass redactor, per-session limits,
-  and F10 for the proxy. A relay router with per-session worker processes was
+  process env after startup, a global last-pass redactor, a per-session
+  cap on concurrent `exec`s, and F10 for the proxy. A relay router with per-session worker processes was
   considered. It keeps process isolation, but adds IPC and process
   management. The multi-tenant design keeps that isolation only where
   untrusted parsing happens (F10).
@@ -1588,6 +1581,20 @@ The costs, and how the design answers them:
   cheap to start again. An upgrade does not force a restart: a busy daemon
   keeps serving until it is idle, unless the protocol changed (see
   [Lifecycle](#lifecycle)).
+
+## Planned for v2.1
+
+Designed, but not part of the first implementation. Each item keeps its
+design record and lands in its own PR after v2 ships.
+
+| # | Feature | Design record |
+|---|---|---|
+| V1 | **Dynamic shell completion.** `airlock completions <bash\|zsh>` prints a script that calls back into `airlock` on each TAB, so `exec -- <TAB>` completes the session's tools and `session revoke <TAB>` completes session ids, and hands off to the tool's own completion after `exec -- <tool>`. | [UX: Shell completion](airlock-v2-ux.md#shell-completion) |
+
+V1 is deferred because it pins clap_complete's `unstable-dynamic` feature,
+sends a daemon request on every TAB, and needs hand-written shell
+delegation. Nothing in the daemon, the sessions or the trust model depends
+on it, so it adds no risk to v2 by waiting.
 
 ## To verify during implementation
 
@@ -1605,7 +1612,7 @@ The costs, and how the design answers them:
 
 ## Docs to update when this ships
 
-- **SKILL.md:** the drafts in [the UX doc](airlock-v2-ux.md#agent-facing-guide-skillmd):
+- **SKILL.md:**
   - `airlock tools list` replaces `airlock list` and needs a session
   - `exec`, `tools list` and `agent check` need `AIRLOCK_ADDR` and
     `AIRLOCK_SESSION`; the session section
@@ -1618,20 +1625,18 @@ The costs, and how the design answers them:
   - `airlock.local.toml` and the global file
   - secret labels across layers, `from = "global"`, optional repo `source`,
     `description`
-- **README.md:** the sections drafted in [the UX doc](airlock-v2-ux.md#readmemd):
-  how it works with the launcher, quick start without `daemon start` or
-  runtime `.gitignore` entries, supplying secrets through `airlock run`,
-  team and personal config (`airlock.local.toml`, the global file,
-  `from = "global"`, `init --local`), approving config, harness hooks,
-  the command reference, shell completion, troubleshooting. `{tool_state}`
-  in the quick start and examples, and the global git excludes line for
+- **README.md:** how it works with the launcher, quick start without
+  `daemon start` or runtime `.gitignore` entries, supplying secrets through
+  `airlock run`, team and personal config (`airlock.local.toml`, the global
+  file, `from = "global"`, `init --local`), approving config, harness
+  hooks, the command reference, troubleshooting. `{tool_state}` in the
+  quick start and examples, and the global git excludes line for
   `airlock.local.toml`.
 - **ARCHITECTURE.md:** one daemon per user and sessions, registration by
   the launcher (config load, approval, secret resolution), session
   isolation, lifecycle modes and the version handshake, runtime dir,
   config layering and merge, `Register`, `Reload` and `List` requests,
-  the session lease and token binding, the completer's fast path in
-  `main()`.
+  the session lease and token binding.
 - **SECURITY.md:** the trust model, the anchors and their validation, and
   the runtime dir replacing sandbox-root runtime files. Config safety: the
   filtered `PATH`, the binary location check, and interpreter arguments
