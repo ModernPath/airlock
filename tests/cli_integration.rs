@@ -231,6 +231,54 @@ fn status_exit_0_and_shows_the_session_when_the_daemon_runs() {
     daemon.shutdown();
 }
 
+// ─── session reload ──────────────────────────────────────────────────────────
+
+#[test]
+fn session_reload_notes_agent_settings_changed() {
+    // e2e_helpers registers over the raw protocol with a fake `agent_hash`
+    // ("deadbeef") rather than the real launcher's, so any real reload's
+    // freshly computed hash is guaranteed to differ — exactly the case
+    // `[agent]` settings changed; restart the agent to apply them exists
+    // for (docs/airlock-v2-design.md, "The agent changes the config").
+    let project = tempfile::tempdir().unwrap();
+    let root = project.path().canonicalize().unwrap();
+    e2e_helpers::write_config(&root, "[tools.sh]\n\n[agent]\ntimeout = 30\n");
+
+    let home = tempfile::tempdir().unwrap();
+    let trust_runtime = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(
+        trust_runtime.path(),
+        std::os::unix::fs::PermissionsExt::from_mode(0o700),
+    )
+    .unwrap();
+    let trust = base_cmd(home.path())
+        .env("AIRLOCK_TEST_RUNTIME_DIR", trust_runtime.path())
+        .current_dir(&root)
+        .args(["trust", "--yes"])
+        .output()
+        .unwrap();
+    assert!(trust.status.success(), "{trust:?}");
+
+    let daemon = e2e_helpers::start_daemon(&root);
+    let runtime_dir = daemon.socket_path.parent().unwrap().to_path_buf();
+
+    let output = base_cmd(home.path())
+        .env("AIRLOCK_TEST_RUNTIME_DIR", &runtime_dir)
+        .current_dir(&root)
+        .args(["session", "reload"])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    let text = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        text.contains("note: agent settings changed; restart the agent to apply them"),
+        "{text}"
+    );
+
+    daemon.shutdown();
+}
+
 // ─── --help grouping (U5) and the sandboxed help restriction (U16) ──────────
 
 #[test]

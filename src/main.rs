@@ -1180,7 +1180,7 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
                 };
                 println!("reloaded {id} {:?}: {summary}", session.name);
                 if agent_changed {
-                    println!("note: [agent] settings changed; restart the session to apply them");
+                    println!("note: agent settings changed; restart the agent to apply them");
                 }
             }
             Err(e) => {
