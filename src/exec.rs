@@ -1489,6 +1489,7 @@ mod tests {
             read_write_paths: vec![],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         // Build a sandbox profile using the platform-specific backend.
@@ -1662,6 +1663,7 @@ mod tests {
             read_write_paths: vec![PathBuf::from("/tmp")],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock

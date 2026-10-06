@@ -31,9 +31,10 @@ pub enum SandboxError {
 }
 
 /// How much of the network a tool may reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkAccess {
     /// No sockets at all; the profile's default deny covers it.
+    #[default]
     None,
     /// Unrestricted outbound access plus name resolution.
     Full,
@@ -46,8 +47,14 @@ pub enum NetworkAccess {
 /// Describes what a tool is allowed to access.
 ///
 /// Used as input to a `SandboxBackend` to produce a `SandboxProfile`.
+#[derive(Default)]
 pub struct ToolPolicy {
-    /// Filesystem paths the tool may read (from global `[filesystem]` and tool's `extra_read`).
+    /// Filesystem paths the tool may read (from global `[filesystem]` and
+    /// tool's `extra_read`). May include a single file, not just directories
+    /// — a proxy tool's session CA certificate (`<runtime_base>/ca/<id>.pem`)
+    /// is granted this way: `emit_filesystem_rules`'s `subpath` rule matches
+    /// a leaf file exactly, and the grant is unaffected by the final denies
+    /// below, which cover writes and the `admin.token` read only.
     pub read_paths: Vec<PathBuf>,
     /// Filesystem paths the tool may read and write (from tool's `extra_write`).
     pub read_write_paths: Vec<PathBuf>,
@@ -65,6 +72,40 @@ pub struct ToolPolicy {
     /// Set by the daemon after binary resolution; `None` in unit tests that
     /// don't exercise the full daemon flow.
     pub binary_path: Option<PathBuf>,
+    /// The daemon's runtime directory (holds the socket, PID file,
+    /// `admin.token`, and session CA certs), when known.
+    ///
+    /// On macOS, when set, the builder appends `(deny file-write* (subpath
+    /// <base>))` and `(deny file-read* (literal <base>/admin.token))` as the
+    /// final rules in the profile (see [Sandbox
+    /// access](../docs/airlock-v2-design.md) and B7). A tool never gets a
+    /// matching read-write grant on the base automatically — only an
+    /// explicit `extra_write` that happens to cover it (e.g. one equal to
+    /// `$TMPDIR`) would, and the deny carves the base back out of it. On
+    /// Linux, Landlock is allow-only and cannot carve a subtree out of a
+    /// grant, so this field has no effect there; nothing in the default
+    /// baseline grants the base, and the anchor check refuses any config
+    /// grant that would.
+    pub runtime_base: Option<PathBuf>,
+    /// The per-session scratch directory (`$TMPDIR` on macOS), when known.
+    ///
+    /// Read from the process environment by the caller (`daemon.rs`/`run.rs`
+    /// today; the per-session snapshot once sessions exist), never by this
+    /// module — see [Session isolation](../docs/airlock-v2-design.md).
+    /// Present for parity with [`AgentPolicy::tmpdir`]; the tool builder does
+    /// not grant it automatically (a tool only gets `$TMPDIR` scratch access
+    /// if its config explicitly lists it in `extra_write`), so this field is
+    /// currently unused by `generate_profile`.
+    pub tmpdir: Option<PathBuf>,
+    /// `<root>/.git/hooks`, when the sandbox root is a git worktree (F9).
+    ///
+    /// On macOS, appended as `(deny file-write* (subpath <git_hooks_deny>))`
+    /// — the first of the final deny rules — so an agent or a tool with a
+    /// broad write grant on the root cannot install or edit a hook that
+    /// would fire on the user's next `git commit` with no review step. Set
+    /// for both tool and agent profiles. Linux cannot express this; it is
+    /// defense in depth, not a guarantee.
+    pub git_hooks_deny: Option<PathBuf>,
 }
 
 /// Describes what an agent process is allowed to access.
@@ -72,6 +113,7 @@ pub struct ToolPolicy {
 /// Used as input to `SandboxBackend::build_agent` to produce a `SandboxProfile`.
 /// Unlike `ToolPolicy`, there is no `binary_path` field — the entire interactive
 /// session is sandboxed, so there is no single binary path to allow.
+#[derive(Default)]
 pub struct AgentPolicy {
     /// Filesystem paths the agent may read (global filesystem list, toolchain paths,
     /// and any user-declared agent read paths).
@@ -89,6 +131,26 @@ pub struct AgentPolicy {
     /// Always `true` for agents, but included as an explicit field so the
     /// profile generator can be read without assuming.
     pub requires_terminal: bool,
+    /// The daemon's runtime directory, when known. See
+    /// [`ToolPolicy::runtime_base`] for the macOS deny rules this produces.
+    /// Unlike tools, the agent also needs to reach the daemon: when set, the
+    /// macOS builder additionally grants `file-read*` on
+    /// `<runtime_base>/airlock.sock` and an explicit unix-socket
+    /// `network-outbound` to that path, regardless of `requires_network` —
+    /// connecting to the daemon must not depend on the agent's general
+    /// network policy. Neither grant is undone by the final denies, which
+    /// cover writes and the `admin.token` read only.
+    pub runtime_base: Option<PathBuf>,
+    /// The per-session scratch directory (`$TMPDIR` on macOS), when known.
+    ///
+    /// Read from the process environment by the caller, not by this module
+    /// (see [`ToolPolicy::tmpdir`]). When set, the macOS builder grants
+    /// `file-read* file-write*` on its canonical form, exactly as the
+    /// previous `std::env::var("TMPDIR")` lookup did; silently skipped when
+    /// `None` or when canonicalization fails.
+    pub tmpdir: Option<PathBuf>,
+    /// `<root>/.git/hooks`, when known. See [`ToolPolicy::git_hooks_deny`].
+    pub git_hooks_deny: Option<PathBuf>,
 }
 
 /// An opaque, pre-built sandbox configuration produced by a `SandboxBackend`.
@@ -708,6 +770,64 @@ pub mod macos {
         out.push_str("(allow network-bind (local unix-socket))\n");
     }
 
+    /// Emit the grant every agent profile needs to reach the daemon,
+    /// regardless of `requires_network`: `file-read*` on
+    /// `<runtime_base>/airlock.sock` (the ancestor-metadata idiom used for
+    /// `mDNSResponder` above — a socket connect needs filesystem access to
+    /// the path, not just the network-outbound permission) plus an explicit
+    /// unix-socket `network-outbound` grant to that exact path. The latter
+    /// is redundant with the blanket `(allow network-outbound)` emitted by
+    /// `emit_network_rules`, but connecting to the daemon must not depend on
+    /// that general rule staying unconditional.
+    ///
+    /// The runtime base is not otherwise covered by any read/write path
+    /// unless `$TMPDIR` happens to contain it (the common case — see
+    /// [`ToolPolicy::runtime_base`]), so without this the agent could not
+    /// locate its own socket.
+    fn emit_runtime_base_socket_access(
+        runtime_base: &Path,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        let socket_path = runtime_base.join("airlock.sock");
+        emit_ancestor_rules(&socket_path, out)?;
+        let escaped = escape_path(&socket_path)?;
+        out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+        out.push_str(&format!(
+            "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))\n"
+        ));
+        Ok(())
+    }
+
+    /// Emit the deny rules that must be the very last rules in any profile,
+    /// in this order: F9's `.git/hooks` write deny, the runtime base write
+    /// deny, and the `admin.token` read deny.
+    ///
+    /// SBPL's last matching rule wins, so any allow emitted after these
+    /// would re-open what they close — `generate_profile` and
+    /// `generate_agent_profile` each call this exactly once, as the final
+    /// step, which is what makes "last" a structural guarantee rather than a
+    /// property of call order elsewhere in this module.
+    fn emit_final_denies(
+        git_hooks_deny: Option<&Path>,
+        runtime_base: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        if let Some(hooks) = git_hooks_deny {
+            let escaped = escape_path(hooks)?;
+            out.push_str(&format!("(deny file-write* (subpath \"{escaped}\"))\n"));
+        }
+        if let Some(base) = runtime_base {
+            let escaped = escape_path(base)?;
+            out.push_str(&format!("(deny file-write* (subpath \"{escaped}\"))\n"));
+            let admin_token = base.join("admin.token");
+            let escaped_token = escape_path(&admin_token)?;
+            out.push_str(&format!(
+                "(deny file-read* (literal \"{escaped_token}\"))\n"
+            ));
+        }
+        Ok(())
+    }
+
     /// Emit the only network rule a proxy tool gets: a TCP connect to the
     /// daemon's per-exec proxy listener.
     ///
@@ -761,6 +881,13 @@ pub mod macos {
             NetworkAccess::Full => emit_network_rules(&mut out),
             NetworkAccess::ProxyOnly(port) => emit_proxy_network_rules(port, &mut out),
         }
+
+        // Must be last: see `emit_final_denies`.
+        emit_final_denies(
+            policy.git_hooks_deny.as_deref(),
+            policy.runtime_base.as_deref(),
+            &mut out,
+        )?;
 
         Ok(out)
     }
@@ -891,15 +1018,18 @@ pub mod macos {
         // atomic writes, caches, and `mkstemp` output. Canonicalised at
         // profile-build time (the `/var` → `/private/var` symlink must be
         // resolved because Seatbelt evaluates rules against the resolved path).
-        // Silently skipped when `TMPDIR` is unset or cannot be resolved.
-        if let Ok(tmpdir) = std::env::var("TMPDIR") {
-            let tmpdir_path = std::path::PathBuf::from(&tmpdir);
-            if let Ok(canonical) = std::fs::canonicalize(&tmpdir_path) {
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!(
-                    "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
-                ));
-            }
+        // Silently skipped when `tmpdir` is `None` or cannot be resolved. The
+        // value itself is read from the process environment by the caller,
+        // not here — see `AgentPolicy::tmpdir`. This is also normally the
+        // same directory as the runtime base, which is why the final denies
+        // below must come after this grant, not before it.
+        if let Some(tmpdir) = &policy.tmpdir
+            && let Ok(canonical) = std::fs::canonicalize(tmpdir)
+        {
+            let escaped = escape_path(&canonical)?;
+            out.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
+            ));
         }
 
         // ── ~/.CFUserTextEncoding ─────────────────────────────────────────────
@@ -923,6 +1053,13 @@ pub mod macos {
             emit_profile_rules(kind, &mut out)?;
         }
 
+        // The daemon connection is not part of the agent's general network
+        // policy — grant it unconditionally so it cannot be switched off by
+        // a future `requires_network: false`.
+        if let Some(base) = &policy.runtime_base {
+            emit_runtime_base_socket_access(base, &mut out)?;
+        }
+
         // Agents always require network access; the field governs this conditional
         // for forward-compatibility.
         if policy.requires_network {
@@ -943,6 +1080,13 @@ pub mod macos {
             out.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
             out.push_str("(allow network-inbound (local udp \"localhost:*\"))\n");
         }
+
+        // Must be last: see `emit_final_denies`.
+        emit_final_denies(
+            policy.git_hooks_deny.as_deref(),
+            policy.runtime_base.as_deref(),
+            &mut out,
+        )?;
 
         Ok(out)
     }
@@ -1150,6 +1294,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1159,6 +1304,7 @@ pub mod macos {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1168,6 +1314,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1177,6 +1324,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::Full,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1586,6 +1734,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::ProxyOnly(port),
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1669,6 +1818,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             };
             let result = MacOSSeatbelt.build(&policy);
             assert!(
@@ -1709,6 +1859,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::Full,
                 binary_path: Some(PathBuf::from("/usr/local/bin/mytool")),
+                ..Default::default()
             };
             let sbpl = sbpl_from_profile(&policy);
             assert!(
@@ -1726,6 +1877,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: Some(PathBuf::from("/opt/homebrew/Cellar/gh/2.0/bin/gh")),
+                ..Default::default()
             };
             let sbpl = sbpl_from_profile(&policy);
             for ancestor in &[
@@ -1775,6 +1927,7 @@ pub mod macos {
                     read_write_paths: vec![],
                     network: NetworkAccess::None,
                     binary_path: Some(symlink_path.clone()),
+                    ..Default::default()
                 };
                 let sbpl = sbpl_from_profile(&policy);
                 let symlink_escaped = symlink_path.to_string_lossy();
@@ -1802,6 +1955,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             }
         }
 
@@ -1811,6 +1965,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             }
         }
 
@@ -1820,6 +1975,7 @@ pub mod macos {
                 read_write_paths: vec![PathBuf::from(path)],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             }
         }
 
@@ -2015,6 +2171,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             let result = MacOSSeatbelt.build_agent(&policy, None);
             assert!(
@@ -2375,6 +2532,452 @@ pub mod macos {
             assert!(
                 !sbpl.contains("(allow network-bind (local udp"),
                 "tool SBPL must not grant loopback UDP bind, got:\n{sbpl}"
+            );
+        }
+
+        // ── `tmpdir` field (replaces the former `std::env::var("TMPDIR")` read) ─
+
+        #[test]
+        fn agent_profile_tmpdir_field_grants_canonical_scratch_access() {
+            let tmp = tempfile::tempdir().unwrap();
+            let policy = super::super::AgentPolicy {
+                tmpdir: Some(tmp.path().to_path_buf()),
+                requires_network: true,
+                requires_terminal: true,
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{}\"))",
+                    canonical.display()
+                )),
+                "agent SBPL should grant rw on the canonical form of `tmpdir`, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_without_tmpdir_omits_scratch_grant() {
+            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+            assert!(
+                !sbpl.contains("file-read* file-write* (subpath"),
+                "agent SBPL must not grant TMPDIR-style scratch access when `tmpdir` is \
+                 None, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn tool_profile_tmpdir_field_grants_nothing_automatically() {
+            // Unlike AgentPolicy, ToolPolicy::tmpdir is not consulted by
+            // generate_profile: a tool only gets `$TMPDIR` scratch access if
+            // its config explicitly lists it in `extra_write`
+            // (`read_write_paths`), never automatically.
+            let tmp = tempfile::tempdir().unwrap();
+            let dir = std::fs::canonicalize(tmp.path()).unwrap();
+            let policy = ToolPolicy {
+                tmpdir: Some(dir.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                !sbpl.contains(&dir.display().to_string()),
+                "tool SBPL must not reference `tmpdir` when it is not also in \
+                 read_write_paths, got:\n{sbpl}"
+            );
+        }
+
+        // ── Agent reaches the daemon via `runtime_base` regardless of network ──
+
+        #[test]
+        fn agent_profile_grants_runtime_base_socket_access() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let policy = super::super::AgentPolicy {
+                requires_network: false,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            let socket = base.join("airlock.sock");
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* (literal \"{}\"))",
+                    socket.display()
+                )),
+                "agent SBPL should grant file-read* on the runtime socket, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
+                    socket.display()
+                )),
+                "agent SBPL should grant an explicit unix-socket connect to the runtime \
+                 socket even when requires_network is false, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_without_runtime_base_omits_socket_access_rule() {
+            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+            assert!(
+                !sbpl.contains("remote unix-socket"),
+                "agent SBPL must not grant a remote unix-socket connect when \
+                 runtime_base is None, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("airlock.sock"),
+                "agent SBPL must not mention airlock.sock when runtime_base is None, \
+                 got:\n{sbpl}"
+            );
+        }
+
+        // ── Proxy tool CA cert read grant (single file) ─────────────────────
+
+        #[test]
+        fn proxy_ca_cert_single_file_read_grant_survives_final_denies() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let ca_dir = base.join("ca");
+            std::fs::create_dir(&ca_dir).unwrap();
+            let ca_path = ca_dir.join("abc123.pem");
+            std::fs::write(&ca_path, b"cert").unwrap();
+
+            let policy = ToolPolicy {
+                read_paths: vec![ca_path.clone()],
+                network: NetworkAccess::ProxyOnly(4242),
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* (subpath \"{}\"))",
+                    ca_path.display()
+                )),
+                "a proxy tool's session CA cert should be readable via `read_paths`, \
+                 got:\n{sbpl}"
+            );
+            // The base write-deny does not cover reads, and the admin-token
+            // read-deny is scoped to that one literal — neither shadows this.
+            assert!(
+                !sbpl.contains(&format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    ca_path.display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        // ── F9 / B7: the final deny rules ────────────────────────────────────
+
+        /// The three rules [`super::emit_final_denies`] appends, in order, for
+        /// the given `git_hooks` and `base` paths.
+        fn expected_final_denies(
+            git_hooks: &std::path::Path,
+            base: &std::path::Path,
+        ) -> [String; 3] {
+            [
+                format!("(deny file-write* (subpath \"{}\"))", git_hooks.display()),
+                format!("(deny file-write* (subpath \"{}\"))", base.display()),
+                format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    base.join("admin.token").display()
+                ),
+            ]
+        }
+
+        /// Asserts that the SBPL's last three non-empty lines are exactly the
+        /// F9 and runtime-base denies, in that order — the structural
+        /// guarantee B7 requires regardless of what allow rules precede them
+        /// (a `$TMPDIR` grant, a grant equal to the base, a grant that is an
+        /// ancestor of the base, or built-in profile rules).
+        fn assert_ends_with_final_denies(
+            sbpl: &str,
+            git_hooks: &std::path::Path,
+            base: &std::path::Path,
+        ) {
+            let expected = expected_final_denies(git_hooks, base);
+            let lines: Vec<&str> = sbpl.trim_end().lines().collect();
+            assert!(
+                lines.len() >= expected.len(),
+                "SBPL too short to contain the final denies, got:\n{sbpl}"
+            );
+            let tail = &lines[lines.len() - expected.len()..];
+            for (actual, expected) in tail.iter().zip(expected.iter()) {
+                assert_eq!(
+                    actual, expected,
+                    "final denies out of order; got full SBPL:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_tmpdir_write_grant() {
+            // Simulates a tool whose config grants `extra_write = ["$TMPDIR"]`
+            // — the write grant lands in `read_write_paths`, since ToolPolicy
+            // itself never grants `$TMPDIR` automatically (see
+            // `tool_profile_tmpdir_field_grants_nothing_automatically`).
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![base.clone()],
+                network: NetworkAccess::Full,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_grant_equal_to_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![base.clone()],
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_grant_that_is_a_parent_of_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = parent.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![parent.clone()],
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_tmpdir_write_grant() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                tmpdir: Some(base.clone()),
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_grant_equal_to_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                read_write_paths: vec![base.clone()],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_grant_that_is_a_parent_of_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = parent.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                read_write_paths: vec![parent.clone()],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_final_denies_are_last_for_claude_and_claude_relaxed_profiles() {
+            // The Claude-specific rules (emit_profile_rules) are emitted
+            // before the socket-access and network blocks; this proves the
+            // final denies still land after them, not just after the
+            // generic filesystem/network rules.
+            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            for kind in [
+                super::super::AgentProfileKind::Claude,
+                super::super::AgentProfileKind::ClaudeRelaxed,
+            ] {
+                let policy = super::super::AgentPolicy {
+                    read_paths: vec![],
+                    read_write_paths: vec![base.clone()],
+                    requires_network: true,
+                    requires_terminal: true,
+                    runtime_base: Some(base.clone()),
+                    tmpdir: Some(base.clone()),
+                    git_hooks_deny: Some(git_hooks.clone()),
+                };
+                let sbpl = sbpl_from_agent_profile_with_kind(&policy, Some(kind));
+                assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+            }
+        }
+
+        #[test]
+        fn git_hooks_deny_emits_rule_when_set() {
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    git_hooks.display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn git_hooks_deny_omitted_when_none() {
+            let sbpl = sbpl_from_profile(&empty_policy());
+            assert!(
+                !sbpl.contains(".git/hooks"),
+                "SBPL must not mention .git/hooks when git_hooks_deny is None, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn runtime_base_denies_emitted_when_set() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let policy = ToolPolicy {
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    base.display()
+                )),
+                "got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    base.join("admin.token").display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn runtime_base_denies_omitted_when_none() {
+            let sbpl = sbpl_from_profile(&empty_policy());
+            assert!(
+                !sbpl.contains("admin.token"),
+                "SBPL must not mention admin.token when runtime_base is None, got:\n{sbpl}"
+            );
+        }
+
+        // ── Ignored: needs a real nested sandbox (see module docs) ──────────
+
+        #[test]
+        #[ignore = "needs a nestable sandbox; run outside Airlock with: cargo test -- --ignored"]
+        fn agent_profile_isolates_runtime_base_from_tmpdir_grant() {
+            use std::os::unix::net::UnixListener;
+            use std::os::unix::process::CommandExt;
+            use std::process::Command;
+
+            // `base` sits inside `tmp`, mirroring the real layout where the
+            // runtime base is normally the same directory as `$TMPDIR`.
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = tmp_path.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            std::fs::write(base.join("admin.token"), b"secret").unwrap();
+            let socket_path = base.join("airlock.sock");
+            let _listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: false,
+                runtime_base: Some(base.clone()),
+                tmpdir: Some(tmp_path.clone()),
+                git_hooks_deny: None,
+            };
+
+            let profile = MacOSSeatbelt
+                .build_agent(&policy, None)
+                .expect("agent profile should build");
+            // usize round-trip keeps the captured value Send for pre_exec —
+            // the pointer is only dereferenced in the child, after fork, and
+            // `profile` (which owns the bytes) outlives `cmd.status()` below.
+            let sbpl_addr = profile.as_ptr() as usize;
+
+            // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
+            // admin.token WAS readable, bit 2 = the socket connect FAILED.
+            // A correctly isolated sandbox exits 0.
+            let probe_script = format!(
+                r#"
+                if : > "{base}/probe" 2>/dev/null; then code=1; else code=0; fi
+                if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
+                if ! nc -zU "{base}/airlock.sock" 2>/dev/null; then code=$((code | 4)); fi
+                exit "$code"
+                "#,
+                base = base.display(),
+            );
+
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(&probe_script);
+            // SAFETY: sandbox_init takes only its own argument and a
+            // thread-local error pointer; no allocation; same call made by
+            // exec::spawn() in production.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let sbpl_ptr = sbpl_addr as *const std::os::raw::c_char;
+                    let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+                    if crate::sandbox::macos::sandbox_init(sbpl_ptr, 0, &mut errorbuf) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            let status = cmd.status().expect("probe process should spawn");
+            let code = status.code().unwrap_or(-1);
+            assert_eq!(
+                code, 0,
+                "bit 0 (1) = base write NOT denied, bit 1 (2) = admin.token WAS \
+                 readable, bit 2 (4) = socket connect FAILED; got exit code {code}"
             );
         }
     }
@@ -2839,6 +3442,7 @@ pub mod linux {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -2848,6 +3452,7 @@ pub mod linux {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -2857,6 +3462,7 @@ pub mod linux {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -2951,6 +3557,7 @@ pub mod linux {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             let profile = LinuxLandlock
                 .build_agent(&policy, None)
@@ -2998,9 +3605,143 @@ pub mod linux {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             super::super::build_platform_agent_sandbox_profile(&policy, None)
                 .expect("build_platform_agent_sandbox_profile should return Ok on Linux");
+        }
+
+        // ── Runtime base: Landlock has no carve-out, so nothing grants it ────
+
+        #[test]
+        fn landlock_baseline_never_grants_tmp_or_run_user() {
+            // The runtime base lives under /run/user/<uid> or /tmp (see
+            // runtime_dir.rs). Landlock is allow-only and cannot carve a
+            // subtree back out of a grant, so the only protection is that
+            // nothing in the default baseline grants either path — the
+            // anchor check (anchors.rs) refuses any config or `--allow-write`
+            // that would.
+            for path in LINUX_BASELINE_READ_PATHS
+                .iter()
+                .chain(LINUX_AGENT_BASELINE_READ_PATHS.iter())
+            {
+                assert_ne!(*path, "/tmp", "the baseline must not grant /tmp");
+                assert!(
+                    !path.starts_with("/run/user"),
+                    "the baseline must not grant /run/user, got {path}"
+                );
+            }
+        }
+
+        #[test]
+        fn landlock_tool_build_ignores_the_runtime_base_field() {
+            // `runtime_base` exists on `ToolPolicy` for parity with macOS
+            // (whose Seatbelt builder reads it to emit the final deny
+            // rules); `build_landlock_profile` never reads it, so setting it
+            // — to a path absent from read_paths/read_write_paths — must not
+            // change, gate, or fail the build.
+            let base = tempfile::tempdir().unwrap();
+            let base_path = std::fs::canonicalize(base.path()).unwrap();
+
+            let mut policy = read_write_policy("/tmp");
+            policy.runtime_base = Some(base_path);
+            LinuxLandlock
+                .build(&policy)
+                .expect("build must succeed with runtime_base set");
+        }
+
+        #[test]
+        fn landlock_agent_build_ignores_the_runtime_base_field() {
+            let base = tempfile::tempdir().unwrap();
+            let base_path = std::fs::canonicalize(base.path()).unwrap();
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base_path),
+                ..Default::default()
+            };
+            LinuxLandlock
+                .build_agent(&policy, None)
+                .expect("build_agent must succeed with runtime_base set");
+        }
+
+        // ── Ignored: needs a real nested sandbox (see module docs) ──────────
+
+        /// Proves the only protection Linux has for the runtime base: nothing
+        /// grants it, so a sandboxed agent cannot write into it or read
+        /// `admin.token` inside it — while still being able to connect to a
+        /// listening unix socket there, since Landlock (through ABI v4, the
+        /// level this crate uses) only mediates TCP/UDP ports via `AccessNet`
+        /// and has no mechanism to restrict a path-based unix-socket
+        /// `connect()`.
+        ///
+        /// `base` is a sibling of the granted `work` directory, not nested
+        /// inside it — the real layout, since the anchor check refuses any
+        /// config that would put a write grant over or inside the base.
+        #[tokio::test]
+        #[ignore = "needs a nestable sandbox; run outside Airlock with: cargo test -- --ignored"]
+        async fn agent_profile_isolates_runtime_base_from_a_sibling_write_grant() {
+            use std::collections::HashMap;
+            use std::os::unix::net::UnixListener;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let work = root.join("work");
+            let base = root.join("base");
+            std::fs::create_dir(&work).unwrap();
+            std::fs::create_dir(&base).unwrap();
+            std::fs::write(base.join("admin.token"), b"secret").unwrap();
+            let socket_path = base.join("airlock.sock");
+            let _listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![work.clone()],
+                requires_network: true,
+                requires_terminal: false,
+                runtime_base: Some(base.clone()),
+                tmpdir: None,
+                git_hooks_deny: None,
+            };
+            let profile = LinuxLandlock
+                .build_agent(&policy, None)
+                .expect("agent profile should build");
+
+            // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
+            // admin.token WAS readable, bit 2 = the socket connect FAILED.
+            // A correctly isolated sandbox exits 0.
+            let probe_script = format!(
+                r#"
+                if : > "{base}/probe" 2>/dev/null; then code=1; else code=0; fi
+                if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
+                if ! nc -zU "{base}/airlock.sock" 2>/dev/null; then code=$((code | 4)); fi
+                exit "$code"
+                "#,
+                base = base.display(),
+            );
+
+            let mut env = HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+
+            let request = crate::exec::ExecRequest {
+                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                args: vec!["-c".to_string(), probe_script],
+                work_dir: work,
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            let status = spawned.child.wait().await.expect("wait should succeed");
+            let code = status.code().unwrap_or(-1);
+            assert_eq!(
+                code, 0,
+                "bit 0 (1) = base write NOT denied, bit 1 (2) = admin.token WAS \
+                 readable, bit 2 (4) = socket connect FAILED; got exit code {code}"
+            );
         }
     }
 }
