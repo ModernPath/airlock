@@ -1,0 +1,25 @@
+# One user's bindings for acme/app — never checked in (see the global git
+# excludes line in the main README's "Team and personal config"). Written by
+# `airlock init --local`, then edited by hand; approved the same way the
+# repo file is.
+#
+# `airlock config` shows the merged result.
+
+# GitHub token with read access to acme/app
+[secrets.GH_TOKEN]
+from = "global"   # reuses this user's global binding — see global.toml
+
+# Cloudflare token, Zone:Read on acme.dev
+[secrets.CLOUDFLARE_API_TOKEN]
+source  = "command"
+command = ["op", "read", "op://Private/Cloudflare/token"]
+
+# A personal tool the repo doesn't declare — this user's own, not the team's.
+[tools.psql]
+description = "Postgres shell"
+
+[tools.psql.env]
+PGSERVICE = "app-dev"
+
+[agent.env]
+LOG_LEVEL = "debug"   # overrides the repo's "info" for this user only

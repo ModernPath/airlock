@@ -1,9 +1,10 @@
 # Kubernetes cluster management
 #
-# Start the daemon:
-#   KUBECONFIG_TOKEN="xxxx" airlock daemon start
-#
 # Use it:
+#   cp examples/kubernetes.toml airlock.toml
+#   KUBECONFIG_TOKEN="xxxx" airlock run --profile claude
+#
+# Inside the agent:
 #   airlock exec -- kubectl get pods
 #   airlock exec -- kubectl describe deployment my-app
 #   airlock exec -- kubectl logs deployment/my-app --tail=50

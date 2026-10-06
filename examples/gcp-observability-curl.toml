@@ -24,11 +24,12 @@
 #     --member=user:you@example.com \
 #     --role=roles/iam.serviceAccountTokenCreator
 #
-# Start the daemon:
+# Use it:
 #
-#   airlock daemon start
+#   cp examples/gcp-observability-curl.toml airlock.toml
+#   airlock run --profile claude
 #
-# Use it with plain https:// URLs and no Authorization header. A header the
+# Then, with plain https:// URLs and no Authorization header. A header the
 # agent sets is replaced, and the agent has no token to put in it anyway:
 #
 #   airlock exec -- curl -s 'https://cloudtrace.googleapis.com/v1/projects/my-project/traces?pageSize=5'
