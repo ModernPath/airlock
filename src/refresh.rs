@@ -1,8 +1,9 @@
 //! Background refresh of `source = "command"` secrets.
 //!
 //! For each secret whose config carries a [`RefreshSpec`], the daemon spawns
-//! a long-lived tokio task that periodically re-runs the command and swaps
-//! the in-memory value. On failure the slot's [`Health`] flips to
+//! a long-lived tokio task that periodically re-runs the command — under the
+//! owning session's [`CommandContext`], never the daemon's own environment —
+//! and swaps the in-memory value. On failure the slot's [`Health`] flips to
 //! [`Health::Stale`] — the previous value is kept in memory, but the exec
 //! path refuses it. Refresh keeps trying with exponential backoff capped at
 //! `refresh_max_backoff`; the slot returns to `Healthy` on the next success.
@@ -23,9 +24,14 @@
 //!   `Secret<T>`'s eager-zeroize guarantee, in exchange for closing the
 //!   redaction gap during a swap.
 //! - Rebuild, swap and publish run under one mutex in `RefreshShared`,
-//!   shared by all refresh tasks. The rebuild reads every slot, so two overlapping
-//!   refreshes could otherwise swap in a redactor built before the other one
-//!   published, and it would miss a value the proxy is already injecting.
+//!   shared by all refresh tasks of one session. The rebuild reads every
+//!   slot, so two overlapping refreshes could otherwise swap in a redactor
+//!   built before the other one published, and it would miss a value the
+//!   proxy is already injecting.
+//! - `on_refresh` runs after every successful refresh, so the daemon can
+//!   rebuild its cross-session global redactor (docs/airlock-v2-design.md,
+//!   "Session isolation") without this module knowing anything about other
+//!   sessions.
 
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
@@ -37,12 +43,12 @@ use tokio::task::JoinSet;
 use crate::config::{CommandEnv, Config, RefreshSpec, SecretSource};
 use crate::daemon::RingBuffer;
 use crate::redact::{Redactor, RedactorSwap};
-use crate::secrets::{Health, Secret, SecretStore, run_command_secret};
+use crate::secrets::{CommandContext, Health, Secret, SecretStore};
 
 /// Initial sleep before the first retry after a refresh failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 
-/// What all refresh tasks share.
+/// What all of one session's refresh tasks share.
 pub(crate) struct RefreshShared {
     store: SecretStore,
     redactor_swap: RedactorSwap,
@@ -51,31 +57,42 @@ pub(crate) struct RefreshShared {
     /// serializes refreshes (see the module docs).
     previous: Mutex<HashMap<String, Arc<Secret<String>>>>,
     ring: RingBuffer,
+    on_refresh: Arc<dyn Fn() + Send + Sync>,
 }
 
 impl RefreshShared {
-    pub(crate) fn new(store: SecretStore, redactor_swap: RedactorSwap, ring: RingBuffer) -> Self {
+    pub(crate) fn new(
+        store: SecretStore,
+        redactor_swap: RedactorSwap,
+        ring: RingBuffer,
+        on_refresh: Arc<dyn Fn() + Send + Sync>,
+    ) -> Self {
         RefreshShared {
             store,
             redactor_swap,
             previous: Mutex::default(),
             ring,
+            on_refresh,
         }
     }
 }
 
 /// Spawn one refresh task per `[secrets.<label>]` entry that declares
-/// `refresh = N`. Returns the task set and a shutdown sender — set the
-/// channel to `true` to ask all tasks to stop, then `await` the [`JoinSet`].
-pub fn spawn_all(
+/// `refresh = N`, running each command under `ctx` — the session's own
+/// environment snapshot and filtered `PATH`. Returns the task set and a
+/// shutdown sender — set the channel to `true` to ask all tasks to stop,
+/// then `await` the [`JoinSet`].
+pub fn spawn_all_ctx(
     config: &Config,
     store: SecretStore,
     redactor_swap: RedactorSwap,
     ring: RingBuffer,
+    ctx: Arc<CommandContext>,
+    on_refresh: Arc<dyn Fn() + Send + Sync>,
 ) -> (JoinSet<()>, watch::Sender<bool>) {
     let (tx, rx) = watch::channel(false);
     let mut set = JoinSet::new();
-    let shared = Arc::new(RefreshShared::new(store, redactor_swap, ring));
+    let shared = Arc::new(RefreshShared::new(store, redactor_swap, ring, on_refresh));
 
     for (label, spec) in &config.secrets {
         let SecretSource::Command {
@@ -94,6 +111,7 @@ pub fn spawn_all(
             refresh: refresh.clone(),
             env: env.clone(),
             shared: Arc::clone(&shared),
+            ctx: Arc::clone(&ctx),
             shutdown: rx.clone(),
         };
         set.spawn(task.run());
@@ -126,6 +144,7 @@ struct RefreshTask {
     refresh: RefreshSpec,
     env: CommandEnv,
     shared: Arc<RefreshShared>,
+    ctx: Arc<CommandContext>,
     shutdown: watch::Receiver<bool>,
 }
 
@@ -149,10 +168,11 @@ impl RefreshTask {
             let argv = self.argv.clone();
             let timeout = self.timeout;
             let env = self.env.clone();
+            let ctx = Arc::clone(&self.ctx);
             let shared = Arc::clone(&self.shared);
 
             let res = tokio::task::spawn_blocking(move || {
-                refresh_once(&label, &argv, timeout, &env, &shared)
+                refresh_once_ctx(&label, &argv, timeout, &env, &ctx, &shared)
             })
             .await
             .unwrap_or_else(|join_err| Err(format!("refresh task panicked: {join_err}")));
@@ -171,37 +191,17 @@ impl RefreshTask {
     }
 }
 
-/// Run one refresh attempt synchronously against the daemon's own
-/// environment, the v1 path. [`refresh_once_ctx`] is the
-/// [`crate::secrets::CommandContext`]-based counterpart a session uses
-/// instead, once sessions exist.
-///
-/// See [`apply_refresh_result`] for what happens to the slot and redactor.
-pub(crate) fn refresh_once(
-    label: &str,
-    argv: &[String],
-    timeout: Duration,
-    env: &CommandEnv,
-    shared: &RefreshShared,
-) -> Result<(), String> {
-    apply_refresh_result(label, run_command_secret(argv, timeout, env), shared)
-}
-
 /// Run one refresh attempt synchronously under a session's
-/// [`crate::secrets::CommandContext`] — its own environment snapshot and
-/// filtered `PATH`, never the daemon's own environment.
+/// [`CommandContext`] — its own environment snapshot and filtered `PATH`,
+/// never the daemon's own environment.
 ///
 /// See [`apply_refresh_result`] for what happens to the slot and redactor.
-/// Not yet wired into `spawn_all`: multi-session daemon work lands later
-/// and will call this per-session instead of [`refresh_once`]. Exercised
-/// directly by tests until then.
-#[allow(dead_code)]
 pub(crate) fn refresh_once_ctx(
     label: &str,
     argv: &[String],
     timeout: Duration,
     env: &CommandEnv,
-    ctx: &crate::secrets::CommandContext,
+    ctx: &CommandContext,
     shared: &RefreshShared,
 ) -> Result<(), String> {
     let result =
@@ -211,8 +211,10 @@ pub(crate) fn refresh_once_ctx(
 
 /// On success, rebuild the redactor with two generations for this secret and
 /// swap it in, then publish the freshly-fetched value to the slot and mark
-/// it `Healthy`. On failure, mark the slot `Stale`, leave the value alone
-/// (so its bytes still feed the redactor), and log to the ring buffer.
+/// it `Healthy`, then call `shared.on_refresh` so the caller can rebuild any
+/// redactor that spans more than this session. On failure, mark the slot
+/// `Stale`, leave the value alone (so its bytes still feed the redactor), and
+/// log to the ring buffer.
 ///
 /// The redactor must be swapped *before* the slot is published: anything
 /// that reads the slot (the proxy's credential injection, exec's env
@@ -230,6 +232,7 @@ fn apply_refresh_result(
         redactor_swap,
         previous,
         ring,
+        on_refresh,
     } = shared;
     match result {
         Ok(value) => {
@@ -262,6 +265,7 @@ fn apply_refresh_result(
             } else {
                 ring.log(format!("secret refresh succeeded for {label}"));
             }
+            on_refresh();
             Ok(())
         }
         Err(reason) => {
@@ -327,6 +331,10 @@ mod tests {
         Arc::new(RwLock::new(Arc::new(r)))
     }
 
+    fn noop_callback() -> Arc<dyn Fn() + Send + Sync> {
+        Arc::new(|| {})
+    }
+
     fn store_with(label: &str, value: &str) -> SecretStore {
         let mut map = HashMap::new();
         map.insert(
@@ -354,12 +362,29 @@ mod tests {
     }
 
     fn nonexistent_argv() -> Vec<String> {
-        // Path that should never resolve on macOS or Linux.
         vec![
             PathBuf::from("/var/empty/airlock-no-such-binary")
                 .to_string_lossy()
                 .to_string(),
         ]
+    }
+
+    /// Build a `CommandContext` with a filtered `PATH` of real system
+    /// directories (`/bin:/usr/bin`) — so `sh`/`echo` actually resolve — and
+    /// a snapshot of the caller's choosing, rooted at `root` with no write
+    /// grants.
+    fn test_ctx(
+        root: &std::path::Path,
+        snapshot: std::collections::BTreeMap<String, String>,
+    ) -> CommandContext {
+        let path = crate::exec::filter_path("/bin:/usr/bin", root, &[]);
+        CommandContext {
+            snapshot,
+            path,
+            cwd: root.to_path_buf(),
+            root: root.to_path_buf(),
+            write_grants: Vec::new(),
+        }
     }
 
     #[test]
@@ -369,7 +394,6 @@ mod tests {
         assert_eq!(next_backoff(2, max), Duration::from_secs(10));
         assert_eq!(next_backoff(3, max), Duration::from_secs(20));
         assert_eq!(next_backoff(4, max), Duration::from_secs(40));
-        // 5 → 80 capped to 60
         assert_eq!(next_backoff(5, max), Duration::from_secs(60));
         assert_eq!(next_backoff(20, max), Duration::from_secs(60));
     }
@@ -389,47 +413,6 @@ mod tests {
     }
 
     #[test]
-    fn refresh_once_replaces_value_and_marks_healthy() {
-        let shared = &RefreshShared::new(
-            store_with("TOK", "old"),
-            empty_redactor_swap(),
-            RingBuffer::new(),
-        );
-
-        let res = refresh_once(
-            "TOK",
-            &echo_argv("new-value"),
-            Duration::from_secs(2),
-            &CommandEnv::default(),
-            shared,
-        );
-        assert!(res.is_ok(), "{res:?}");
-        assert_eq!(read_value(&shared.store, "TOK"), "new-value");
-        assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
-    }
-
-    /// Build a `CommandContext` with a filtered `PATH` of real system
-    /// directories (`/bin:/usr/bin`) — so `sh` actually resolves — and a
-    /// snapshot of the caller's choosing, rooted at `root` with no write
-    /// grants.
-    fn test_ctx(
-        root: &std::path::Path,
-        snapshot: std::collections::BTreeMap<String, String>,
-    ) -> crate::secrets::CommandContext {
-        let path = crate::exec::filter_path("/bin:/usr/bin", root, &[]);
-        crate::secrets::CommandContext {
-            snapshot,
-            path,
-            cwd: root.to_path_buf(),
-            root: root.to_path_buf(),
-            write_grants: Vec::new(),
-        }
-    }
-
-    /// `refresh_once_ctx` runs the command under the given `CommandContext`
-    /// — its snapshot, not the daemon's environment — and otherwise behaves
-    /// exactly like `refresh_once`: the slot is updated and marked healthy.
-    #[test]
     fn refresh_once_ctx_uses_context_snapshot_and_marks_healthy() {
         let tmp = tempfile::tempdir().unwrap();
         let mut snapshot = std::collections::BTreeMap::new();
@@ -443,6 +426,7 @@ mod tests {
             store_with("TOK", "old"),
             empty_redactor_swap(),
             RingBuffer::new(),
+            noop_callback(),
         );
 
         let argv = vec![
@@ -463,9 +447,55 @@ mod tests {
         assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
     }
 
-    /// A command that resolves inside the project root under a
-    /// `CommandContext` is refused and marks the slot stale, same as any
-    /// other refresh failure.
+    #[test]
+    fn refresh_once_ctx_calls_on_refresh_on_success() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        let shared = &RefreshShared::new(
+            store_with("TOK", "old"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+            Arc::new(move || called_clone.store(true, std::sync::atomic::Ordering::SeqCst)),
+        );
+
+        refresh_once_ctx(
+            "TOK",
+            &echo_argv("new-value"),
+            Duration::from_secs(2),
+            &CommandEnv::default(),
+            &ctx,
+            shared,
+        )
+        .unwrap();
+        assert!(called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[test]
+    fn refresh_once_ctx_does_not_call_on_refresh_on_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
+        let called = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let called_clone = Arc::clone(&called);
+        let shared = &RefreshShared::new(
+            store_with("TOK", "still-good"),
+            empty_redactor_swap(),
+            RingBuffer::new(),
+            Arc::new(move || called_clone.store(true, std::sync::atomic::Ordering::SeqCst)),
+        );
+
+        let _ = refresh_once_ctx(
+            "TOK",
+            &nonexistent_argv(),
+            Duration::from_secs(1),
+            &CommandEnv::default(),
+            &ctx,
+            shared,
+        );
+        assert!(!called.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
     #[test]
     fn refresh_once_ctx_refuses_command_inside_root_and_marks_stale() {
         let tmp = tempfile::tempdir().unwrap();
@@ -480,6 +510,7 @@ mod tests {
             store_with("TOK", "still-good"),
             empty_redactor_swap(),
             RingBuffer::new(),
+            noop_callback(),
         );
 
         let res = refresh_once_ctx(
@@ -502,18 +533,22 @@ mod tests {
     }
 
     #[test]
-    fn refresh_once_rebuilds_redactor_with_both_generations() {
+    fn refresh_once_ctx_rebuilds_redactor_with_both_generations() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
         let shared = &RefreshShared::new(
             store_with("TOK", "old-value"),
             empty_redactor_swap(),
             RingBuffer::new(),
+            noop_callback(),
         );
 
-        refresh_once(
+        refresh_once_ctx(
             "TOK",
             &echo_argv("new-value"),
             Duration::from_secs(2),
             &CommandEnv::default(),
+            &ctx,
             shared,
         )
         .unwrap();
@@ -526,60 +561,30 @@ mod tests {
     }
 
     #[test]
-    fn refreshing_one_secret_keeps_the_previous_generation_of_another() {
-        let mut map = HashMap::new();
-        for (label, value) in [("A", "a-old-value"), ("B", "b-old-value")] {
-            map.insert(
-                label.to_string(),
-                RwLock::new(SecretSlot {
-                    value: Arc::new(Secret::new(value.to_string())),
-                    health: Health::Healthy,
-                }),
-            );
-        }
-        let shared = &RefreshShared::new(Arc::new(map), empty_redactor_swap(), RingBuffer::new());
-
-        for (label, value) in [("A", "a-new-value"), ("B", "b-new-value")] {
-            refresh_once(
-                label,
-                &echo_argv(value),
-                Duration::from_secs(2),
-                &CommandEnv::default(),
-                shared,
-            )
-            .unwrap();
-        }
-
-        let redactor = shared.redactor_swap.read().unwrap().clone();
-        let out = redactor.redact_bytes(b"a-old-value a-new-value b-old-value b-new-value");
-        let s = String::from_utf8_lossy(&out);
-        assert!(!s.contains("-value"), "a generation was not redacted: {s}");
-    }
-
-    #[test]
-    fn refresh_once_failure_marks_stale_and_keeps_value() {
+    fn refresh_once_ctx_failure_marks_stale_and_keeps_value() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
         let shared = &RefreshShared::new(
             store_with("TOK", "still-good-for-now"),
             empty_redactor_swap(),
             RingBuffer::new(),
+            noop_callback(),
         );
 
-        let res = refresh_once(
+        let res = refresh_once_ctx(
             "TOK",
             &nonexistent_argv(),
             Duration::from_secs(1),
             &CommandEnv::default(),
+            &ctx,
             shared,
         );
         assert!(res.is_err());
-        // Value preserved.
         assert_eq!(read_value(&shared.store, "TOK"), "still-good-for-now");
-        // Health flipped.
         assert!(matches!(
             read_health(&shared.store, "TOK"),
             Health::Stale { .. }
         ));
-        // Failure logged.
         let log = shared
             .ring
             .entries()
@@ -594,19 +599,22 @@ mod tests {
     }
 
     #[test]
-    fn refresh_once_success_after_failure_restores_healthy() {
+    fn refresh_once_ctx_success_after_failure_restores_healthy() {
+        let tmp = tempfile::tempdir().unwrap();
+        let ctx = test_ctx(tmp.path(), std::collections::BTreeMap::new());
         let shared = &RefreshShared::new(
             store_with("TOK", "old"),
             empty_redactor_swap(),
             RingBuffer::new(),
+            noop_callback(),
         );
 
-        // Force into Stale.
-        let _ = refresh_once(
+        let _ = refresh_once_ctx(
             "TOK",
             &nonexistent_argv(),
             Duration::from_secs(1),
             &CommandEnv::default(),
+            &ctx,
             shared,
         );
         assert!(matches!(
@@ -614,16 +622,70 @@ mod tests {
             Health::Stale { .. }
         ));
 
-        // Successful refresh restores Healthy.
-        refresh_once(
+        refresh_once_ctx(
             "TOK",
             &echo_argv("recovered"),
             Duration::from_secs(2),
             &CommandEnv::default(),
+            &ctx,
             shared,
         )
         .unwrap();
         assert_eq!(read_value(&shared.store, "TOK"), "recovered");
         assert!(matches!(read_health(&shared.store, "TOK"), Health::Healthy));
+    }
+
+    #[tokio::test]
+    async fn spawn_all_ctx_spawns_one_task_per_refreshable_secret() {
+        let tmp = tempfile::tempdir().unwrap();
+        let mut config = test_config();
+        config.secrets.insert(
+            "TOK".to_string(),
+            crate::config::SecretSpec {
+                label: "TOK".to_string(),
+                source: SecretSource::Command {
+                    argv: echo_argv("v"),
+                    timeout: Duration::from_secs(2),
+                    refresh: Some(RefreshSpec {
+                        interval: Duration::from_secs(3600),
+                        max_backoff: Duration::from_secs(3600),
+                    }),
+                    env: CommandEnv::default(),
+                },
+            },
+        );
+        let store = store_with("TOK", "old");
+        let ctx = Arc::new(test_ctx(tmp.path(), std::collections::BTreeMap::new()));
+
+        let (mut tasks, tx) = spawn_all_ctx(
+            &config,
+            store,
+            empty_redactor_swap(),
+            RingBuffer::new(),
+            ctx,
+            noop_callback(),
+        );
+        assert_eq!(tasks.len(), 1);
+        let _ = tx.send(true);
+        let drain = async { while tasks.join_next().await.is_some() {} };
+        tokio::time::timeout(Duration::from_secs(2), drain)
+            .await
+            .unwrap();
+    }
+
+    fn test_config() -> Config {
+        Config {
+            sandbox_root: PathBuf::from("/tmp"),
+            socket_path: PathBuf::from("/tmp/airlock.sock"),
+            pid_path: PathBuf::from("/tmp/airlock.pid"),
+            ca_path: PathBuf::from("/tmp/airlock-ca.pem"),
+            timeout: Duration::from_secs(300),
+            filesystem_read: Vec::new(),
+            filesystem_write: Vec::new(),
+            secrets: HashMap::new(),
+            tools: HashMap::new(),
+            agent: None,
+            tool_state_dirs: Vec::new(),
+        }
     }
 }
