@@ -155,6 +155,17 @@ pub(crate) enum Location {
     InsideWriteGrant,
 }
 
+impl Location {
+    /// Why a `PATH` entry at this location is dropped, or `None` to keep it.
+    fn path_drop_reason(&self) -> Option<&'static str> {
+        match self {
+            Location::Outside => None,
+            Location::InsideRoot => Some("inside the project"),
+            Location::InsideWriteGrant => Some("writable from a sandbox"),
+        }
+    }
+}
+
 /// Classify `path` against the root and write grants, root taking priority
 /// so the more specific "inside the project" message wins when both apply.
 pub(crate) fn classify_location(path: &Path, root: &Path, write_grants: &[PathBuf]) -> Location {
@@ -194,21 +205,35 @@ pub fn filter_path(path_var: &str, root: &Path, write_grants: &[PathBuf]) -> Fil
             dropped.push((raw.to_string(), "relative".to_string()));
             continue;
         }
-        if crate::anchors::is_inside(candidate, root) {
-            dropped.push((raw.to_string(), "inside the project".to_string()));
-            continue;
-        }
-        if write_grants
-            .iter()
-            .any(|grant| crate::anchors::is_inside(candidate, grant))
-        {
-            dropped.push((raw.to_string(), "writable from a sandbox".to_string()));
+        if let Some(reason) = classify_location(candidate, root, write_grants).path_drop_reason() {
+            dropped.push((raw.to_string(), reason.to_string()));
             continue;
         }
         entries.push(candidate.to_path_buf());
     }
 
     FilteredPath { entries, dropped }
+}
+
+impl FilteredPath {
+    /// This `PATH` with [`filter_path`]'s project and write-grant checks
+    /// applied again against `write_grants`, for when the grants have grown
+    /// since it was filtered.
+    pub fn refiltered(&self, root: &Path, write_grants: &[PathBuf]) -> FilteredPath {
+        let mut out = FilteredPath {
+            entries: Vec::new(),
+            dropped: self.dropped.clone(),
+        };
+        for entry in &self.entries {
+            match classify_location(entry, root, write_grants).path_drop_reason() {
+                Some(reason) => out
+                    .dropped
+                    .push((entry.to_string_lossy().into_owned(), reason.to_string())),
+                None => out.entries.push(entry.clone()),
+            }
+        }
+        out
+    }
 }
 
 /// Render the entries [`filter_path`] dropped, for the tail of a "binary

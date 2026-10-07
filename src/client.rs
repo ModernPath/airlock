@@ -717,6 +717,7 @@ mod tests {
                     sha256: config::sha256_hex(b"original contents"),
                 }],
                 mode: crate::protocol::WireMode::Default,
+                write_grants: Vec::new(),
             };
             write_daemon_msg(
                 &mut writer2,

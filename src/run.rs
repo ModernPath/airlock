@@ -340,7 +340,13 @@ pub fn run_agent(
     args: &[String],
     opts: RunOptions,
 ) -> Result<ExitCode, RunError> {
-    let extra_write_grants = resolve_paths(&opts.allow_write, cwd);
+    // Profile paths are agent-writable like `--allow-write`, so both go
+    // through the anchor check and the `PATH`/binary refusal.
+    let mut extra_write_grants = resolve_paths(&opts.allow_write, cwd);
+    if let Some(p) = opts.profile {
+        let home = launcher::home_dir()?;
+        extra_write_grants.extend(profile_read_write_paths(p, home.to_str()));
+    }
 
     let prepared = launcher::prepare(
         cwd,
@@ -348,7 +354,7 @@ pub fn run_agent(
             discover: opts.discover.clone(),
             verbose: opts.verbose,
             quiet: opts.quiet,
-            extra_write_grants,
+            extra_write_grants: extra_write_grants.clone(),
             cli_kits: opts.kits.clone(),
         },
     )?;
@@ -375,17 +381,10 @@ pub fn run_agent(
     policy.runtime_base = Some(prepared.anchors.runtime_base.clone());
     policy.tmpdir = prepared.env_snapshot.get("TMPDIR").map(PathBuf::from);
     policy.home = home.map(PathBuf::from);
-    if let Some(p) = opts.profile {
-        policy
-            .read_write_paths
-            .extend(profile_read_write_paths(p, home));
-    }
     policy
         .read_paths
         .extend(resolve_paths(&opts.allow_read, cwd));
-    policy
-        .read_write_paths
-        .extend(resolve_paths(&opts.allow_write, cwd));
+    policy.read_write_paths.extend(extra_write_grants);
     // Kit read paths may not exist (e.g. no ~/.rustup on this machine) —
     // filtered here, same as detect_toolchain_paths/profile_read_write_paths.
     // Kit write dirs/files were already created by launcher::prepare, so no

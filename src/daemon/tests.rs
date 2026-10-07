@@ -530,6 +530,71 @@ async fn reload_swaps_tools_and_reports_changes() {
     assert_eq!(tools[0].name, "psql");
 }
 
+#[tokio::test]
+async fn reload_never_drops_a_write_grant() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let root = tempfile::tempdir().unwrap();
+    let grant = tempfile::tempdir().unwrap();
+    let grant_bin = grant.path().join("bin");
+    std::fs::create_dir(&grant_bin).unwrap();
+
+    let mut register_payload = test_payload(root.path(), "[tools.gh]\n");
+    register_payload.write_grants = vec![grant.path().to_path_buf()];
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let reply = admin
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Register(Box::new(RegisterRequest {
+                payload: register_payload,
+                name: "claude".to_string(),
+                sandbox: SandboxKind::Airlock,
+                ends: SessionEnds::Ttl { secs: 3600 },
+            })),
+        ))
+        .await;
+    let DaemonMessage::Registered { id, .. } = reply else {
+        panic!("expected Registered, got {reply:?}")
+    };
+
+    // A launcher that forgot the agent's grant, and so left a directory
+    // inside it on `PATH`.
+    let mut reload_payload = test_payload(root.path(), "[tools.gh]\n");
+    reload_payload.path.insert(0, grant_bin.clone());
+    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(reload_payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let policy = daemon.state.sessions.get(&id).unwrap().current_policy();
+    assert_eq!(policy.write_grants, vec![grant.path().to_path_buf()]);
+    assert!(
+        !policy.path.entries.contains(&grant_bin),
+        "{:?}",
+        policy.path
+    );
+    assert!(
+        policy
+            .path
+            .dropped
+            .iter()
+            .any(|(entry, reason)| entry == &grant_bin.to_string_lossy()
+                && reason == "writable from a sandbox"),
+        "{:?}",
+        policy.path.dropped
+    );
+    assert_eq!(
+        daemon.state.sessions.get(&id).unwrap().info().write_grants,
+        vec![grant.path().to_path_buf()]
+    );
+}
+
 // ─── Proxy CA lifecycle ───────────────────────────────────────────────────────
 
 fn proxy_config(host: &str) -> String {

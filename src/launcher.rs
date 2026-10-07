@@ -85,7 +85,9 @@ pub struct PrepareOptions {
     pub discover: DiscoverOpts,
     pub verbose: bool,
     pub quiet: bool,
-    /// `--allow-write` (run only); resolved to absolute paths by the caller.
+    /// Write grants beyond the config's, as absolute paths: `airlock run`'s
+    /// `--allow-write` and profile paths, or the session's existing grants
+    /// on `session reload`. Empty for `session start`.
     pub extra_write_grants: Vec<PathBuf>,
     /// `--kit` (run only; repeatable), additive to `agent.kits`. Empty for
     /// `session start`/`session reload`, which never apply kits — see
@@ -289,7 +291,7 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     clippy::disallowed_methods,
     reason = "launcher-side: runs in the user's terminal before Register"
 )]
-fn home_dir() -> Result<PathBuf, LauncherError> {
+pub(crate) fn home_dir() -> Result<PathBuf, LauncherError> {
     std::env::var("HOME")
         .map(PathBuf::from)
         .map_err(|_| LauncherError::Config(ConfigError::HomeNotSet))
