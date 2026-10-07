@@ -527,6 +527,12 @@ impl Sessions {
     }
 
     /// Resolve `s` as a session id, a unique id prefix, or a unique name.
+    ///
+    /// Keep this in sync with [`resolve_session_ref`] below, which applies
+    /// the identical rule client-side, over the `SessionInfo` list `session
+    /// list` already returns, for a CLI command that must resolve a ref
+    /// itself before it can act (`session reload`, `session revoke`) rather
+    /// than hand the raw ref to an admin request that resolves it here.
     pub fn resolve_ref(&self, s: &str) -> Result<Arc<Session>, String> {
         let live = self.live.read().unwrap_or_else(|e| e.into_inner());
 
@@ -553,6 +559,45 @@ impl Sessions {
                     ids.join(", ")
                 ))
             }
+        }
+    }
+}
+
+/// Resolves `s` against `sessions` by the same rule as
+/// [`Sessions::resolve_ref`] (exact id, unique id prefix, or unique name) —
+/// for a client that only has the `SessionInfo` list `session list`/`Tools`
+/// already return, not the daemon's live registry. `session reload` uses
+/// this: it must know which session(s) it's reloading, each with its own
+/// project root, before it can even build that session's `Reload` payload,
+/// so it cannot simply hand the raw ref to an admin request and let the
+/// daemon resolve it the way `session revoke` does.
+///
+/// Never silently acts on more than one match: ambiguity is an error naming
+/// every candidate.
+pub fn resolve_session_ref<'a>(
+    s: &str,
+    sessions: &'a [SessionInfo],
+) -> Result<&'a SessionInfo, String> {
+    if let Some(exact) = sessions.iter().find(|session| session.id.as_str() == s) {
+        return Ok(exact);
+    }
+
+    let mut matches: Vec<&SessionInfo> = sessions
+        .iter()
+        .filter(|session| session.id.as_str().starts_with(s) || session.name == s)
+        .collect();
+    matches.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
+    matches.dedup_by(|a, b| a.id == b.id);
+
+    match matches.len() {
+        0 => Err(format!("no session matches {s:?}")),
+        1 => Ok(matches[0]),
+        _ => {
+            let ids: Vec<&str> = matches.iter().map(|session| session.id.as_str()).collect();
+            Err(format!(
+                "{s:?} matches more than one session: {}",
+                ids.join(", ")
+            ))
         }
     }
 }
@@ -680,6 +725,49 @@ mod tests {
     fn resolve_ref_unknown_errors() {
         let sessions = Sessions::new();
         let err = sessions.resolve_ref("nope").unwrap_err();
+        assert!(err.contains("no session matches"), "{err}");
+    }
+
+    // ── resolve_session_ref: the client-side mirror of resolve_ref, over
+    //    SessionInfo rather than the live registry (main.rs's `session
+    //    reload`/`session revoke`) ────────────────────────────────────────
+
+    #[test]
+    fn resolve_session_ref_by_exact_id() {
+        let infos = vec![test_session(SessionId::parse("abc123").unwrap(), "claude").info()];
+        let found = resolve_session_ref("abc123", &infos).unwrap();
+        assert_eq!(found.id.as_str(), "abc123");
+    }
+
+    #[test]
+    fn resolve_session_ref_by_unique_prefix() {
+        let infos = vec![test_session(SessionId::parse("abc123").unwrap(), "claude").info()];
+        let found = resolve_session_ref("abc1", &infos).unwrap();
+        assert_eq!(found.id.as_str(), "abc123");
+    }
+
+    #[test]
+    fn resolve_session_ref_by_unique_name() {
+        let infos = vec![test_session(SessionId::parse("abc123").unwrap(), "claude").info()];
+        let found = resolve_session_ref("claude", &infos).unwrap();
+        assert_eq!(found.id.as_str(), "abc123");
+    }
+
+    #[test]
+    fn resolve_session_ref_ambiguous_prefix_names_every_candidate() {
+        let infos = vec![
+            test_session(SessionId::parse("abc123").unwrap(), "claude").info(),
+            test_session(SessionId::parse("abc456").unwrap(), "codex").info(),
+        ];
+        let err = resolve_session_ref("abc", &infos).unwrap_err();
+        assert!(err.contains("more than one session"), "{err}");
+        assert!(err.contains("abc123"), "{err}");
+        assert!(err.contains("abc456"), "{err}");
+    }
+
+    #[test]
+    fn resolve_session_ref_unknown_errors() {
+        let err = resolve_session_ref("nope", &[]).unwrap_err();
         assert!(err.contains("no session matches"), "{err}");
     }
 

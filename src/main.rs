@@ -23,6 +23,7 @@ use airlock::protocol::{
 };
 use airlock::run::{self, RunOptions};
 use airlock::runtime_dir::RuntimeDir;
+use airlock::session;
 
 // ─── Version string ──────────────────────────────────────────────────────────
 
@@ -1153,19 +1154,29 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
     };
 
     let project_root = discover_root_quietly(cwd);
-    let targets: Vec<_> = sessions
-        .into_iter()
-        .filter(|s| {
-            if all {
-                true
-            } else if !ids.is_empty() {
-                ids.iter()
-                    .any(|id| s.id.as_str().starts_with(id.as_str()) || &s.name == id)
-            } else {
-                project_root.as_deref() == Some(s.root.as_path())
+    let targets: Vec<SessionInfo> = if all {
+        sessions
+    } else if !ids.is_empty() {
+        // Resolve each ref exactly once, by the same rule the daemon's own
+        // handlers use (exact id, unique id prefix, or unique name) — never
+        // silently reload every session an ambiguous ref happens to match.
+        let mut resolved = Vec::with_capacity(ids.len());
+        for id in &ids {
+            match session::resolve_session_ref(id, &sessions) {
+                Ok(info) => resolved.push(info.clone()),
+                Err(msg) => {
+                    eprint_error(msg);
+                    return ExitCode::from(125);
+                }
             }
-        })
-        .collect();
+        }
+        resolved
+    } else {
+        sessions
+            .into_iter()
+            .filter(|s| project_root.as_deref() == Some(s.root.as_path()))
+            .collect()
+    };
 
     let mut exit = ExitCode::SUCCESS;
     for session in targets {
@@ -1222,46 +1233,50 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
         Ok(v) => v,
         Err(code) => return code,
     };
-    let sessions = match conn.admin_request(&token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => sessions,
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
-    };
 
-    let project_root = discover_root_quietly(cwd);
-    let targets: Vec<_> = sessions
-        .into_iter()
-        .filter(|s| {
-            if all {
-                true
-            } else if here {
-                project_root.as_deref() == Some(s.root.as_path())
-            } else {
-                ids.iter()
-                    .any(|id| s.id.as_str().starts_with(id.as_str()) || &s.name == id)
+    // `--all`/`--here` select by root, resolved here (there's no ref to
+    // disambiguate). A bare ref is sent to the daemon's `Revoke` as-is —
+    // `handle_revoke` already resolves it (exact id, unique id prefix, or
+    // unique name) and refuses an ambiguous one, naming every candidate,
+    // rather than this command silently ending every session it matches.
+    let targets: Vec<String> = if all || here {
+        let sessions = match conn.admin_request(&token, AdminRequest::ListSessions) {
+            Ok(DaemonMessage::Sessions { sessions }) => sessions,
+            Ok(_) => {
+                eprintln!("error: unexpected response from the daemon");
+                return ExitCode::from(125);
             }
-        })
-        .collect();
+            Err(e) => {
+                eprint_error(e);
+                return ExitCode::from(125);
+            }
+        };
+        let project_root = discover_root_quietly(cwd);
+        sessions
+            .into_iter()
+            .filter(|s| all || project_root.as_deref() == Some(s.root.as_path()))
+            .map(|s| s.id.to_string())
+            .collect()
+    } else {
+        ids
+    };
 
     if targets.is_empty() {
         eprintln!("error: no matching session");
         return ExitCode::from(125);
     }
 
-    let target_ids: Vec<String> = targets.iter().map(|s| s.id.to_string()).collect();
     match conn.admin_request(
         &token,
         AdminRequest::Revoke {
-            sessions: target_ids,
+            sessions: targets.clone(),
         },
     ) {
         Ok(DaemonMessage::Ok) => {}
+        Ok(DaemonMessage::Error { kind, message }) => {
+            eprint_error(message);
+            return ExitCode::from(kind.exit_code());
+        }
         Ok(_) => {
             eprintln!("error: unexpected response from the daemon");
             return ExitCode::from(125);
@@ -1272,8 +1287,8 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
         }
     }
 
-    for s in &targets {
-        println!("ended {} {:?}", s.id, s.name);
+    for t in &targets {
+        println!("ended {t}");
     }
     ExitCode::SUCCESS
 }
