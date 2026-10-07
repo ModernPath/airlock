@@ -491,6 +491,14 @@ fn describe_secret_source(spec: &config::RawSecretSpec) -> Option<String> {
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
+/// How long to keep retrying a connect after `spawn_automatic_daemon`
+/// finds another process already starting the daemon
+/// ([`crate::daemon::START_IN_PROGRESS_EXIT_CODE`]) — long enough for a
+/// losing launcher to wait out the winner's own startup (bind, admin-token
+/// write, double fork, readiness) rather than treat the race as a failure.
+const AUTOMATIC_DAEMON_CONNECT_TIMEOUT: Duration = Duration::from_secs(3);
+const AUTOMATIC_DAEMON_CONNECT_POLL: Duration = Duration::from_millis(50);
+
 /// Ensures a daemon is reachable at `runtime`'s socket: connects to an
 /// existing one, handling version skew per "Upgrading Airlock" in the UX
 /// doc, or starts an automatic one by re-executing this binary.
@@ -543,7 +551,7 @@ pub fn ensure_daemon(
     let started_new = conn.is_none();
     if started_new {
         spawn_automatic_daemon(verbose)?;
-        conn = Some(admin::Connection::connect(&runtime.socket_path())?);
+        conn = Some(connect_retrying(runtime)?);
     }
 
     Ok((conn.expect("filled above"), started_new))
@@ -559,6 +567,29 @@ fn wait_for_daemon_gone(runtime: &RuntimeDir) {
     }
 }
 
+/// Connects to the daemon's admin socket, retrying for up to
+/// [`AUTOMATIC_DAEMON_CONNECT_TIMEOUT`] — the daemon `spawn_automatic_daemon`
+/// just started (or found someone else starting) may still be mid-startup.
+fn connect_retrying(runtime: &RuntimeDir) -> Result<admin::Connection, LauncherError> {
+    let deadline = std::time::Instant::now() + AUTOMATIC_DAEMON_CONNECT_TIMEOUT;
+    loop {
+        match admin::Connection::connect(&runtime.socket_path()) {
+            Ok(c) => return Ok(c),
+            Err(e) if std::time::Instant::now() >= deadline => return Err(LauncherError::Admin(e)),
+            Err(_) => std::thread::sleep(AUTOMATIC_DAEMON_CONNECT_POLL),
+        }
+    }
+}
+
+/// Starts the automatic daemon by re-executing this binary as `airlock
+/// daemon start --automatic` and waiting for it to signal readiness (the
+/// existing double fork + readiness pipe in `src/daemon.rs`).
+///
+/// A losing race for the startup lock is not a failure here: the child
+/// exits with [`crate::daemon::START_IN_PROGRESS_EXIT_CODE`], already
+/// having printed nothing but a `note:` line, and the winner is (or will
+/// shortly be) serving the same socket — `ensure_daemon`'s `connect_retrying`
+/// is what actually waits for it.
 fn spawn_automatic_daemon(verbose: bool) -> Result<(), LauncherError> {
     let exe = std::env::current_exe()?;
     if verbose {
@@ -567,6 +598,9 @@ fn spawn_automatic_daemon(verbose: bool) -> Result<(), LauncherError> {
     let status = std::process::Command::new(exe)
         .args(["daemon", "start", "--automatic"])
         .status()?;
+    if status.code() == Some(i32::from(crate::daemon::START_IN_PROGRESS_EXIT_CODE)) {
+        return Ok(());
+    }
     if !status.success() {
         return Err(LauncherError::Aborted);
     }

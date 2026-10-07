@@ -1280,6 +1280,20 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
 
 // ─── Command: daemon ─────────────────────────────────────────────────────────
 
+fn report_daemon_start_result(result: Result<(), daemon::DaemonError>) -> ExitCode {
+    match result {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(daemon::DaemonError::StartInProgress) => {
+            eprintln!("note: another process is already starting or running the daemon");
+            ExitCode::from(daemon::START_IN_PROGRESS_EXIT_CODE)
+        }
+        Err(e) => {
+            eprint_error(e);
+            ExitCode::from(125)
+        }
+    }
+}
+
 fn cmd_daemon(action: DaemonAction) -> ExitCode {
     match action {
         DaemonAction::Start {
@@ -1294,13 +1308,7 @@ fn cmd_daemon(action: DaemonAction) -> ExitCode {
             } else {
                 DaemonMode::Manual
             };
-            match daemon::start(mode, foreground) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::from(125)
-                }
-            }
+            report_daemon_start_result(daemon::start(mode, foreground))
         }
         DaemonAction::Stop { yes } => cmd_daemon_stop(yes),
         DaemonAction::Restart { yes } => {
@@ -1308,13 +1316,7 @@ fn cmd_daemon(action: DaemonAction) -> ExitCode {
             if stop_code != ExitCode::SUCCESS {
                 return stop_code;
             }
-            match daemon::start(DaemonMode::Manual, false) {
-                Ok(()) => ExitCode::SUCCESS,
-                Err(e) => {
-                    eprintln!("error: {e}");
-                    ExitCode::from(125)
-                }
-            }
+            report_daemon_start_result(daemon::start(DaemonMode::Manual, false))
         }
         DaemonAction::Logs { session } => cmd_daemon_logs(session),
         DaemonAction::Install => cmd_daemon_install(),

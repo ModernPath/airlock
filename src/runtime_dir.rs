@@ -18,6 +18,7 @@ use thiserror::Error;
 const SOCKET_FILENAME: &str = "airlock.sock";
 const PID_FILENAME: &str = "airlock.pid";
 const ADMIN_TOKEN_FILENAME: &str = "admin.token";
+const LOCK_FILENAME: &str = "airlock.lock";
 const CA_DIRNAME: &str = "ca";
 
 /// Debug-only escape hatch for integration tests, which cannot rely on a
@@ -141,6 +142,16 @@ impl RuntimeDir {
 
     pub fn admin_token_path(&self) -> PathBuf {
         self.base.join(ADMIN_TOKEN_FILENAME)
+    }
+
+    /// An exclusive `flock` on this file serializes concurrent `daemon
+    /// start`s (docs/ARCHITECTURE.md, "Startup"): held from before the
+    /// stale-state check through the daemon's entire life, so a second
+    /// `start` can never delete a winner's socket/admin.token as "stale",
+    /// and a non-blocking lock attempt doubles as "is a daemon starting or
+    /// running right now".
+    pub fn lock_path(&self) -> PathBuf {
+        self.base.join(LOCK_FILENAME)
     }
 
     pub fn ca_dir(&self) -> PathBuf {

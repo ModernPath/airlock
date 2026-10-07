@@ -50,7 +50,11 @@ main()
  │   └─ synchronous_startup()         ← all pre-fork work
  │       ├─ harden_process()          ← RLIMIT_CORE=0, PR_SET_DUMPABLE=0 (Linux)
  │       ├─ runtime_dir::locate() + create_and_validate()  ← per-user base, outside every project
- │       ├─ cleanup stale PID/socket (in the runtime dir, not the project)
+ │       ├─ acquire_startup_lock(airlock.lock)  ← exclusive flock, held for the daemon's life;
+ │       │                                        a losing concurrent `daemon start` gets
+ │       │                                        StartInProgress and exits 75, not an error
+ │       ├─ cleanup stale PID/socket (in the runtime dir, not the project; safe to treat a
+ │       │  socket with no PID file as stale now, since the lock rules out a concurrent starter)
  │       ├─ write admin.token (32 random bytes, mode 0600)
  │       ├─ umask(0o077) + UnixListener::bind() + restore umask
  │       ├─ verify_socket_permissions()  ← refuse start if not 0o700

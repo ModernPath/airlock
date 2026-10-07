@@ -34,6 +34,7 @@ async fn start_test_daemon_with_idle(mode: DaemonMode, idle_exit: Option<Duratio
 
     let admin_token = AdminToken::generate();
     write_admin_token(&runtime.admin_token_path(), &admin_token).expect("write admin token");
+    let lock = acquire_startup_lock(&runtime.lock_path()).expect("acquire startup lock");
 
     listener.set_nonblocking(true).expect("nonblocking");
     let tokio_listener = tokio::net::UnixListener::from_std(listener).expect("from_std");
@@ -41,6 +42,7 @@ async fn start_test_daemon_with_idle(mode: DaemonMode, idle_exit: Option<Duratio
     let state = DaemonState::new(
         runtime,
         admin_token.clone(),
+        lock,
         mode,
         idle_exit,
         RingBuffer::new(),
@@ -815,6 +817,30 @@ async fn stop_shuts_down_and_removes_files() {
     }
     assert!(!pid_path.exists());
     assert!(!daemon.state.runtime.admin_token_path().exists());
+}
+
+// ─── Startup lock ─────────────────────────────────────────────────────────────
+
+/// A second, concurrent `daemon start` must not be able to take the lock
+/// while the first is still starting (or running) — the mechanism that
+/// stops it from racing `check_and_cleanup_stale_state` against the
+/// winner's own bind/admin-token write.
+#[test]
+fn acquire_startup_lock_refuses_a_second_concurrent_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("airlock.lock");
+
+    let first = acquire_startup_lock(&path).expect("first holder should succeed");
+    assert!(matches!(
+        acquire_startup_lock(&path),
+        Err(DaemonError::StartInProgress)
+    ));
+
+    // Once released (the holder's fd closes), a new start can take it —
+    // mirroring the winner's daemon exiting and a later `daemon start`
+    // succeeding.
+    drop(first);
+    assert!(acquire_startup_lock(&path).is_ok());
 }
 
 // ─── Idle exit ───────────────────────────────────────────────────────────────

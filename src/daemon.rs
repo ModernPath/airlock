@@ -79,6 +79,13 @@ const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
 #[cfg(debug_assertions)]
 const IDLE_EXIT_OVERRIDE_VAR: &str = "AIRLOCK_TEST_IDLE_EXIT_SECS";
 
+/// `airlock daemon start`'s exit code for [`DaemonError::StartInProgress`],
+/// distinct from the generic 125 other startup failures use. `main.rs`'s
+/// `cmd_daemon` emits it; `launcher::spawn_automatic_daemon` matches on it
+/// to tell "another process already has this" apart from a real failure
+/// and retry connecting instead of aborting.
+pub const START_IN_PROGRESS_EXIT_CODE: u8 = 75;
+
 // ─── Error type ───────────────────────────────────────────────────────────────
 
 /// Errors that can occur during daemon startup and lifecycle management.
@@ -144,6 +151,22 @@ pub enum DaemonError {
     AlreadyRunning {
         /// The PID of the existing daemon.
         pid: u32,
+    },
+
+    /// Another process already holds the startup lock: it is either
+    /// starting a daemon right now or already running one. The caller
+    /// should not treat this as a hard failure — `ensure_daemon` retries
+    /// connecting instead of propagating it.
+    #[error("another process is already starting or running the daemon")]
+    StartInProgress,
+
+    /// Failed to open or lock `airlock.lock`.
+    #[error("failed to acquire the startup lock {path}: {source}")]
+    LockFailed {
+        /// The lock file's path.
+        path: PathBuf,
+        /// The underlying I/O error.
+        source: std::io::Error,
     },
 
     /// Failed to clean up stale state files.
@@ -323,13 +346,13 @@ impl ChildRegistry {
 /// mechanism) or running in the foreground. Returns after readiness
 /// (background) or at shutdown (foreground).
 pub fn start(mode: DaemonMode, foreground: bool) -> Result<(), DaemonError> {
-    let (runtime, listener, admin_token) = synchronous_startup()?;
+    let handles = synchronous_startup()?;
     let idle_exit = idle_exit_duration(mode);
 
     if foreground {
-        run_foreground(runtime, listener, admin_token, mode, idle_exit)
+        run_foreground(handles, mode, idle_exit)
     } else {
-        daemonize(runtime, listener, admin_token, mode, idle_exit)
+        daemonize(handles, mode, idle_exit)
     }
 }
 
@@ -357,15 +380,35 @@ fn idle_exit_duration(mode: DaemonMode) -> Option<Duration> {
 
 // ─── Synchronous startup sequence ───────────────────────────────────────────
 
-/// Locate, create and validate the runtime dir; clean up stale state; bind
-/// and verify the socket; write a fresh admin token. Completes entirely
-/// without creating a tokio runtime or spawning any thread.
-fn synchronous_startup()
--> Result<(RuntimeDir, unix_net::UnixListener, protocol::AdminToken), DaemonError> {
+/// The resources [`synchronous_startup`] hands to [`daemonize`] or
+/// [`run_foreground`], bundled into one value so the fork/async entry
+/// points downstream of it don't each carry four separate parameters.
+pub(crate) struct StartupHandles {
+    runtime: RuntimeDir,
+    listener: unix_net::UnixListener,
+    admin_token: protocol::AdminToken,
+    /// The startup `flock` ([`acquire_startup_lock`]); see
+    /// [`DaemonState::_lock`] for why it is held for the daemon's life.
+    lock: std::fs::File,
+}
+
+/// Locate, create and validate the runtime dir; take the startup lock; clean
+/// up stale state; bind and verify the socket; write a fresh admin token.
+/// Completes entirely without creating a tokio runtime or spawning any
+/// thread.
+fn synchronous_startup() -> Result<StartupHandles, DaemonError> {
     harden_process();
 
     let runtime = RuntimeDir::locate()?;
     runtime.create_and_validate()?;
+
+    // Held from here through the rest of this process's life (the fd
+    // survives both forks in `daemonize`, inherited like `listener` and
+    // `admin_token`): no other `daemon start` can run its own stale-state
+    // check, bind or admin-token write while this one is in flight, so a
+    // second launcher starting the daemon at the same moment can never see
+    // this one's socket/PID file mid-write and "clean up" it as stale.
+    let lock = acquire_startup_lock(&runtime.lock_path())?;
 
     check_and_cleanup_stale_state(&runtime)?;
 
@@ -379,7 +422,48 @@ fn synchronous_startup()
     let admin_token = protocol::AdminToken::generate();
     write_admin_token(&runtime.admin_token_path(), &admin_token)?;
 
-    Ok((runtime, listener, admin_token))
+    Ok(StartupHandles {
+        runtime,
+        listener,
+        admin_token,
+        lock,
+    })
+}
+
+/// Take a non-blocking exclusive `flock` on `path` (created with mode
+/// `0600` if it doesn't exist). A busy lock means another process is
+/// already starting or running the daemon — [`DaemonError::StartInProgress`],
+/// not a hard failure: `ensure_daemon` in `launcher.rs` treats it as "someone
+/// else has this" and retries connecting instead of propagating it.
+fn acquire_startup_lock(path: &Path) -> Result<std::fs::File, DaemonError> {
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::io::AsRawFd;
+
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .open(path)
+        .map_err(|source| DaemonError::LockFailed {
+            path: path.to_path_buf(),
+            source,
+        })?;
+
+    // SAFETY: flock(2) on a valid, owned fd; no memory is touched besides
+    // the syscall's own arguments.
+    let ret = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+    if ret != 0 {
+        let err = std::io::Error::last_os_error();
+        if err.raw_os_error() == Some(libc::EWOULDBLOCK) {
+            return Err(DaemonError::StartInProgress);
+        }
+        return Err(DaemonError::LockFailed {
+            path: path.to_path_buf(),
+            source: err,
+        });
+    }
+    Ok(file)
 }
 
 /// Check for a stale PID/socket left by a crashed daemon.
@@ -508,10 +592,8 @@ pub(crate) fn harden_process() {
 // ─── Double-fork daemonization ──────────────────────────────────────────────
 
 /// Daemonize using double-fork and then run the async runtime.
-pub fn daemonize(
-    runtime: RuntimeDir,
-    listener: unix_net::UnixListener,
-    admin_token: protocol::AdminToken,
+pub(crate) fn daemonize(
+    handles: StartupHandles,
     mode: DaemonMode,
     idle_exit: Option<Duration>,
 ) -> Result<(), DaemonError> {
@@ -570,9 +652,7 @@ pub fn daemonize(
     }
 
     run_async_runtime(
-        runtime,
-        listener,
-        admin_token,
+        handles,
         mode,
         idle_exit,
         Some(ReadinessPipe(write_end)),
@@ -637,14 +717,12 @@ fn redirect_stdio_to_devnull() {
 // ─── Foreground mode entry point ────────────────────────────────────────────
 
 /// Run the daemon in the foreground (no forking).
-pub fn run_foreground(
-    runtime: RuntimeDir,
-    listener: unix_net::UnixListener,
-    admin_token: protocol::AdminToken,
+pub(crate) fn run_foreground(
+    handles: StartupHandles,
     mode: DaemonMode,
     idle_exit: Option<Duration>,
 ) -> Result<(), DaemonError> {
-    run_async_runtime(runtime, listener, admin_token, mode, idle_exit, None, true)
+    run_async_runtime(handles, mode, idle_exit, None, true)
 }
 
 // ─── Admin-token file ────────────────────────────────────────────────────────
@@ -694,12 +772,18 @@ pub struct DaemonState {
     /// connections; `None` while busy.
     idle_since: Mutex<Option<Instant>>,
     pub shutdown: CancellationToken,
+    /// The startup `flock` ([`acquire_startup_lock`]), held for the
+    /// daemon's entire life so a concurrent `daemon start` can never see
+    /// this one's files mid-write. Never read; only its `Drop` (releasing
+    /// the lock when this process exits) matters.
+    _lock: std::fs::File,
 }
 
 impl DaemonState {
     fn new(
         runtime: RuntimeDir,
         admin_token: protocol::AdminToken,
+        lock: std::fs::File,
         mode: DaemonMode,
         idle_exit: Option<Duration>,
         ring_buffer: RingBuffer,
@@ -718,6 +802,7 @@ impl DaemonState {
             open_connections: AtomicUsize::new(0),
             idle_since: Mutex::new(Some(Instant::now())),
             shutdown: CancellationToken::new(),
+            _lock: lock,
         })
     }
 
@@ -934,9 +1019,7 @@ async fn graceful_shutdown(state: &Arc<DaemonState>) {
 // ─── Async runtime entry point ──────────────────────────────────────────────
 
 fn run_async_runtime(
-    runtime: RuntimeDir,
-    listener: unix_net::UnixListener,
-    admin_token: protocol::AdminToken,
+    handles: StartupHandles,
     mode: DaemonMode,
     idle_exit: Option<Duration>,
     readiness: Option<ReadinessPipe>,
@@ -953,36 +1036,17 @@ fn run_async_runtime(
         }
     };
 
-    rt.block_on(async_main(
-        runtime,
-        listener,
-        admin_token,
-        mode,
-        idle_exit,
-        readiness,
-        foreground,
-    ))
+    rt.block_on(async_main(handles, mode, idle_exit, readiness, foreground))
 }
 
 async fn async_main(
-    runtime: RuntimeDir,
-    listener: unix_net::UnixListener,
-    admin_token: protocol::AdminToken,
+    handles: StartupHandles,
     mode: DaemonMode,
     idle_exit: Option<Duration>,
     mut readiness: Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
-    let result = async_main_inner(
-        runtime,
-        listener,
-        admin_token,
-        mode,
-        idle_exit,
-        &mut readiness,
-        foreground,
-    )
-    .await;
+    let result = async_main_inner(handles, mode, idle_exit, &mut readiness, foreground).await;
     if let (Err(err), Some(pipe)) = (&result, readiness.take()) {
         pipe.fail(err);
     }
@@ -990,14 +1054,19 @@ async fn async_main(
 }
 
 async fn async_main_inner(
-    runtime: RuntimeDir,
-    listener: unix_net::UnixListener,
-    admin_token: protocol::AdminToken,
+    handles: StartupHandles,
     mode: DaemonMode,
     idle_exit: Option<Duration>,
     readiness: &mut Option<ReadinessPipe>,
     foreground: bool,
 ) -> Result<(), DaemonError> {
+    let StartupHandles {
+        runtime,
+        listener,
+        admin_token,
+        lock,
+    } = handles;
+
     let ring_buffer = if foreground {
         RingBuffer::new_echoing()
     } else {
@@ -1030,7 +1099,7 @@ async fn async_main_inner(
         runtime.socket_path().display()
     ));
 
-    let state = DaemonState::new(runtime, admin_token, mode, idle_exit, ring_buffer);
+    let state = DaemonState::new(runtime, admin_token, lock, mode, idle_exit, ring_buffer);
 
     {
         let state = Arc::clone(&state);
@@ -1382,8 +1451,8 @@ async fn handle_admin_request(
             .await;
         }
         AdminRequest::Stop => {
-            let _ = write_ndjson_message(&mut writer, &DaemonMessage::Ok, &global_redactor, None)
-                .await;
+            let _ =
+                write_ndjson_message(&mut writer, &DaemonMessage::Ok, &global_redactor, None).await;
             state
                 .ring_buffer
                 .log("stop requested over the admin connection");
