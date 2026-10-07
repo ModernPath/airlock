@@ -1944,6 +1944,7 @@ fn start_tool(
 
     let spawned = exec::spawn(exec::ExecRequest {
         binary,
+        arg0: tool.to_string(),
         args,
         work_dir: cwd.to_path_buf(),
         env,

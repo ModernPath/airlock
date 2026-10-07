@@ -149,6 +149,7 @@ fn shell_request(sh_cmd: &str, tmp_dir: &Path) -> ExecRequest {
     let snapshot: BTreeMap<String, String> = std::env::vars().collect();
     ExecRequest {
         binary: resolve_binary_in("sh", &path, tmp_dir, &[]).expect("sh should be in PATH"),
+        arg0: "sh".to_string(),
         args: vec!["-c".to_string(), sh_cmd.to_string()],
         work_dir: tmp_dir.to_path_buf(),
         env: build_env_from(&snapshot, &path, &[]),
@@ -331,6 +332,24 @@ async fn stdout_receives_known_string() {
 
     let status = spawned.child.wait().await.unwrap();
     assert!(status.success());
+}
+
+/// The child sees `arg0`, not the canonical binary path, as its `argv[0]`:
+/// a multicall binary (coreutils, busybox) dispatches on it. With no
+/// arguments after the `-c` string, `$0` is the shell's own `argv[0]`.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+#[tokio::test]
+async fn child_argv0_is_arg0_not_the_canonical_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut request = shell_request("echo $0", tmp.path());
+    request.arg0 = "tool-name".to_string();
+    let mut spawned = spawn(request).expect("spawn should succeed");
+
+    let mut buf = Vec::new();
+    spawned.stdout.read_to_end(&mut buf).await.unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&buf), "tool-name\n");
+    assert!(spawned.child.wait().await.unwrap().success());
 }
 
 /// Stderr receives the exact bytes written by the child.
@@ -789,6 +808,7 @@ mod macos_sandbox {
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),
@@ -848,6 +868,7 @@ mod macos_sandbox {
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),
@@ -898,6 +919,7 @@ mod macos_sandbox {
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),
@@ -971,6 +993,7 @@ mod linux_sandbox {
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),
@@ -1019,6 +1042,7 @@ mod linux_sandbox {
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),
@@ -1063,6 +1087,7 @@ mod linux_sandbox {
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
             binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
             env: plain_env(),

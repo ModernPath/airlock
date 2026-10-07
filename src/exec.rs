@@ -393,6 +393,11 @@ pub struct ExecRequest {
     /// [`resolve_binary_in`]).
     pub binary: PathBuf,
 
+    /// The child's `argv[0]`: the name the binary was looked up under, as a
+    /// shell would pass it. Canonicalizing `binary` loses that name, and
+    /// multicall binaries (coreutils, busybox) dispatch on it.
+    pub arg0: String,
+
     /// Argument list — the full `argv` after the binary name (i.e., `argv[1..]`).
     pub args: Vec<String>,
 
@@ -514,6 +519,7 @@ pub struct SpawnedChild {
 #[allow(unused_mut)]
 pub fn spawn(mut request: ExecRequest) -> Result<SpawnedChild, ExecError> {
     let mut cmd = tokio::process::Command::new(&request.binary);
+    cmd.arg0(&request.arg0);
     cmd.args(&request.args);
     cmd.current_dir(&request.work_dir);
 
@@ -1431,6 +1437,7 @@ mod tests {
 
         let _request = ExecRequest {
             binary: PathBuf::from("/bin/sh"),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), "true".to_string()],
             work_dir: PathBuf::from("/tmp"),
             env: test_env(&secrets),
@@ -1533,6 +1540,7 @@ mod tests {
 
         let request = ExecRequest {
             binary: test_resolve("true").expect("true should be in PATH"),
+            arg0: "true".to_string(),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
             env: test_env(&[]),
@@ -1601,6 +1609,7 @@ mod tests {
 
         let request = ExecRequest {
             binary: test_resolve("true").expect("true should be in PATH"),
+            arg0: "true".to_string(),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
             env: test_env(&[]),
