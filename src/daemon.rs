@@ -888,21 +888,30 @@ impl DaemonState {
         let Some(session) = self.sessions.end(id, reason) else {
             return;
         };
-        session.lease_closer.cancel();
+        self.release_session(&session);
         let policy = session.current_policy();
         tokio::spawn(async move {
             policy.shutdown_refresh().await;
         });
-        // Unconditional, and ignoring the common "never had one"/"already
-        // gone" case (NotFound): a reload can drop the session's last proxy
-        // tool after writing this file, so the *current* policy — all a
-        // `had_proxy` check here could see — no longer says whether one is
-        // on disk.
-        let _ = std::fs::remove_file(self.runtime.ca_path(id.as_str()));
         self.rebuild_global_redactor();
         self.note_activity();
         self.ring_buffer
             .log_session(id.as_str(), format!("session ended ({reason:?})"));
+    }
+
+    /// Releases what an ended session holds outside its policy: wakes a
+    /// lease holder blocked on it, and removes its CA file.
+    fn release_session(&self, session: &Session) {
+        session.lease_closer.cancel();
+        self.remove_session_ca(&session.id);
+    }
+
+    /// Removes a session's proxy CA file. Unconditional, ignoring the
+    /// common "never had one"/"already gone" case: a reload can drop the
+    /// session's last proxy tool after writing the file, so the *current*
+    /// policy no longer says whether one is on disk.
+    fn remove_session_ca(&self, id: &protocol::SessionId) {
+        let _ = std::fs::remove_file(self.runtime.ca_path(id.as_str()));
     }
 
     /// Recompute the idle marker. Called whenever the session count or the
@@ -1000,15 +1009,10 @@ async fn graceful_shutdown(state: &Arc<DaemonState>) {
     let sessions = state.sessions.list();
     for session in &sessions {
         state.sessions.end(&session.id, EndedReason::Stopped);
-        session.lease_closer.cancel();
+        state.release_session(session);
     }
     for session in &sessions {
-        let policy = session.current_policy();
-        policy.shutdown_refresh().await;
-        // Unconditional, same reasoning as `end_session`: the current
-        // policy doesn't say whether a CA file was ever written for this
-        // session, only whether one is needed right now.
-        let _ = std::fs::remove_file(state.runtime.ca_path(session.id.as_str()));
+        session.current_policy().shutdown_refresh().await;
     }
 
     let pids = state.child_registry.all();
@@ -1635,10 +1639,7 @@ async fn handle_reload(
 
     // The CA file outlives any policy that still needs it (build_session_policy
     // keeps it across a reload whose routes are unchanged), but not a reload
-    // that drops the session's last proxy tool — nothing will delete it on
-    // this session's behalf again once that happens, since end_session and
-    // graceful_shutdown remove it unconditionally rather than check whether
-    // the session's *current* policy still has a proxy.
+    // that drops the session's last proxy tool.
     let proxy_removed = existing_policy.proxy.is_some() && new_policy.proxy.is_none();
 
     let (old_policy, changes, agent_changed) = {
@@ -1653,7 +1654,7 @@ async fn handle_reload(
     });
 
     if proxy_removed {
-        let _ = std::fs::remove_file(state.runtime.ca_path(session.id.as_str()));
+        state.remove_session_ca(&session.id);
     }
 
     state.rebuild_global_redactor();
