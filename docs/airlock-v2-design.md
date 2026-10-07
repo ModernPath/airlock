@@ -1089,14 +1089,16 @@ so a `CARGO_HOME` the user passes through cannot defeat isolation.
 
 ### Built-in kit definitions
 
-A kit never grants write, and never grants read, to binaries or
-config/credential files — writing to `~/.cargo/bin`, or reading
-`~/.cargo/credentials.toml` or `~/.hex/hex.config`, would hand the agent a
-way to run code the user later trusts unsandboxed, or read a live API key.
+A kit never grants write to binaries or config files, and never grants
+read of credential files — writing to `~/.cargo/bin` or
+`~/.cargo/config.toml`, or reading `~/.cargo/credentials.toml` or
+`~/.hex/hex.config`, would hand the agent a way to run code the user later
+trusts unsandboxed, or read a live API key. Plain settings files may be
+read: shared `rust` reads `config.toml` so the user's cargo settings apply.
 
 | Kit | Reads | Isolated env | Shared writes |
 |---|---|---|---|
-| `rust` | `~/.rustup`, `~/.cargo/bin` | `CARGO_HOME` | `~/.cargo/registry`, `~/.cargo/git`, plus `.package-cache`/`.package-cache-mutate`/`.global-cache`/`.global-cache-journal` as individual files under `CARGO_HOME` |
+| `rust` | `~/.rustup`, `~/.cargo/bin`; shared mode also `CARGO_HOME/config.toml` (and the legacy `config`) | `CARGO_HOME` | `~/.cargo/registry`, `~/.cargo/git`, plus `.package-cache`/`.package-cache-mutate`/`.global-cache`/`.global-cache-journal` as individual files under `CARGO_HOME` |
 | `node` | `~/.nvm`, `~/.volta`, fnm's dir, `~/.bun/bin` | `npm_config_cache`, `YARN_CACHE_FOLDER`, `npm_config_store_dir`, `BUN_INSTALL_CACHE_DIR`, `COREPACK_HOME` | the real dirs for each |
 | `python` | `~/.pyenv`, `~/.local/share/uv/python` | `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR` | the platform cache defaults |
 | `go` | `~/go/bin`, `~/sdk` | `GOMODCACHE`, `GOCACHE`, and `GOPATH` (not just the two caches — `go install`'s output and the sumdb cache live under `GOPATH` with no env var of their own) | `$GOPATH/pkg/{mod,sumdb}`, `GOCACHE`'s platform default |
