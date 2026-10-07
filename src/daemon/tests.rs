@@ -530,6 +530,160 @@ async fn reload_swaps_tools_and_reports_changes() {
     assert_eq!(tools[0].name, "psql");
 }
 
+// ─── Proxy CA lifecycle ───────────────────────────────────────────────────────
+
+fn proxy_config(host: &str) -> String {
+    format!("[tools.curl]\nproxy = true\n\n[[tools.curl.routes]]\nhost = {host:?}\n")
+}
+
+#[tokio::test]
+async fn reload_keeps_the_same_ca_when_routes_are_unchanged() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    let cert_before = std::fs::read(&ca_path).expect("CA file written at register");
+
+    // Reload with the same route (a static tool added alongside it is
+    // enough to make this a real reload, not a no-op).
+    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut toml = proxy_config("example.com");
+    toml.push_str("[tools.sh]\n");
+    let payload = test_payload(tmp.path(), &toml);
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let cert_after = std::fs::read(&ca_path).expect("CA file still present after reload");
+    assert_eq!(
+        cert_before, cert_after,
+        "unchanged routes should keep the same CA, not mint and rewrite a new one"
+    );
+}
+
+#[tokio::test]
+async fn reload_regenerates_the_ca_when_routes_change() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    let cert_before = std::fs::read(&ca_path).expect("CA file written at register");
+
+    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let payload = test_payload(tmp.path(), &proxy_config("other.example"));
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let cert_after = std::fs::read(&ca_path).expect("CA file still present after reload");
+    assert_ne!(
+        cert_before, cert_after,
+        "a changed route must mint a new CA — the old one's name constraints don't cover it"
+    );
+}
+
+#[tokio::test]
+async fn reload_removes_the_ca_file_when_the_last_proxy_tool_is_dropped() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    assert!(ca_path.exists(), "CA file should exist after register");
+
+    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    assert!(
+        !ca_path.exists(),
+        "dropping the session's last proxy tool should remove its CA file"
+    );
+}
+
+#[tokio::test]
+async fn end_session_removes_a_leftover_ca_file_even_without_a_proxy_tool() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    // No proxy tool in this session's config, but a CA file exists anyway —
+    // e.g. left behind by a reload from before `end_session` removed it
+    // unconditionally rather than only when the *current* policy has a
+    // proxy tool.
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    std::fs::write(&ca_path, b"stale CA").unwrap();
+    assert!(ca_path.exists());
+
+    daemon.state.end_session(&id, EndedReason::Revoked);
+    assert!(!ca_path.exists());
+}
+
 // ─── Revoke by prefix / name / ambiguity ─────────────────────────────────────
 
 #[tokio::test]

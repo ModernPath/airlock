@@ -145,6 +145,7 @@ pub fn build_session_policy(
     runtime: &RuntimeDir,
     ring_buffer: &RingBuffer,
     on_refresh: Arc<dyn Fn() + Send + Sync>,
+    existing: Option<&SessionPolicy>,
 ) -> Result<SessionPolicy, String> {
     let config = crate::config::resolve_wire_config(payload.config.clone(), &payload.root)
         .map_err(|e| format!("config error: {e}"))?;
@@ -163,26 +164,46 @@ pub fn build_session_policy(
     };
 
     let proxy = if config.tools.values().any(|t| t.proxy.is_some()) {
-        let ca = ProxyCa::generate(config.tools.values().filter_map(|t| t.proxy.as_ref()))
-            .map_err(|e| format!("proxy CA error: {e}"))?
-            .ok_or_else(|| {
-                "internal: a proxy tool is configured but no CA was generated".to_string()
-            })?;
         let ca_path = runtime.ca_path(session_id.as_str());
-        ca.write_cert_pem(&ca_path)
-            .map_err(|e| format!("failed to write the session's proxy CA: {e}"))?;
-        // The runtime base is 0700, so this is belt-and-suspenders: a
-        // session's CA is readable only by its own tools' sandbox grants,
-        // never by another session or an unsandboxed process of the user.
-        if let Err(e) = std::fs::set_permissions(
-            &ca_path,
-            std::os::unix::fs::PermissionsExt::from_mode(0o600),
-        ) {
-            ring_buffer.log(format!(
-                "failed to tighten permissions on {}: {e}",
-                ca_path.display()
-            ));
-        }
+        let proxy_policies = || config.tools.values().filter_map(|t| t.proxy.as_ref());
+
+        // A reload whose routes are unchanged keeps the same CA — same key,
+        // same cert, same file on disk, no rewrite under whatever is
+        // mid-`exec` and already trusts it. One whose routes changed (or a
+        // fresh `Register`, which has no `existing` at all) cannot: the old
+        // CA's name constraints would no longer match what this config
+        // needs.
+        let reused_ca = existing
+            .and_then(|p| p.proxy.as_ref())
+            .filter(|shared| shared.ca().covers(proxy_policies()))
+            .map(|shared| Arc::clone(shared.ca()));
+
+        let ca = match reused_ca {
+            Some(ca) => ca,
+            None => {
+                let ca = ProxyCa::generate(proxy_policies())
+                    .map_err(|e| format!("proxy CA error: {e}"))?
+                    .ok_or_else(|| {
+                        "internal: a proxy tool is configured but no CA was generated".to_string()
+                    })?;
+                ca.write_cert_pem(&ca_path)
+                    .map_err(|e| format!("failed to write the session's proxy CA: {e}"))?;
+                // The runtime base is 0700, so this is belt-and-suspenders: a
+                // session's CA is readable only by its own tools' sandbox
+                // grants, never by another session or an unsandboxed
+                // process of the user.
+                if let Err(e) = std::fs::set_permissions(
+                    &ca_path,
+                    std::os::unix::fs::PermissionsExt::from_mode(0o600),
+                ) {
+                    ring_buffer.log(format!(
+                        "failed to tighten permissions on {}: {e}",
+                        ca_path.display()
+                    ));
+                }
+                Arc::new(ca)
+            }
+        };
         Some(Arc::new(ProxyShared::new(
             ca,
             ca_path,

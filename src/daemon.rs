@@ -850,13 +850,15 @@ impl DaemonState {
         };
         session.lease_closer.cancel();
         let policy = session.current_policy();
-        let had_proxy = policy.proxy.is_some();
         tokio::spawn(async move {
             policy.shutdown_refresh().await;
         });
-        if had_proxy {
-            let _ = std::fs::remove_file(self.runtime.ca_path(id.as_str()));
-        }
+        // Unconditional, and ignoring the common "never had one"/"already
+        // gone" case (NotFound): a reload can drop the session's last proxy
+        // tool after writing this file, so the *current* policy — all a
+        // `had_proxy` check here could see — no longer says whether one is
+        // on disk.
+        let _ = std::fs::remove_file(self.runtime.ca_path(id.as_str()));
         self.rebuild_global_redactor();
         self.note_activity();
         self.ring_buffer
@@ -972,9 +974,10 @@ async fn graceful_shutdown(state: &Arc<DaemonState>) {
     for session in &sessions {
         let policy = session.current_policy();
         policy.shutdown_refresh().await;
-        if policy.proxy.is_some() {
-            let _ = std::fs::remove_file(state.runtime.ca_path(session.id.as_str()));
-        }
+        // Unconditional, same reasoning as `end_session`: the current
+        // policy doesn't say whether a CA file was ever written for this
+        // session, only whether one is needed right now.
+        let _ = std::fs::remove_file(state.runtime.ca_path(session.id.as_str()));
     }
 
     let pids = state.child_registry.all();
@@ -1517,6 +1520,7 @@ async fn handle_register(
         &state.runtime,
         &state.ring_buffer,
         on_refresh,
+        None,
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1619,6 +1623,8 @@ async fn handle_reload(
         }
     };
 
+    let existing_policy = session.current_policy();
+
     let weak = Arc::downgrade(state);
     let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
         if let Some(state) = weak.upgrade() {
@@ -1632,6 +1638,7 @@ async fn handle_reload(
         &state.runtime,
         &state.ring_buffer,
         on_refresh,
+        Some(&existing_policy),
     ) {
         Ok(p) => p,
         Err(e) => {
@@ -1641,6 +1648,14 @@ async fn handle_reload(
             };
         }
     };
+
+    // The CA file outlives any policy that still needs it (build_session_policy
+    // keeps it across a reload whose routes are unchanged), but not a reload
+    // that drops the session's last proxy tool — nothing will delete it on
+    // this session's behalf again once that happens, since end_session and
+    // graceful_shutdown remove it unconditionally rather than check whether
+    // the session's *current* policy still has a proxy.
+    let proxy_removed = existing_policy.proxy.is_some() && new_policy.proxy.is_none();
 
     let (old_policy, changes, agent_changed) = {
         let mut guard = session.policy.write().unwrap_or_else(|e| e.into_inner());
@@ -1652,6 +1667,10 @@ async fn handle_reload(
     tokio::spawn(async move {
         old_policy.shutdown_refresh().await;
     });
+
+    if proxy_removed {
+        let _ = std::fs::remove_file(state.runtime.ca_path(session.id.as_str()));
+    }
 
     state.rebuild_global_redactor();
     state
