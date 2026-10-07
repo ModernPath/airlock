@@ -392,7 +392,17 @@ fn expand_rust(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             let cargo_home = env_or(inputs, "CARGO_HOME", home.join(".cargo"));
             out.write.push(cargo_home.join("registry"));
             out.write.push(cargo_home.join("git"));
-            for f in [".package-cache", ".package-cache-mutate", ".global-cache"] {
+            // `.global-cache` is a SQLite database; its rollback journal is
+            // created and deleted around every write. Seatbelt lets a
+            // single-file grant do both. Landlock can't grant creating one
+            // name in a directory, so on Linux cargo warns that it couldn't
+            // record last-use data, and the build itself is unaffected.
+            for f in [
+                ".package-cache",
+                ".package-cache-mutate",
+                ".global-cache",
+                ".global-cache-journal",
+            ] {
                 out.write_files.push(cargo_home.join(f));
             }
         }
@@ -1039,6 +1049,11 @@ mod tests {
             expanded
                 .write_files
                 .contains(&home.join(".cargo/.global-cache"))
+        );
+        assert!(
+            expanded
+                .write_files
+                .contains(&home.join(".cargo/.global-cache-journal"))
         );
         assert!(
             expanded.state_dirs.is_empty(),
