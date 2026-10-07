@@ -220,6 +220,14 @@ Interactive tty is not supported — tools that try to read from a terminal
 (prompts for passwords, editor invocations, `less`-style pagers, etc.) will
 fail. Use non-interactive flags where available (e.g. `--yes`, `--no-pager`).
 
+### No new terminals under `airlock run`
+
+`airlock run` lets you use the terminal you were started on, but not
+allocate new ones: `tmux`, `script`, `expect` and similar fail to open a pty.
+That's deliberate (a pty grant on macOS would also reach the user's other
+terminal tabs). If a task needs one, tell the user; they can set
+`[agent] pty = true`.
+
 ### No binary output
 
 Airlock's redaction engine operates on UTF-8 text. Binary output (images,

@@ -167,6 +167,15 @@ pub struct AgentPolicy {
     /// Always `true` for agents, but included as an explicit field so the
     /// profile generator can be read without assuming.
     pub requires_terminal: bool,
+    /// The terminal the agent was started on: the devices behind the
+    /// launcher's stdin/stdout/stderr (`/dev/ttys003`), found by the caller.
+    /// Only these and `/dev/tty` are opened read-write — never every
+    /// `/dev/ttys*`, which is every other terminal tab the user has open.
+    pub terminals: Vec<PathBuf>,
+    /// `[agent] pty = true`: the agent may allocate pseudo-terminals.
+    /// Seatbelt can't tell a pty the agent just allocated from another
+    /// tab's, so this grants every `/dev/ttys*` again.
+    pub pty: bool,
     /// The daemon's runtime directory, when known. See
     /// [`ToolPolicy::runtime_base`] for the macOS deny rules this produces.
     /// Unlike tools, the agent also needs to reach the daemon: when set, the
@@ -1107,8 +1116,12 @@ pub mod macos {
 
         // ── Terminal device access ────────────────────────────────────────────
         // Agents drive interactive sessions and need read/write access to the
-        // controlling terminal (`/dev/tty`) and the pseudo-terminal device tree
-        // (`/dev/ttys*`). Tool profiles intentionally omit these rules.
+        // controlling terminal: `/dev/tty` and the device behind it. Only that
+        // one device — a `/dev/ttys*` pattern would let the agent write
+        // into, and fake the output of, every other terminal tab the user
+        // has open. Writes to the inherited stdio fds need no rule at all;
+        // reopening the terminal by name and the ioctls below do. Tool
+        // profiles intentionally omit these rules.
         //
         // `pseudo-tty` is a distinct SBPL operation class (separate from
         // `file-ioctl`) that covers PTY-specific ioctls — TIOCSETA/TIOCGETA
@@ -1117,17 +1130,34 @@ pub mod macos {
         // terminal into raw mode: tcsetattr returns EPERM, the terminal
         // stays in cooked mode, arrow keys emit raw escape sequences that
         // echo as garbage (^[[A, ^[[B, …), and signal generation misbehaves.
-        // `file-ioctl` on /dev/ttys* and /dev/pty* is also required for
+        // `file-ioctl` on the terminal device is also required for
         // non-pseudo-tty ioctls (TIOCGWINSZ for window size, etc.).
+        //
+        // Allocating a new pty means opening `/dev/ptmx` and then whichever
+        // `/dev/ttysNNN` the kernel hands out, which no literal can name in
+        // advance — so `pty` brings back the patterns, and with them every
+        // other tab.
         if policy.requires_terminal {
             out.push_str("(allow pseudo-tty)\n");
             out.push_str("(allow file-read* file-write* (literal \"/dev/tty\"))\n");
-            out.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n");
-            out.push_str("(allow file-read* file-write* (regex #\"^/dev/pty[a-z][0-9a-f]+$\"))\n");
-            out.push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
-            out.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n");
-            out.push_str("(allow file-ioctl (regex #\"^/dev/pty[a-z][0-9a-f]+$\"))\n");
-            out.push_str("(allow file-ioctl (literal \"/dev/ptmx\"))\n");
+            for terminal in &policy.terminals {
+                push_rule(
+                    &mut out,
+                    "allow file-read* file-write* file-ioctl",
+                    "literal",
+                    terminal,
+                )?;
+            }
+            if policy.pty {
+                out.push_str("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))\n");
+                out.push_str(
+                    "(allow file-read* file-write* (regex #\"^/dev/pty[a-z][0-9a-f]+$\"))\n",
+                );
+                out.push_str("(allow file-read* file-write* (literal \"/dev/ptmx\"))\n");
+                out.push_str("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))\n");
+                out.push_str("(allow file-ioctl (regex #\"^/dev/pty[a-z][0-9a-f]+$\"))\n");
+                out.push_str("(allow file-ioctl (literal \"/dev/ptmx\"))\n");
+            }
         }
 
         // ── /Applications read access ─────────────────────────────────────────
@@ -1247,6 +1277,14 @@ pub mod macos {
             out.push_str("(allow network-inbound (local tcp \"localhost:*\"))\n");
             out.push_str("(allow network-inbound (local udp \"localhost:*\"))\n");
         }
+
+        // TIOCSTI pushes bytes into a terminal's input queue as if typed;
+        // into the agent's own terminal, the user's shell would read them
+        // once the agent exits, outside every sandbox. Something else in
+        // this profile already refuses it (verified with `sandbox-exec`),
+        // but not by name. After every `file-ioctl` allow, so none can
+        // re-enable it.
+        out.push_str("(deny file-ioctl (ioctl-command TIOCSTI))\n");
 
         // Must be last: see `emit_final_denies`.
         emit_final_denies(
@@ -2304,24 +2342,57 @@ pub mod macos {
         // ── AgentPolicy: terminal device access ───────────────────────────────
 
         #[test]
-        fn agent_profile_includes_terminal_device_rules() {
-            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+        fn agent_profile_grants_only_its_own_terminal() {
+            let policy = super::super::AgentPolicy {
+                terminals: vec![PathBuf::from("/dev/ttys003")],
+                ..agent_policy_empty()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
             assert!(
                 sbpl.contains("(allow file-read* file-write* (literal \"/dev/tty\"))"),
                 "agent SBPL should include /dev/tty read+write literal rule, got:\n{sbpl}"
             );
             assert!(
-                sbpl.contains("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))"),
-                "agent SBPL should include /dev/ttys regex read+write rule, got:\n{sbpl}"
-            );
-            assert!(
-                sbpl.contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"),
-                "agent SBPL should include /dev/ttys file-ioctl regex rule (for tcsetattr/TIOCGWINSZ), got:\n{sbpl}"
+                sbpl.contains(
+                    "(allow file-read* file-write* file-ioctl (literal \"/dev/ttys003\"))"
+                ),
+                "agent SBPL should grant its own terminal, got:\n{sbpl}"
             );
             assert!(
                 sbpl.contains("(allow pseudo-tty)"),
                 "agent SBPL should include (allow pseudo-tty) for tcsetattr/raw-mode ioctls, got:\n{sbpl}"
             );
+            assert!(
+                !sbpl.contains("/dev/ttys[0-9]") && !sbpl.contains("/dev/ptmx"),
+                "without `pty`, no other terminal may be reachable, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_with_pty_grants_pty_allocation() {
+            let policy = super::super::AgentPolicy {
+                pty: true,
+                ..agent_policy_empty()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert!(sbpl.contains("(allow file-read* file-write* (literal \"/dev/ptmx\"))"));
+            assert!(sbpl.contains("(allow file-read* file-write* (regex #\"^/dev/ttys[0-9]+$\"))"));
+            assert!(sbpl.contains("(allow file-ioctl (regex #\"^/dev/ttys[0-9]+$\"))"));
+        }
+
+        #[test]
+        fn agent_profile_denies_tiocsti_after_every_ioctl_allow() {
+            let policy = super::super::AgentPolicy {
+                terminals: vec![PathBuf::from("/dev/ttys003")],
+                pty: true,
+                ..agent_policy_empty()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            let deny = sbpl
+                .find("(deny file-ioctl (ioctl-command TIOCSTI))")
+                .expect("TIOCSTI deny");
+            let last_ioctl_allow = sbpl.rfind("(allow file-ioctl").unwrap();
+            assert!(deny > last_ioctl_allow, "got:\n{sbpl}");
         }
 
         // ── AgentPolicy: network ──────────────────────────────────────────────
@@ -3091,6 +3162,8 @@ pub mod macos {
                     read_write_paths: vec![base.clone()],
                     requires_network: true,
                     requires_terminal: true,
+                    terminals: vec![],
+                    pty: false,
                     runtime_base: Some(base.clone()),
                     tmpdir: Some(base.clone()),
                     home: Some(PathBuf::from(TEST_HOME)),
@@ -3186,6 +3259,8 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: false,
+                terminals: vec![],
+                pty: false,
                 runtime_base: Some(base.clone()),
                 tmpdir: Some(tmp_path.clone()),
                 home: None,

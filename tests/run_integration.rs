@@ -234,6 +234,68 @@ fn run_shims_a_tool_so_its_plain_name_goes_through_the_session() {
     assert_eq!(std::fs::read_dir(&shims).unwrap().count(), 0);
 }
 
+// ─── Terminal ─────────────────────────────────────────────────────────────────
+
+/// A fresh pseudo-terminal: its master, its slave, and the slave's path.
+#[cfg(target_os = "macos")]
+fn openpty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd, String) {
+    use std::os::fd::FromRawFd;
+
+    let (mut master, mut slave) = (0, 0);
+    // SAFETY: `openpty` writes two fds it just opened into `master` and
+    // `slave`; the null name/termios/winsize arguments are documented as
+    // optional.
+    let rc = unsafe {
+        libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
+    // SAFETY: both fds are freshly opened and owned by nothing else.
+    let (master, slave) = unsafe {
+        (
+            std::os::fd::OwnedFd::from_raw_fd(master),
+            std::os::fd::OwnedFd::from_raw_fd(slave),
+        )
+    };
+    let name = rustix::termios::ttyname(&slave, Vec::new()).unwrap();
+    (master, slave, name.into_string().unwrap())
+}
+
+// The agent can reopen the terminal it was started on by name, but another
+// pty — standing in for another terminal tab — only with `[agent] pty`.
+#[test]
+#[cfg(target_os = "macos")]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_agent_reaches_its_own_terminal_and_others_only_with_pty() {
+    for (config, expected) in [
+        (minimal_config(), 0),
+        ("[tools.echo]\n\n[agent]\npty = true\n", 2),
+    ] {
+        let fx = Fixture::new();
+        fx.write_config(config);
+        let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+        assert!(trust_output.status.success(), "{trust_output:?}");
+
+        let (_own_master, own, _) = openpty();
+        let (_other_master, _other, other) = openpty();
+        let script = format!(r#"exec 3>"$(tty)" || exit 1; exec 4>{other} && exit 2; exit 0"#);
+        let status = fx
+            .cmd()
+            .stdin(own.try_clone().unwrap())
+            .stdout(own.try_clone().unwrap())
+            .stderr(own)
+            .args(["run", "--no-session", "--", "/bin/sh", "-c", &script])
+            .status()
+            .unwrap();
+        assert_eq!(status.code(), Some(expected), "config:\n{config}");
+    }
+}
+
 // ─── Kits ─────────────────────────────────────────────────────────────────────
 //
 // `--no-session` keeps these focused on the sandbox + env the kit produces,

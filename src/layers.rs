@@ -1558,6 +1558,7 @@ fn merge_level(
             (None, Vec::new(), HashMap::new(), Vec::new())
         } else {
             let mut timeout: Option<u64> = None;
+            let mut pty: Option<bool> = None;
             let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
             let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
             // Every layer (in merge order) that set a given `agent.env` key, so
@@ -1573,6 +1574,9 @@ fn merge_level(
                 let Some(a) = agent_cfg else { continue };
                 if a.timeout.is_some() {
                     timeout = a.timeout;
+                }
+                if a.pty.is_some() {
+                    pty = a.pty;
                 }
                 union_with_layer(&mut passthrough_env_prov, *kind, a.passthrough_env.clone());
                 for (k, v) in &a.env {
@@ -1649,6 +1653,7 @@ fn merge_level(
                         })
                     },
                     kits: items_of(&agent_kits_prov),
+                    pty,
                 }),
                 passthrough_env_prov,
                 agent_env_prov,

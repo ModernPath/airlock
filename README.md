@@ -566,6 +566,7 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 | `passthrough_env` | Host env var names forwarded to the agent (skipped if unset). |
 | `env`             | `NAME = value` map, same syntax as tool `env`. |
 | `filesystem`      | `read = [...]` / `write = [...]` paths beyond the sandbox root. |
+| `pty`             | `true` lets the agent allocate pseudo-terminals (`tmux`, `script`, `expect`, a harness that runs commands in a pty). Off by default: on macOS it also lets the agent open every other terminal tab you have. See [SECURITY.md](SECURITY.md#the-agents-terminal). |
 
 `[agent.env]` may reference secrets. This is the one deliberate exception to "the agent never sees secrets": it is for credentials the agent itself must hold — its own LLM API key, typically — not for tool credentials, which belong in `[tools.<name>.env]`.
 

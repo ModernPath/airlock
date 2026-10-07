@@ -776,6 +776,10 @@ pub struct RawAgentConfig {
     /// ([`crate::launcher::prepare`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kits: Vec<String>,
+    /// Let the agent allocate pseudo-terminals. Off by default: on macOS it
+    /// also opens every other terminal tab to the agent.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pty: Option<bool>,
 }
 
 /// Raw deserialized `[secrets.<label>]` entry.
@@ -1097,6 +1101,9 @@ pub struct AgentConfig {
 
     /// Additional read-write filesystem paths for the agent sandbox (resolved).
     pub filesystem_write: Vec<PathBuf>,
+
+    /// Whether the agent may allocate pseudo-terminals.
+    pub pty: bool,
 }
 
 /// Every path this config grants write access to: `filesystem.write`, every
@@ -1819,6 +1826,7 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
                 env: agent_env,
                 filesystem_read: agent_fs_read,
                 filesystem_write: agent_fs_write,
+                pty: raw_agent.pty.unwrap_or(false),
             })
         }
     };

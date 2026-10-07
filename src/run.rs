@@ -385,6 +385,7 @@ pub fn run_agent(
     policy.runtime_base = Some(prepared.anchors.runtime_base.clone());
     policy.tmpdir = prepared.env_snapshot.get("TMPDIR").map(PathBuf::from);
     policy.home = home.map(PathBuf::from);
+    policy.terminals = own_terminals();
     policy
         .read_paths
         .extend(resolve_paths(&opts.allow_read, cwd));
@@ -476,7 +477,7 @@ pub fn run_agent(
     let args = args.to_vec();
 
     let runtime = tokio::runtime::Runtime::new().map_err(RunError::RuntimeCreation)?;
-    runtime.block_on(async move {
+    let exit_code = runtime.block_on(async move {
         let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler should be installable");
 
@@ -498,7 +499,52 @@ pub fn run_agent(
 
         let exit_code = signal_loop(child, child_pid, timeout, sigterm, lease_ended).await;
         Ok::<ExitCode, RunError>(exit_code)
-    })
+    })?;
+    discard_pending_input();
+    Ok(exit_code)
+}
+
+// ─── The agent's terminal ─────────────────────────────────────────────────────
+
+fn stdio_fds() -> [std::os::fd::BorrowedFd<'static>; 3] {
+    [
+        rustix::stdio::stdin(),
+        rustix::stdio::stdout(),
+        rustix::stdio::stderr(),
+    ]
+}
+
+/// The terminal devices behind this process's stdin/stdout/stderr, which
+/// the agent inherits: the only ones its sandbox may open by name.
+fn own_terminals() -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut terminals = Vec::new();
+    for fd in stdio_fds() {
+        if let Ok(name) = rustix::termios::ttyname(fd, Vec::new()) {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(name.into_bytes()));
+            if !terminals.contains(&path) {
+                terminals.push(path);
+            }
+        }
+    }
+    terminals
+}
+
+/// Drops input still queued on the agent's terminal, so the user's shell
+/// doesn't read it as typed: say, a reply the agent made the terminal
+/// emulator send and never read. Not a boundary — a process the agent
+/// leaves running keeps the terminal open — but nothing is left queued at
+/// the moment the agent exits. Only from the foreground: `tcflush` from a
+/// background process group would stop this process with SIGTTOU.
+fn discard_pending_input() {
+    for fd in stdio_fds() {
+        if rustix::termios::isatty(fd)
+            && rustix::termios::tcgetpgrp(fd).ok() == Some(rustix::process::getpgrp())
+        {
+            let _ = rustix::termios::tcflush(fd, rustix::termios::QueueSelector::IFlush);
+        }
+    }
 }
 
 fn resolve_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
@@ -833,6 +879,7 @@ mod tests {
             env: BTreeMap::new(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
+            pty: false,
         }
     }
 
@@ -846,6 +893,7 @@ mod tests {
                 .collect(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
+            pty: false,
         }
     }
 
