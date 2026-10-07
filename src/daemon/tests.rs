@@ -1022,6 +1022,86 @@ async fn manual_daemon_never_idle_exits() {
     assert!(!daemon.state.shutdown.is_cancelled());
 }
 
+/// A connection that never registers a session — like a polling `airlock
+/// status`'s Hello + `ListSessions` — must not reset the idle-exit grace
+/// period just by existing: idle-exit is based on the session count, not
+/// on whether anything is currently connected.
+#[tokio::test]
+async fn repeated_status_style_polling_does_not_block_idle_exit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let daemon =
+        start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(100))).await;
+    let socket_path = daemon.state.runtime.socket_path();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !daemon.state.shutdown.is_cancelled() {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "automatic daemon did not idle-exit despite having no sessions, \
+                 just because something kept polling it"
+            );
+        }
+        // Best-effort, not `TestClient` (which panics on any I/O error):
+        // once idle-exit fires, the daemon starts tearing down its socket,
+        // and a poll landing in that window failing is expected, not a bug.
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(&socket_path).await {
+            let hello = protocol::encode_line(&ClientHello {
+                protocol: protocol::PROTOCOL_VERSION,
+                version: "test".to_string(),
+            });
+            let mut buf = [0u8; 512];
+            if stream.write_all(&hello).await.is_ok() && stream.read(&mut buf).await.is_ok() {
+                let req = admin_request(&daemon.admin_token, AdminRequest::ListSessions);
+                let line = protocol::encode_line(&req);
+                if stream.write_all(&line).await.is_ok() {
+                    let _ = stream.read(&mut buf).await;
+                }
+            }
+        }
+        // Faster than the idle grace period above: under the bug, each of
+        // these connections reset the grace timer, so it never elapsed.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The gap `handle_register` covers: a session can still be in the middle
+/// of being created — zero sessions inserted yet — while the daemon is
+/// plainly not idle. `registrations_in_flight` (which `RegistrationGuard`
+/// holds for a real `Register`) must block idle-exit here exactly as a
+/// live session would, and release it the same way once it clears.
+#[tokio::test]
+async fn registration_in_flight_blocks_idle_exit_with_zero_sessions() {
+    let daemon =
+        start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(50))).await;
+
+    daemon
+        .state
+        .registrations_in_flight
+        .fetch_add(1, Ordering::SeqCst);
+    daemon.state.note_activity();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !daemon.state.shutdown.is_cancelled(),
+        "a registration in flight must block idle-exit even with zero sessions"
+    );
+
+    daemon
+        .state
+        .registrations_in_flight
+        .fetch_sub(1, Ordering::SeqCst);
+    daemon.state.note_activity();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    while !daemon.state.shutdown.is_cancelled() {
+        if std::time::Instant::now() > deadline {
+            panic!("daemon did not idle-exit once the registration finished");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 // ─── Global redactor ─────────────────────────────────────────────────────────
 
 #[tokio::test]
