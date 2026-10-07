@@ -391,12 +391,14 @@ fn expand_rust(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
         Mode::Shared => {
             let cargo_home = env_or(inputs, "CARGO_HOME", home.join(".cargo"));
             // The user's own cargo settings (aliases, build flags, registry
-            // sources) apply to the agent too. Read-only: a writable config
-            // could set `build.rustc-wrapper` and run code in the user's
-            // next unsandboxed build. `config` is the pre-1.39 name. The
-            // credentials files stay unreadable.
-            out.read.push(cargo_home.join("config.toml"));
-            out.read.push(cargo_home.join("config"));
+            // sources) and registry credentials apply to the agent too, so
+            // private registries and `cargo publish` work. Read-only: a
+            // writable config could set `build.rustc-wrapper` and run code
+            // in the user's next unsandboxed build. The extensionless names
+            // are the pre-1.39 ones.
+            for f in ["config.toml", "config", "credentials.toml", "credentials"] {
+                out.read.push(cargo_home.join(f));
+            }
             out.write.push(cargo_home.join("registry"));
             out.write.push(cargo_home.join("git"));
             // `.global-cache` is a SQLite database; its rollback journal is
@@ -481,6 +483,18 @@ fn expand_node(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
                     Platform::Linux => home.join(".cache/node/corepack"),
                 },
             ));
+            // Registry settings and auth tokens, read-only: npm and pnpm
+            // read the user npmrc, Yarn 2+ its own yarnrc. A writable npmrc
+            // could set `script-shell` or `node-options` and run code
+            // outside the sandbox.
+            let npmrc = inputs
+                .env
+                .get("npm_config_userconfig")
+                .or_else(|| inputs.env.get("NPM_CONFIG_USERCONFIG"))
+                .map(PathBuf::from)
+                .unwrap_or_else(|| home.join(".npmrc"));
+            out.read.push(npmrc);
+            out.read.push(home.join(".yarnrc.yml"));
         }
     }
     out
@@ -513,6 +527,20 @@ fn expand_python(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
                     Platform::Linux => home.join(".cache/pip"),
                 },
             ));
+            // Index settings and upload credentials, read-only: pip's user
+            // config (a PIP_CONFIG_FILE override, the platform location, and
+            // the legacy ~/.pip), uv's user config, and twine's ~/.pypirc.
+            if let Some(file) = inputs.env.get("PIP_CONFIG_FILE") {
+                out.read.push(PathBuf::from(file));
+            }
+            if inputs.platform == Platform::MacOs {
+                out.read
+                    .push(home.join("Library/Application Support/pip/pip.conf"));
+            }
+            out.read.push(home.join(".config/pip/pip.conf"));
+            out.read.push(home.join(".pip/pip.conf"));
+            out.read.push(home.join(".config/uv/uv.toml"));
+            out.read.push(home.join(".pypirc"));
             // uv does not follow platform cache-dir convention on macOS;
             // it uses ~/.cache/uv (or $XDG_CACHE_HOME/uv) on every platform.
             out.write
@@ -576,10 +604,10 @@ fn expand_go(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
 
 /// `~/.mix` holds both archives (code Mix loads — the hex and rebar
 /// archives) and escripts (executables); writing it in shared mode would be
-/// a sandbox escape, the same way `~/.cargo/bin` is. `~/.hex/hex.config`
-/// can hold the user's Hex API key, so neither mode ever reads or writes
-/// `~/.hex` itself — only `~/.hex/packages`, the package cache, in shared
-/// mode.
+/// a sandbox escape, the same way `~/.cargo/bin` is. Of `~/.hex`, shared
+/// mode writes only `~/.hex/packages`, the package cache, and reads
+/// `hex.config`, which holds the user's Hex API key and repo settings, so
+/// private repos and `mix hex.publish` work.
 fn expand_elixir(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
     let home = inputs.home;
     // Both modes need to know where the real ~/.mix lives, honoring an
@@ -622,6 +650,7 @@ fn expand_elixir(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
         Mode::Shared => {
             out.read.push(real_mix_home);
             let hex_home = env_or(inputs, "HEX_HOME", home.join(".hex"));
+            out.read.push(hex_home.join("hex.config"));
             out.write.push(hex_home.join("packages"));
             out.write.push(env_or(
                 inputs,
@@ -1071,10 +1100,22 @@ mod tests {
             .chain(&expanded.write_files)
             .collect();
         assert!(
-            !everything
+            expanded
+                .read
+                .contains(&home.join(".cargo/credentials.toml"))
+        );
+        assert!(
+            !everything.iter().any(|p| p.ends_with(".cargo")),
+            "shared mode must not grant CARGO_HOME itself: {everything:?}"
+        );
+        assert!(
+            !expanded
+                .write
                 .iter()
-                .any(|p| p.ends_with(".cargo") || p.to_string_lossy().contains("credentials")),
-            "shared mode must grant neither CARGO_HOME itself nor its credentials: {everything:?}"
+                .chain(&expanded.write_files)
+                .any(|p| p.to_string_lossy().contains("credentials")
+                    || p.to_string_lossy().contains("config")),
+            "credentials and config must stay read-only: {everything:?}"
         );
         assert!(
             expanded.state_dirs.is_empty(),
@@ -1137,6 +1178,54 @@ mod tests {
                 .write
                 .contains(&home.join("Library/Caches/node/corepack"))
         );
+        assert!(expanded.read.contains(&home.join(".npmrc")));
+        assert!(expanded.read.contains(&home.join(".yarnrc.yml")));
+        assert!(!expanded.write.contains(&home.join(".npmrc")));
+    }
+
+    #[test]
+    fn expand_node_shared_honors_npm_userconfig_override() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let mut env = empty_env();
+        env.insert(
+            "NPM_CONFIG_USERCONFIG".to_string(),
+            "/custom/npmrc".to_string(),
+        );
+        let inp = inputs(&home, &env, Platform::Linux, &root);
+        let mut kit_defs = BTreeMap::new();
+        kit_defs.insert(
+            "node".to_string(),
+            RawKitConfig {
+                mode: Some("shared".to_string()),
+                ..Default::default()
+            },
+        );
+        let expanded = expand_all(&["node".to_string()], &kit_defs, &inp).unwrap();
+        assert!(expanded.read.contains(&PathBuf::from("/custom/npmrc")));
+        assert!(!expanded.read.contains(&home.join(".npmrc")));
+    }
+
+    #[test]
+    fn isolated_kits_grant_no_registry_credentials() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let kits: Vec<String> = BUILTIN_KITS.iter().map(|k| k.to_string()).collect();
+        let expanded = expand_all(&kits, &BTreeMap::new(), &inp).unwrap();
+        for file in [
+            ".cargo/credentials.toml",
+            ".npmrc",
+            ".yarnrc.yml",
+            ".pypirc",
+            ".hex/hex.config",
+        ] {
+            assert!(
+                !expanded.read.contains(&home.join(file)),
+                "isolated mode must not grant {file}"
+            );
+        }
     }
 
     #[test]
@@ -1207,6 +1296,15 @@ mod tests {
                 .write
                 .contains(&home.join("Library/Caches/pypoetry"))
         );
+        assert!(expanded.read.contains(&home.join(".pypirc")));
+        assert!(
+            expanded
+                .read
+                .contains(&home.join("Library/Application Support/pip/pip.conf"))
+        );
+        assert!(expanded.read.contains(&home.join(".config/pip/pip.conf")));
+        assert!(expanded.read.contains(&home.join(".config/uv/uv.toml")));
+        assert!(!expanded.write.contains(&home.join(".pypirc")));
     }
 
     // ── expand_all: go ────────────────────────────────────────────────
@@ -1347,6 +1445,7 @@ mod tests {
         );
         assert!(!expanded.write.contains(&home.join(".hex")));
         assert!(!expanded.read.contains(&home.join(".hex")));
+        assert!(expanded.read.contains(&home.join(".hex/hex.config")));
     }
 
     #[test]

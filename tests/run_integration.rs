@@ -235,7 +235,7 @@ fn run_with_rust_kit_isolated_cannot_write_the_real_cargo_registry() {
 
 #[test]
 #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
-fn run_with_rust_kit_shared_via_global_config_writes_registry_not_bin_or_credentials() {
+fn run_with_rust_kit_shared_via_global_config_writes_registry_reads_credentials_only() {
     let fx = Fixture::new();
     fx.write_config("[agent]\nkits = [\"rust\"]\n");
 
@@ -252,19 +252,22 @@ fn run_with_rust_kit_shared_via_global_config_writes_registry_not_bin_or_credent
     let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
     assert!(trust_output.status.success(), "{trust_output:?}");
 
-    // A real ~/.cargo/bin and ~/.cargo/credentials.toml, as cargo itself
-    // would create — shared mode reads neither path from the kit (only
-    // `~/.cargo/registry`/`git` and the lock files are write-granted, and
-    // credentials.toml is never granted at all).
+    // A real ~/.cargo as cargo itself would create it. Shared mode writes
+    // only the caches; the user's config and registry credentials are
+    // readable so private registries work, but never writable, and
+    // ~/.cargo/bin is never writable.
     let cargo_home = fx.home.path().join(".cargo");
     std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
     std::fs::write(cargo_home.join("bin/rustc"), b"real rustc").unwrap();
     std::fs::write(cargo_home.join("credentials.toml"), b"token = \"secret\"").unwrap();
+    std::fs::write(cargo_home.join("config.toml"), b"[alias]\n").unwrap();
 
     let script = r#"
         (echo ok > "$HOME/.cargo/registry/marker" && echo REGISTRY_WRITE_OK) || echo REGISTRY_WRITE_DENIED
         (echo poison > "$HOME/.cargo/bin/rustc" && echo BIN_WRITE_OK) || echo BIN_WRITE_DENIED
-        (cat "$HOME/.cargo/credentials.toml" && echo CRED_READ_OK) || echo CRED_READ_DENIED
+        (cat "$HOME/.cargo/credentials.toml" >/dev/null && echo CRED_READ_OK) || echo CRED_READ_DENIED
+        (echo x >> "$HOME/.cargo/credentials.toml" && echo CRED_WRITE_OK) || echo CRED_WRITE_DENIED
+        (echo x >> "$HOME/.cargo/config.toml" && echo CONFIG_WRITE_OK) || echo CONFIG_WRITE_DENIED
     "#;
     let output = fx
         .cmd()
@@ -273,14 +276,22 @@ fn run_with_rust_kit_shared_via_global_config_writes_registry_not_bin_or_credent
         .unwrap();
     assert!(output.status.success(), "{output:?}");
     let stdout = String::from_utf8_lossy(&output.stdout);
-    assert!(stdout.contains("REGISTRY_WRITE_OK"), "{stdout}");
-    assert!(stdout.contains("BIN_WRITE_DENIED"), "{stdout}");
-    assert!(stdout.contains("CRED_READ_DENIED"), "{stdout}");
-    assert!(!stdout.contains("BIN_WRITE_OK"), "{stdout}");
-    assert!(!stdout.contains("CRED_READ_OK"), "{stdout}");
+    for expected in [
+        "REGISTRY_WRITE_OK",
+        "BIN_WRITE_DENIED",
+        "CRED_READ_OK",
+        "CRED_WRITE_DENIED",
+        "CONFIG_WRITE_DENIED",
+    ] {
+        assert!(stdout.contains(expected), "missing {expected}: {stdout}");
+    }
     assert_eq!(
         std::fs::read(cargo_home.join("bin/rustc")).unwrap(),
         b"real rustc"
+    );
+    assert_eq!(
+        std::fs::read(cargo_home.join("credentials.toml")).unwrap(),
+        b"token = \"secret\""
     );
 }
 
