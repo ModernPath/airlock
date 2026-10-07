@@ -557,7 +557,7 @@ Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Each has two modes:
 
 `--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` and `airlock config` both show the active kits, their mode, and the exact paths/env each one resolved to.
 
-A kit never grants write to binaries or config files, or read of credential files — not `~/.cargo/bin`, not `~/.cargo/credentials.toml`, not `~/.hex/hex.config`. Shared `rust` does read `~/.cargo/config.toml`, so your cargo settings apply to the agent too. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
+A kit never grants write to binaries or config files — not `~/.cargo/bin`, not `~/.cargo/config.toml`, not `~/.npmrc` — since either would let the agent run code outside the sandbox later. In shared mode a kit does *read* the toolchain's user config and registry credentials, so your settings, private registries and publishing work for the agent too: `~/.cargo/config.toml` and `credentials.toml`, `~/.npmrc` and `~/.yarnrc.yml`, `pip.conf`, uv's `uv.toml` and `~/.pypirc`, `~/.hex/hex.config`. Isolated mode reads none of them. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
 
 ```toml
 [kits.bazel]                # global or local layer only; no mode (always these paths)

@@ -1905,9 +1905,11 @@ pub fn global_config_template() -> &'static str {
 # mode here or in airlock.local.toml (never in a project's own airlock.toml):
 # "isolated" (the default) points the toolchain's cache env vars at a
 # directory private to this project, so the agent never touches your real
-# caches; "shared" instead grants write to the real ones. Prefer isolated —
-# shared lets the agent poison a cache (e.g. ~/.cargo/registry/src) that an
-# unsandboxed build later trusts without re-verifying.
+# caches; "shared" instead grants write to the real ones, plus read of your
+# toolchain config and registry credentials (~/.cargo/credentials.toml,
+# ~/.npmrc, ~/.hex/hex.config, ...) so private registries work. Prefer
+# isolated — shared lets the agent poison a cache (e.g.
+# ~/.cargo/registry/src) that an unsandboxed build later trusts.
 # [kits.rust]
 # mode = "isolated"
 
