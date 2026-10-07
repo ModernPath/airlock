@@ -40,7 +40,7 @@ use crate::protocol::{
     RequestBody, SessionEnds, SessionRequest, SessionToken,
 };
 use crate::proxy::server::ProxySession;
-use crate::redact::{self, Redactor, RedactorSwap};
+use crate::redact::{self, Redactor, RedactorSwap, StreamRedactor};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
 use crate::secrets::Secret;
 use crate::session::{self, EndedReason, Ends, Session, SessionPolicy, Sessions};
@@ -822,23 +822,31 @@ impl DaemonState {
         )
     }
 
-    /// Rebuild the global redactor from every live session's current
-    /// secrets. Called after register, reload, revoke/end, and from a
-    /// session's own refresh callback.
+    /// Rebuild the global redactor from every live session's secrets: each
+    /// one's current value, and its value before its latest refresh — the
+    /// same generations the session's own redactor covers, so the backstop
+    /// doesn't lose a just-rotated value either. Called after register,
+    /// reload, revoke/end, and from a session's own refresh callback.
     pub fn rebuild_global_redactor(&self) {
-        let mut owned: Vec<(String, Arc<Secret<String>>)> = Vec::new();
+        let mut owned: Vec<(String, Vec<Arc<Secret<String>>>)> = Vec::new();
         for live_session in self.sessions.list() {
             let policy = live_session.current_policy();
+            let previous = policy
+                .previous_secrets
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             for (label, slot) in policy.secrets.iter() {
                 let s = slot.read().unwrap_or_else(|e| e.into_inner());
-                owned.push((label.clone(), Arc::clone(&s.value)));
+                let mut generations = vec![Arc::clone(&s.value)];
+                generations.extend(previous.get(label).cloned());
+                owned.push((label.clone(), generations));
             }
         }
-        let refs: Vec<(&str, &Secret<String>)> = owned
+        let refs: Vec<(&str, &[Arc<Secret<String>>])> = owned
             .iter()
-            .map(|(n, v)| (n.as_str(), v.as_ref()))
+            .map(|(n, g)| (n.as_str(), g.as_slice()))
             .collect();
-        if let Ok(new_redactor) = Redactor::new(refs) {
+        if let Ok(new_redactor) = Redactor::build_from_generations(refs) {
             let mut g = self
                 .global_redactor
                 .write()
@@ -2057,9 +2065,16 @@ async fn handle_exec_request(
         format!("tool {tool:?} spawned (PID: {pid})"),
     );
 
-    let (stdout_task, mut stdout_rx) =
-        spawn_redaction_pipeline(session_redactor.clone(), spawned.stdout);
-    let (stderr_task, mut stderr_rx) = spawn_redaction_pipeline(session_redactor, spawned.stderr);
+    let (stdout_task, mut stdout_rx) = spawn_redaction_pipeline(
+        Arc::clone(&session_redactor),
+        Arc::clone(&global_redactor),
+        spawned.stdout,
+    );
+    let (stderr_task, mut stderr_rx) = spawn_redaction_pipeline(
+        session_redactor,
+        Arc::clone(&global_redactor),
+        spawned.stderr,
+    );
 
     let mut child_stdin: Option<tokio::process::ChildStdin> = Some(spawned.stdin);
     let mut stdin_received = false;
@@ -2276,18 +2291,15 @@ async fn drain_channel_to_client<W: tokio::io::AsyncWriteExt + Unpin>(
     }
 }
 
-/// Send one redacted chunk to the client: `bytes` has already passed the
-/// session's own redactor ([`spawn_redaction_pipeline`]); this applies the
-/// daemon-wide global redactor as the last pass before it leaves the
-/// process (docs/airlock-v2-design.md, "Session isolation").
+/// Send one chunk of output that [`spawn_redaction_pipeline`] has already
+/// redacted to the client.
 async fn send_output<W: tokio::io::AsyncWriteExt + Unpin>(
     writer: &mut W,
     bytes: &[u8],
     global_redactor: &Redactor,
     message: fn(String) -> DaemonMessage,
 ) {
-    let bytes = global_redactor.redact_bytes(bytes);
-    let text = redact::bytes_to_lossy_utf8(&bytes);
+    let text = redact::bytes_to_lossy_utf8(bytes);
     if !text.is_empty() {
         let _ = write_ndjson_message(writer, &message(text), global_redactor, None).await;
     }
@@ -2301,105 +2313,45 @@ fn stderr_message(data: String) -> DaemonMessage {
     DaemonMessage::Stderr { data }
 }
 
+/// Read a tool's output to EOF, passing it through the session's own
+/// redactor and then the daemon-wide global one (docs/airlock-v2-design.md,
+/// "Session isolation"). Both passes are streams, so a secret split across
+/// two reads — or across two chunks the first pass emits — is still caught.
+/// The task ends once the held-back tail is flushed at EOF.
 fn spawn_redaction_pipeline<R: tokio::io::AsyncRead + Unpin + Send + 'static>(
-    redactor: Arc<Redactor>,
-    mut async_reader: R,
+    session_redactor: Arc<Redactor>,
+    global_redactor: Arc<Redactor>,
+    mut reader: R,
 ) -> (
-    tokio::task::JoinHandle<std::io::Result<()>>,
+    tokio::task::JoinHandle<()>,
     tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
 ) {
-    let (input_tx, input_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (output_tx, output_rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel::<Vec<u8>>();
 
-    let blocking_task = tokio::task::spawn_blocking(move || {
-        let reader = ChannelReader::new(input_rx);
-        let writer = ChannelWriter { tx: output_tx };
-        redactor.redact_stream(reader, writer)
-    });
-
-    tokio::spawn(async move {
+    let task = tokio::spawn(async move {
         use tokio::io::AsyncReadExt;
+        let mut session_pass = StreamRedactor::new(session_redactor);
+        let mut global_pass = StreamRedactor::new(global_redactor);
         let mut buf = [0u8; 8192];
         loop {
-            match async_reader.read(&mut buf).await {
+            match reader.read(&mut buf).await {
                 Ok(0) | Err(_) => break,
                 Ok(n) => {
-                    if input_tx.send(buf[..n].to_vec()).is_err() {
-                        break;
+                    let out = global_pass.push(&session_pass.push(&buf[..n]));
+                    if !out.is_empty() && tx.send(out).is_err() {
+                        return;
                     }
                 }
             }
         }
+        let mut tail = global_pass.push(&session_pass.finish());
+        tail.extend(global_pass.finish());
+        if !tail.is_empty() {
+            let _ = tx.send(tail);
+        }
     });
 
-    (blocking_task, output_rx)
-}
-
-struct ChannelReader {
-    rx: std::sync::mpsc::Receiver<Vec<u8>>,
-    buffer: Vec<u8>,
-    pos: usize,
-}
-
-impl ChannelReader {
-    fn new(rx: std::sync::mpsc::Receiver<Vec<u8>>) -> Self {
-        Self {
-            rx,
-            buffer: Vec::new(),
-            pos: 0,
-        }
-    }
-}
-
-impl std::io::Read for ChannelReader {
-    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
-        if self.pos < self.buffer.len() {
-            let available = self.buffer.len() - self.pos;
-            let n = std::cmp::min(buf.len(), available);
-            buf[..n].copy_from_slice(&self.buffer[self.pos..self.pos + n]);
-            self.pos += n;
-            return Ok(n);
-        }
-
-        match self.rx.recv() {
-            Ok(data) => {
-                if data.is_empty() {
-                    return Ok(0);
-                }
-                let n = std::cmp::min(buf.len(), data.len());
-                buf[..n].copy_from_slice(&data[..n]);
-                if n < data.len() {
-                    self.buffer = data;
-                    self.pos = n;
-                } else {
-                    self.buffer.clear();
-                    self.pos = 0;
-                }
-                Ok(n)
-            }
-            Err(_) => Ok(0),
-        }
-    }
-}
-
-struct ChannelWriter {
-    tx: tokio::sync::mpsc::UnboundedSender<Vec<u8>>,
-}
-
-impl std::io::Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        if buf.is_empty() {
-            return Ok(0);
-        }
-        self.tx
-            .send(buf.to_vec())
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "receiver dropped"))?;
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
+    (task, rx)
 }
 
 fn build_platform_sandbox_profile(

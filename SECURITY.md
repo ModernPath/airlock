@@ -124,7 +124,7 @@ Static values in `[tools.<tool>.env]` support exactly two template placeholders 
 
 ### 5. Output redaction
 
-All stdout and stderr from the child pass through an **Aho-Corasick** streaming automaton before reaching the client — first the session's own redactor, built from that session's secrets, then a daemon-wide **last-pass redactor** built from every live session's secrets (see [Session isolation](#session-isolation)). For each secret, **four encoding variants** are registered as search patterns:
+All stdout and stderr from the child pass through an **Aho-Corasick** streaming automaton before reaching the client — first the session's own redactor, built from that session's secrets, then a daemon-wide **last-pass redactor** built from every live session's secrets, including each refreshed secret's previous value (see [Session isolation](#session-isolation)). Both passes are streams, so a secret split across two reads of the child's output is still caught. For each secret, **four encoding variants** are registered as search patterns:
 
 An `Error` message leaving the daemon is not exempt: its text can originate somewhere other than the daemon's own words (a stale secret's refresh-failure reason is the refresh command's captured stderr), so `write_ndjson_message` — the one function every outbound message passes through — redacts an `Error`'s text the same way, through the session's redactor (when a session is in scope) and then the global one, before it is serialized.
 

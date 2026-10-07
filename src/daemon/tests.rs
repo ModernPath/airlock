@@ -1249,6 +1249,90 @@ async fn global_redactor_masks_another_sessions_secret() {
     assert!(!out.contains("s3cr3t-value"), "{out}");
 }
 
+#[tokio::test]
+async fn global_redactor_masks_another_sessions_previous_value() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut payload = test_payload(tmp.path(), "[tools.sh]\n");
+    payload.secrets = vec![crate::protocol::WireSecret {
+        label: "TOK".to_string(),
+        value: zeroize::Zeroizing::new("new-s3cr3t-value".to_string()),
+    }];
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "one".to_string(),
+            sandbox: SandboxKind::External,
+            ends: SessionEnds::Ttl { secs: 3600 },
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = admin.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    // What a refresh leaves behind: the value the secret held before it.
+    let policy = daemon.state.sessions.get(&id).unwrap().current_policy();
+    policy.previous_secrets.lock().unwrap().insert(
+        "TOK".to_string(),
+        Arc::new(crate::secrets::Secret::new("old-s3cr3t-value".to_string())),
+    );
+    daemon.state.rebuild_global_redactor();
+
+    let redactor = daemon.state.global_redactor_snapshot();
+    let out = redactor.redact_bytes(b"leaked: old-s3cr3t-value new-s3cr3t-value");
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("s3cr3t-value"), "{out}");
+}
+
+/// Hands out one chunk per read, so a test controls exactly where a read
+/// boundary falls.
+struct ChunkedReader(std::collections::VecDeque<&'static [u8]>);
+
+impl tokio::io::AsyncRead for ChunkedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(chunk) = self.0.pop_front() {
+            buf.put_slice(chunk);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn redaction_pipeline_catches_secrets_split_across_reads() {
+    let own = crate::secrets::Secret::new("own-s3cr3t-value".to_string());
+    let other = crate::secrets::Secret::new("other-s3cr3t-value".to_string());
+    let session_redactor = Arc::new(Redactor::new([("OWN", &own)]).unwrap());
+    let global_redactor = Arc::new(Redactor::new([("OTHER", &other)]).unwrap());
+    let reader = ChunkedReader(
+        [
+            b"a: own-s3cr3t-".as_slice(),
+            b"value\nb: other-s3c",
+            b"r3t-val",
+            b"ue",
+        ]
+        .into(),
+    );
+
+    let (task, mut rx) = spawn_redaction_pipeline(session_redactor, global_redactor, reader);
+    task.await.unwrap();
+    let mut out = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        out.extend(chunk);
+    }
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "a: [REDACTED:OWN]\nb: [REDACTED:OTHER]"
+    );
+}
+
 /// `resolve_tool_env` turns a stale secret's refresh-failure reason into the
 /// `StaleSecret` error's `message` — and that reason is the refresh
 /// command's own captured stderr, not text the daemon composed. Before this
