@@ -230,7 +230,7 @@ fn run_shims_a_tool_so_its_plain_name_goes_through_the_session() {
     assert!(output.status.success(), "{output:?}");
     assert_eq!(String::from_utf8_lossy(&output.stdout), "VIA=daemon\n");
 
-    let shims = fx.xdg_cache.path().join("airlock/shims");
+    let shims = fx.runtime.path().join("shims");
     assert_eq!(std::fs::read_dir(&shims).unwrap().count(), 0);
 }
 

@@ -20,6 +20,7 @@ const PID_FILENAME: &str = "airlock.pid";
 const ADMIN_TOKEN_FILENAME: &str = "admin.token";
 const LOCK_FILENAME: &str = "airlock.lock";
 const CA_DIRNAME: &str = "ca";
+const SHIMS_DIRNAME: &str = "shims";
 
 /// Debug-only escape hatch for integration tests, which cannot rely on a
 /// fixed, real per-user runtime directory across machines. Release builds
@@ -160,6 +161,13 @@ impl RuntimeDir {
 
     pub fn ca_path(&self, session_id: &str) -> PathBuf {
         self.ca_dir().join(format!("{session_id}.pem"))
+    }
+
+    /// Where `airlock run` writes a session's tool shims. The launcher
+    /// creates it, not `create_and_validate`: only a session with shimmed
+    /// tools needs one.
+    pub fn shims_dir(&self, session_id: &str) -> PathBuf {
+        self.base.join(SHIMS_DIRNAME).join(session_id)
     }
 
     pub fn addr(&self) -> String {
@@ -348,6 +356,7 @@ mod tests {
         assert_eq!(rt.admin_token_path(), PathBuf::from("/base/admin.token"));
         assert_eq!(rt.ca_dir(), PathBuf::from("/base/ca"));
         assert_eq!(rt.ca_path("abc123"), PathBuf::from("/base/ca/abc123.pem"));
+        assert_eq!(rt.shims_dir("abc123"), PathBuf::from("/base/shims/abc123"));
     }
 
     #[test]

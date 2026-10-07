@@ -895,10 +895,12 @@ impl DaemonState {
     }
 
     /// Releases what an ended session holds outside its policy: wakes a
-    /// lease holder blocked on it, and removes its CA file.
+    /// lease holder blocked on it, and removes its CA file and the tool
+    /// shims `airlock run` wrote for it.
     fn release_session(&self, session: &Session) {
         session.lease_closer.cancel();
         self.remove_session_ca(&session.id);
+        let _ = std::fs::remove_dir_all(self.runtime.shims_dir(session.id.as_str()));
     }
 
     /// Removes a session's proxy CA file. Unconditional, ignoring the

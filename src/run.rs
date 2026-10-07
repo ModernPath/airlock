@@ -408,11 +408,7 @@ pub fn run_agent(
     let shimmed = prepared.config.shimmed_tools();
     let shims = match &session {
         Some(s) if !shimmed.is_empty() => {
-            let dir = prepared
-                .anchors
-                .tool_state_base
-                .join("shims")
-                .join(s.id.as_str());
+            let dir = prepared.runtime.shims_dir(s.id.as_str());
             let airlock = std::env::current_exe()
                 .and_then(std::fs::canonicalize)
                 .map_err(RunError::Shims)?;
@@ -571,7 +567,10 @@ fn start_session(
 /// real binary on the session's filtered `PATH`, built from the launcher's
 /// own `PATH` before this directory existed, so a shim never finds itself.
 ///
-/// Written once at launch and removed on drop, when the agent exits.
+/// Lives in the runtime dir, which no agent or tool sandbox can write, so
+/// the scripts stay as written. Written once at launch and removed on drop,
+/// when the agent exits; the daemon also removes it when the session ends,
+/// which covers a launcher killed before it could.
 struct ShimDir {
     path: PathBuf,
 }

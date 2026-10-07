@@ -712,6 +712,32 @@ async fn end_session_removes_a_leftover_ca_file_even_without_a_proxy_tool() {
     assert!(!ca_path.exists());
 }
 
+// The launcher removes its own shims when the agent exits; this is the path
+// for a launcher killed before it could.
+#[tokio::test]
+async fn end_session_removes_the_session_shims() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\nshim = true\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let shims = daemon.state.runtime.shims_dir(id.as_str());
+    std::fs::create_dir_all(&shims).unwrap();
+    std::fs::write(shims.join("sh"), b"#!/bin/sh\n").unwrap();
+
+    daemon.state.end_session(&id, EndedReason::Revoked);
+    assert!(!shims.exists());
+}
+
 // ─── Revoke by prefix / name / ambiguity ─────────────────────────────────────
 
 #[tokio::test]
