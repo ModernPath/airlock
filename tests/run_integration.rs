@@ -35,6 +35,17 @@ struct Fixture {
     project: tempfile::TempDir,
 }
 
+// A session this fixture started (or an automatic daemon still in its idle
+// grace period) would otherwise keep the daemon running long after the
+// test and its runtime dir are gone.
+impl Drop for Fixture {
+    fn drop(&mut self) {
+        if self.runtime.path().join("airlock.sock").exists() {
+            let _ = self.cmd().args(["daemon", "stop", "--yes"]).output();
+        }
+    }
+}
+
 impl Fixture {
     fn new() -> Self {
         let runtime = tempfile::tempdir().unwrap();
