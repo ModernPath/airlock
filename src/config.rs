@@ -1570,6 +1570,89 @@ pub(crate) fn resolve_bound_secret_source(
     }
 }
 
+/// Which table an env entry lives in: a tool's `[tools.<name>.env]` or
+/// `[agent.env]`. Errors name it the same way whether the launcher's merge
+/// or the daemon's own re-validation finds the problem.
+#[derive(Clone, Copy)]
+pub(crate) enum EnvOwner<'a> {
+    Tool(&'a str),
+    Agent,
+}
+
+impl<'a> EnvOwner<'a> {
+    /// The tool's name, or `"agent"`.
+    pub(crate) fn item(self) -> &'a str {
+        match self {
+            EnvOwner::Tool(name) => name,
+            EnvOwner::Agent => "agent",
+        }
+    }
+
+    /// Its TOML location, without the `.env` suffix.
+    pub(crate) fn location(self) -> String {
+        match self {
+            EnvOwner::Tool(name) => format!("tools.{name}"),
+            EnvOwner::Agent => "agent".to_string(),
+        }
+    }
+}
+
+/// The checks every env entry gets, whoever owns it: a valid variable name
+/// and, for a proxy tool, no shadowing of the proxy's own variables and no
+/// secret (a proxy tool's credentials are injected by the proxy, never
+/// handed to the tool).
+pub(crate) fn check_env_entry(
+    owner: EnvOwner<'_>,
+    var_name: &str,
+    value: &RawEnvValue,
+    is_proxy_tool: bool,
+) -> Result<(), ConfigError> {
+    if !is_valid_env_var_name(var_name) {
+        return Err(ConfigError::InvalidEnvVarName {
+            tool: owner.item().to_string(),
+            name: var_name.to_string(),
+        });
+    }
+    if is_proxy_tool && crate::proxy::is_reserved_env_var(var_name) {
+        return Err(ConfigError::ProxyReservedEnvVar {
+            tool: owner.item().to_string(),
+            var_name: var_name.to_string(),
+        });
+    }
+    if is_proxy_tool && matches!(value, RawEnvValue::SecretRef(_)) {
+        return Err(ConfigError::ProxyToolSecretEnv {
+            tool: owner.item().to_string(),
+            var_name: var_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one env table from the wire. Static values arrive already
+/// rendered by the launcher and are copied verbatim, not re-templated.
+fn resolve_env_map(
+    owner: EnvOwner<'_>,
+    raw_env: HashMap<String, RawEnvValue>,
+    is_proxy_tool: bool,
+    secrets: &HashMap<String, SecretSpec>,
+    undeclared_refs: &mut Vec<(String, String, String)>,
+) -> Result<BTreeMap<String, EnvValue>, ConfigError> {
+    let mut env = BTreeMap::new();
+    for (var_name, raw_value) in raw_env {
+        check_env_entry(owner, &var_name, &raw_value, is_proxy_tool)?;
+        let value = match raw_value {
+            RawEnvValue::Static(s) => EnvValue::Static(s),
+            RawEnvValue::SecretRef(RawSecretRef { secret }) => {
+                if !secrets.contains_key(&secret) {
+                    undeclared_refs.push((owner.location(), var_name.clone(), secret.clone()));
+                }
+                EnvValue::SecretRef(secret)
+            }
+        };
+        env.insert(var_name, value);
+    }
+    Ok(env)
+}
 /// Resolve a merged, normalized [`RawConfig`] — the wire form the launcher
 /// sends over the socket (decision #3 in the v2 implementation contract) —
 /// into a [`Config`], against the already-decided project `root`.
@@ -1623,45 +1706,13 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
     for (name, raw_tool) in raw_tools {
         validate_tool_name(&name)?;
 
-        let mut env: BTreeMap<String, EnvValue> = BTreeMap::new();
-        if let Some(raw_env) = raw_tool.env {
-            for (var_name, raw_value) in raw_env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: name.clone(),
-                        name: var_name,
-                    });
-                }
-                if raw_tool.proxy && crate::proxy::is_reserved_env_var(&var_name) {
-                    return Err(ConfigError::ProxyReservedEnvVar {
-                        tool: name.clone(),
-                        var_name,
-                    });
-                }
-                let value = match raw_value {
-                    // Already rendered by the launcher — copied verbatim,
-                    // not re-templated.
-                    RawEnvValue::Static(s) => EnvValue::Static(s),
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if raw_tool.proxy {
-                            return Err(ConfigError::ProxyToolSecretEnv {
-                                tool: name.clone(),
-                                var_name,
-                            });
-                        }
-                        if !secrets.contains_key(&secret) {
-                            undeclared_refs.push((
-                                format!("tools.{name}"),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                env.insert(var_name, value);
-            }
-        }
+        let env = resolve_env_map(
+            EnvOwner::Tool(&name),
+            raw_tool.env.unwrap_or_default(),
+            raw_tool.proxy,
+            &secrets,
+            &mut undeclared_refs,
+        )?;
 
         let proxy = resolve_proxy_policy(&name, raw_tool.proxy, raw_tool.routes, &secrets)?;
 
@@ -1692,29 +1743,13 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
         Some(raw_agent) => {
             let agent_timeout = Duration::from_secs(raw_agent.timeout.unwrap_or(0));
 
-            let mut agent_env: BTreeMap<String, EnvValue> = BTreeMap::new();
-            for (var_name, raw_value) in raw_agent.env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: "agent".to_string(),
-                        name: var_name,
-                    });
-                }
-                let value = match raw_value {
-                    RawEnvValue::Static(s) => EnvValue::Static(s),
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if !secrets.contains_key(&secret) {
-                            undeclared_refs.push((
-                                "agent".to_string(),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                agent_env.insert(var_name, value);
-            }
+            let agent_env = resolve_env_map(
+                EnvOwner::Agent,
+                raw_agent.env,
+                false,
+                &secrets,
+                &mut undeclared_refs,
+            )?;
 
             let (agent_fs_read, agent_fs_write) = match raw_agent.filesystem {
                 Some(fs) => (
