@@ -61,7 +61,7 @@ pub struct LayerFile {
 }
 
 impl LayerFile {
-    fn read(kind: LayerKind, path: &Path, euid: u32) -> Result<Self, ConfigError> {
+    pub(crate) fn read(kind: LayerKind, path: &Path, euid: u32) -> Result<Self, ConfigError> {
         let contents = config::read_config_securely(path, euid)?;
         let bytes = contents.into_bytes();
         let sha256 = config::sha256_hex(&bytes);
@@ -73,7 +73,7 @@ impl LayerFile {
         })
     }
 
-    fn parse(&self) -> Result<RawConfig, ConfigError> {
+    pub(crate) fn parse(&self) -> Result<RawConfig, ConfigError> {
         let text = std::str::from_utf8(&self.bytes).map_err(|_| ConfigError::ReadError {
             path: self.path.clone(),
             source: std::io::Error::new(std::io::ErrorKind::InvalidData, "not valid UTF-8"),

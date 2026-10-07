@@ -620,7 +620,7 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
 // ─── Command: init ───────────────────────────────────────────────────────────
 
 /// `main.rs`'s own inputs for [`inspect::init_cmd`]: `cwd`/`HOME` from the
-/// process, `XDG_CONFIG_HOME` for `--global`'s directory, and the real
+/// process, the global config path every other command reads, and the real
 /// `git check-ignore` for `--local`'s ignore-file note. `--global` inside
 /// the sandbox is already refused by `sandbox_refusal` before this runs.
 #[allow(
@@ -636,7 +636,8 @@ fn cmd_init(local: bool, global: bool) -> ExitCode {
         Ok(h) => h,
         Err(code) => return code,
     };
-    let xdg_config_home = std::env::var_os("XDG_CONFIG_HOME").map(PathBuf::from);
+    let (global_config, _) =
+        airlock::anchors::global_config_path(&|k| std::env::var(k).ok(), &home);
     let kind = if global {
         inspect::InitKind::Global
     } else if local {
@@ -649,7 +650,7 @@ fn cmd_init(local: bool, global: bool) -> ExitCode {
         kind,
         &cwd,
         &home,
-        xdg_config_home.as_deref(),
+        &global_config,
         &inspect::RealGitRunner,
         &mut stdout,
     )

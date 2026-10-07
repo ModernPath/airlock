@@ -1247,18 +1247,12 @@ pub fn render_git_ignore_note(ignored: Option<bool>) -> String {
     }
 }
 
-fn read_raw_config(path: &Path) -> Result<config::RawConfig, String> {
-    let text = std::fs::read_to_string(path)
-        .map_err(|e| format!("failed to read {}: {e}", path.display()))?;
-    toml::from_str(&text).map_err(|e| format!("failed to parse {}: {e}", path.display()))
-}
-
-fn global_config_path_from(home: &Path, xdg_config_home: Option<&Path>) -> PathBuf {
-    xdg_config_home
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("airlock")
-        .join(config::config_filename())
+/// Reads and parses a config file the way loading a layer does, so `init`
+/// gets the same symlink, ownership and size checks.
+fn read_raw_config(kind: LayerKind, path: &Path) -> Result<config::RawConfig, String> {
+    layers::LayerFile::read(kind, path, config::current_euid())
+        .and_then(|file| file.parse())
+        .map_err(|e| e.to_string())
 }
 
 fn init_plain(cwd: &Path, home: &Path, out: &mut dyn Write) -> ExitCode {
@@ -1285,42 +1279,41 @@ fn init_plain(cwd: &Path, home: &Path, out: &mut dyn Write) -> ExitCode {
     ExitCode::SUCCESS
 }
 
-fn init_global(home: &Path, xdg_config_home: Option<&Path>, out: &mut dyn Write) -> ExitCode {
-    let dir = xdg_config_home
-        .map(Path::to_path_buf)
-        .unwrap_or_else(|| home.join(".config"))
-        .join("airlock");
-    let path = dir.join(config::config_filename());
+fn init_global(home: &Path, global_config: &Path, out: &mut dyn Write) -> ExitCode {
+    let path = global_config;
+    let dir = path
+        .parent()
+        .expect("the global config path always has a parent");
     if path.exists() {
-        writeln!(out, "error: {} already exists", display_path(&path, home)).ok();
+        writeln!(out, "error: {} already exists", display_path(path, home)).ok();
         return ExitCode::from(125);
     }
-    if let Err(e) = create_dir_0700(&dir) {
+    if let Err(e) = create_dir_0700(dir) {
         writeln!(
             out,
             "error: failed to create {}: {e}",
-            display_path(&dir, home)
+            display_path(dir, home)
         )
         .ok();
         return ExitCode::from(125);
     }
-    if let Err(e) = std::fs::write(&path, config::global_config_template()) {
+    if let Err(e) = std::fs::write(path, config::global_config_template()) {
         writeln!(
             out,
             "error: failed to write {}: {e}",
-            display_path(&path, home)
+            display_path(path, home)
         )
         .ok();
         return ExitCode::from(125);
     }
-    writeln!(out, "created {}", display_path(&path, home)).ok();
+    writeln!(out, "created {}", display_path(path, home)).ok();
     ExitCode::SUCCESS
 }
 
 fn init_local(
     cwd: &Path,
     home: &Path,
-    xdg_config_home: Option<&Path>,
+    global_config: &Path,
     git: &dyn GitRunner,
     out: &mut dyn Write,
 ) -> ExitCode {
@@ -1337,16 +1330,15 @@ fn init_local(
 
     let repo_path = cwd.join(config::config_filename());
     let (content, bindings_summary, standalone) = if repo_path.exists() {
-        let repo_raw = match read_raw_config(&repo_path) {
+        let repo_raw = match read_raw_config(LayerKind::Repo, &repo_path) {
             Ok(r) => r,
             Err(e) => {
                 writeln!(out, "error: {e}").ok();
                 return ExitCode::from(125);
             }
         };
-        let global_path = global_config_path_from(home, xdg_config_home);
-        let global_raw = if global_path.exists() {
-            match read_raw_config(&global_path) {
+        let global_raw = if global_config.exists() {
+            match read_raw_config(LayerKind::Global, global_config) {
                 Ok(r) => Some(r),
                 Err(e) => {
                     writeln!(out, "error: {e}").ok();
@@ -1410,14 +1402,14 @@ pub fn init_cmd(
     kind: InitKind,
     cwd: &Path,
     home: &Path,
-    xdg_config_home: Option<&Path>,
+    global_config: &Path,
     git: &dyn GitRunner,
     out: &mut dyn Write,
 ) -> ExitCode {
     match kind {
         InitKind::Plain => init_plain(cwd, home, out),
-        InitKind::Global => init_global(home, xdg_config_home, out),
-        InitKind::Local => init_local(cwd, home, xdg_config_home, git, out),
+        InitKind::Global => init_global(home, global_config, out),
+        InitKind::Local => init_local(cwd, home, global_config, git, out),
     }
 }
 
@@ -1999,7 +1991,7 @@ access = "none"
             InitKind::Plain,
             tmp.path(),
             tmp.path(),
-            None,
+            &tmp.path().join(".config/airlock/airlock.toml"),
             &git,
             &mut out,
         );
@@ -2020,7 +2012,7 @@ access = "none"
             InitKind::Plain,
             tmp.path(),
             tmp.path(),
-            None,
+            &tmp.path().join(".config/airlock/airlock.toml"),
             &git,
             &mut out,
         );
@@ -2040,7 +2032,7 @@ access = "none"
             InitKind::Global,
             tmp.path(),
             tmp.path(),
-            Some(&xdg),
+            &xdg.join("airlock").join("airlock.toml"),
             &git,
             &mut out,
         );
@@ -2064,7 +2056,7 @@ access = "none"
             InitKind::Local,
             tmp.path(),
             tmp.path(),
-            None,
+            &tmp.path().join(".config/airlock/airlock.toml"),
             &git,
             &mut out,
         );
@@ -2100,7 +2092,7 @@ access = "none"
             InitKind::Local,
             tmp.path(),
             tmp.path(),
-            Some(&xdg),
+            &xdg.join("airlock").join("airlock.toml"),
             &git,
             &mut out,
         );
@@ -2130,11 +2122,31 @@ access = "none"
             InitKind::Local,
             tmp.path(),
             tmp.path(),
-            None,
+            &tmp.path().join(".config/airlock/airlock.toml"),
             &git,
             &mut out,
         );
         assert_eq!(code, ExitCode::from(125));
+    }
+
+    #[test]
+    fn init_local_refuses_a_symlinked_repo_config() {
+        let tmp = tempdir().unwrap();
+        let elsewhere = tmp.path().join("elsewhere.toml");
+        std::fs::write(&elsewhere, "[tools.gh]\n").unwrap();
+        std::os::unix::fs::symlink(&elsewhere, tmp.path().join("airlock.toml")).unwrap();
+        let mut out = Vec::new();
+        let git = fake_git(None);
+        let code = init_cmd(
+            InitKind::Local,
+            tmp.path(),
+            tmp.path(),
+            &tmp.path().join(".config/airlock/airlock.toml"),
+            &git,
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::from(125));
+        assert!(!tmp.path().join("airlock.local.toml").exists());
     }
 
     #[test]
