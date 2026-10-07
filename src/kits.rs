@@ -361,6 +361,18 @@ fn expand_builtin(kit: &str, mode: Mode, inputs: &Inputs<'_>, state: &Path) -> E
 }
 
 /// `$VAR` from the env snapshot, or `default` when absent.
+impl Inputs<'_> {
+    /// A per-user location under `home` that differs by platform:
+    /// `macos` on macOS (usually under `Library/`), `linux` on Linux
+    /// (usually an XDG-style dot directory).
+    fn home_path(&self, macos: &str, linux: &str) -> PathBuf {
+        self.home.join(match self.platform {
+            Platform::MacOs => macos,
+            Platform::Linux => linux,
+        })
+    }
+}
+
 fn env_or(inputs: &Inputs<'_>, var: &str, default: PathBuf) -> PathBuf {
     inputs.env.get(var).map(PathBuf::from).unwrap_or(default)
 }
@@ -409,20 +421,13 @@ fn expand_rust(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
     out
 }
 
-fn fnm_dir(home: &Path, platform: Platform) -> PathBuf {
-    match platform {
-        Platform::MacOs => home.join("Library/Application Support/fnm"),
-        Platform::Linux => home.join(".local/share/fnm"),
-    }
-}
-
 fn expand_node(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
     let home = inputs.home;
     let mut out = Expanded {
         read: vec![
             home.join(".nvm"),
             home.join(".volta"),
-            fnm_dir(home, inputs.platform),
+            inputs.home_path("Library/Application Support/fnm", ".local/share/fnm"),
             home.join(".bun/bin"),
         ],
         ..Default::default()
@@ -447,18 +452,12 @@ fn expand_node(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             out.write.push(env_or(
                 inputs,
                 "YARN_CACHE_FOLDER",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/Caches/Yarn"),
-                    Platform::Linux => home.join(".cache/yarn"),
-                },
+                inputs.home_path("Library/Caches/Yarn", ".cache/yarn"),
             ));
             out.write.push(env_or(
                 inputs,
                 "npm_config_store_dir",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/pnpm/store"),
-                    Platform::Linux => home.join(".local/share/pnpm/store"),
-                },
+                inputs.home_path("Library/pnpm/store", ".local/share/pnpm/store"),
             ));
             out.write.push(env_or(
                 inputs,
@@ -468,10 +467,7 @@ fn expand_node(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             out.write.push(env_or(
                 inputs,
                 "COREPACK_HOME",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/Caches/node/corepack"),
-                    Platform::Linux => home.join(".cache/node/corepack"),
-                },
+                inputs.home_path("Library/Caches/node/corepack", ".cache/node/corepack"),
             ));
             // Registry settings and auth tokens, read-only: npm and pnpm
             // read the user npmrc, Yarn 2+ its own yarnrc. A writable npmrc
@@ -512,10 +508,7 @@ fn expand_python(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             out.write.push(env_or(
                 inputs,
                 "PIP_CACHE_DIR",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/Caches/pip"),
-                    Platform::Linux => home.join(".cache/pip"),
-                },
+                inputs.home_path("Library/Caches/pip", ".cache/pip"),
             ));
             // Index settings and upload credentials, read-only: pip's user
             // config (a PIP_CONFIG_FILE override, the platform location, and
@@ -538,10 +531,7 @@ fn expand_python(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             out.write.push(env_or(
                 inputs,
                 "POETRY_CACHE_DIR",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/Caches/pypoetry"),
-                    Platform::Linux => home.join(".cache/pypoetry"),
-                },
+                inputs.home_path("Library/Caches/pypoetry", ".cache/pypoetry"),
             ));
         }
     }
@@ -582,10 +572,7 @@ fn expand_go(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
             out.write.push(env_or(
                 inputs,
                 "GOCACHE",
-                match inputs.platform {
-                    Platform::MacOs => home.join("Library/Caches/go-build"),
-                    Platform::Linux => home.join(".cache/go-build"),
-                },
+                inputs.home_path("Library/Caches/go-build", ".cache/go-build"),
             ));
         }
     }
