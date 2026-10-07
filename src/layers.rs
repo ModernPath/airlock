@@ -635,6 +635,89 @@ fn check_global_paths_absolute(file: &Path, raw: &[String]) -> Result<(), Config
     Ok(())
 }
 
+/// Refuse `override = true` on any tool in a layer other than the local one.
+fn reject_override(
+    file: &Path,
+    tools: Option<&HashMap<String, RawToolConfig>>,
+) -> Result<(), ConfigError> {
+    for (name, t) in tools.into_iter().flatten() {
+        if t.r#override {
+            return Err(ConfigError::OverrideOutsideLocal {
+                file: file.to_path_buf(),
+                tool: name.clone(),
+            });
+        }
+    }
+    Ok(())
+}
+
+/// The secret pool an item owned by each layer resolves its references
+/// against, and the scope that decides what an unresolved one means.
+struct LayerPools<'a> {
+    global_file: Option<&'a Path>,
+    repo_file: Option<&'a Path>,
+    global: &'a HashMap<String, SecretSource>,
+    repo: &'a HashMap<String, SecretSource>,
+    /// Global, repo and local-only labels together: a local item may use
+    /// any of them.
+    local: &'a HashMap<String, SecretSource>,
+}
+
+impl<'a> LayerPools<'a> {
+    fn for_layer(&self, kind: LayerKind) -> (RefScope<'a>, &'a HashMap<String, SecretSource>) {
+        match kind {
+            LayerKind::Global => (
+                RefScope::Global {
+                    file: self
+                        .global_file
+                        .expect("an item owned by the global layer has a file"),
+                },
+                self.global,
+            ),
+            LayerKind::Local => (RefScope::Local, self.local),
+            LayerKind::Repo | LayerKind::ConfigFile => (
+                RefScope::RepoLike {
+                    file: self
+                        .repo_file
+                        .expect("an item owned by the repo layer has a file"),
+                },
+                self.repo,
+            ),
+        }
+    }
+}
+
+/// The value the highest-precedence layer that sets it gives, and which
+/// layer that was. `ordered` runs lowest to highest.
+fn highest_wins<T: Clone>(
+    ordered: &[(LayerKind, Option<&RawConfig>)],
+    get: impl Fn(&RawConfig) -> Option<&T>,
+) -> (Option<T>, Option<LayerKind>) {
+    ordered
+        .iter()
+        .rev()
+        .find_map(|(kind, raw)| Some((raw.and_then(&get)?.clone(), *kind)))
+        .map_or((None, None), |(value, kind)| (Some(value), Some(kind)))
+}
+
+/// Appends each of `items` not already in `acc`, recording `kind` as the
+/// layer that first brought it in. Order is first-seen.
+fn union_with_layer(
+    acc: &mut Vec<(String, LayerKind)>,
+    kind: LayerKind,
+    items: impl IntoIterator<Item = String>,
+) {
+    for item in items {
+        if !acc.iter().any(|(seen, _)| *seen == item) {
+            acc.push((item, kind));
+        }
+    }
+}
+
+fn items_of(acc: &[(String, LayerKind)]) -> Vec<String> {
+    acc.iter().map(|(item, _)| item.clone()).collect()
+}
+
 /// Merge a project's loaded layers into one normalized, wire-ready config.
 ///
 /// Parses each layer, applies the per-layer structural rules (repo cannot
@@ -651,6 +734,12 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     let repo_file = layers.repo.as_ref().map(|f| f.path.as_path());
     let local_file = layers.local.as_ref().map(|f| f.path.as_path());
     let repo_kind = layers.repo.as_ref().map_or(LayerKind::Repo, |f| f.kind);
+    // Lowest to highest precedence.
+    let ordered: [(LayerKind, Option<&RawConfig>); 3] = [
+        (LayerKind::Global, global_raw.as_ref()),
+        (repo_kind, repo_raw.as_ref()),
+        (LayerKind::Local, local_raw.as_ref()),
+    ];
 
     // ── Per-layer structural rules ──────────────────────────────────────
 
@@ -665,28 +754,10 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 file: file.to_path_buf(),
             });
         }
-        if let Some(tools) = &repo.tools {
-            for (name, t) in tools {
-                if t.r#override {
-                    return Err(ConfigError::OverrideOutsideLocal {
-                        file: file.to_path_buf(),
-                        tool: name.clone(),
-                    });
-                }
-            }
-        }
+        reject_override(file, repo.tools.as_ref())?;
     }
     if let (Some(global), Some(file)) = (&global_raw, global_file) {
-        if let Some(tools) = &global.tools {
-            for (name, t) in tools {
-                if t.r#override {
-                    return Err(ConfigError::OverrideOutsideLocal {
-                        file: file.to_path_buf(),
-                        tool: name.clone(),
-                    });
-                }
-            }
-        }
+        reject_override(file, global.tools.as_ref())?;
         if let Some(fs) = &global.filesystem {
             check_global_paths_absolute(file, &fs.read)?;
             check_global_paths_absolute(file, &fs.write)?;
@@ -835,6 +906,13 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         .chain(local_only_pool.iter())
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
+    let pools = LayerPools {
+        global_file,
+        repo_file,
+        global: &global_pool,
+        repo: &repo_pool,
+        local: &combined_for_local,
+    };
 
     // ── Tool merge ───────────────────────────────────────────────────────
 
@@ -915,20 +993,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             },
         );
 
-        let scope = match owning_layer {
-            LayerKind::Global => RefScope::Global {
-                file: global_file.unwrap(),
-            },
-            LayerKind::Local => RefScope::Local,
-            LayerKind::Repo | LayerKind::ConfigFile => RefScope::RepoLike {
-                file: repo_file.unwrap(),
-            },
-        };
-        let pool = match owning_layer {
-            LayerKind::Global => &global_pool,
-            LayerKind::Local => &combined_for_local,
-            LayerKind::Repo | LayerKind::ConfigFile => &repo_pool,
-        };
+        let (scope, pool) = pools.for_layer(owning_layer);
 
         let raw_env = winning.env.clone().unwrap_or_default();
         let env = resolve_env_table(
@@ -987,17 +1052,10 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
     // ── Agent merge ──────────────────────────────────────────────────────
 
-    let layered_agents: Vec<(LayerKind, Option<&config::RawAgentConfig>)> = vec![
-        (
-            LayerKind::Global,
-            global_raw.as_ref().and_then(|c| c.agent.as_ref()),
-        ),
-        (repo_kind, repo_raw.as_ref().and_then(|c| c.agent.as_ref())),
-        (
-            LayerKind::Local,
-            local_raw.as_ref().and_then(|c| c.agent.as_ref()),
-        ),
-    ];
+    let layered_agents: Vec<(LayerKind, Option<&config::RawAgentConfig>)> = ordered
+        .iter()
+        .map(|(kind, raw)| (*kind, raw.and_then(|c| c.agent.as_ref())))
+        .collect();
 
     // Agent merge result plus the provenance `SettingsProvenance` needs,
     // which the `if`/`else` below has no other way to hand back out of its
@@ -1015,7 +1073,6 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             (None, Vec::new(), HashMap::new(), Vec::new())
         } else {
             let mut timeout: Option<u64> = None;
-            let mut passthrough_env: Vec<String> = Vec::new();
             let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
             let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
             // Every layer (in merge order) that set a given `agent.env` key, so
@@ -1023,9 +1080,8 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             // any) can both be reported — `airlock config`'s `local (overrides
             // repo)` annotation.
             let mut env_history: HashMap<String, Vec<LayerKind>> = HashMap::new();
-            let mut fs_read: Vec<String> = Vec::new();
-            let mut fs_write: Vec<String> = Vec::new();
-            let mut agent_kits: Vec<String> = Vec::new();
+            let mut fs_read: Vec<(String, LayerKind)> = Vec::new();
+            let mut fs_write: Vec<(String, LayerKind)> = Vec::new();
             let mut agent_kits_prov: Vec<(String, LayerKind)> = Vec::new();
 
             for (kind, agent_cfg) in &layered_agents {
@@ -1033,36 +1089,18 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 if a.timeout.is_some() {
                     timeout = a.timeout;
                 }
-                for v in &a.passthrough_env {
-                    if !passthrough_env.contains(v) {
-                        passthrough_env.push(v.clone());
-                        passthrough_env_prov.push((v.clone(), *kind));
-                    }
-                }
+                union_with_layer(&mut passthrough_env_prov, *kind, a.passthrough_env.clone());
                 for (k, v) in &a.env {
                     env_by_key.insert(k.clone(), (*kind, v.clone()));
                     env_history.entry(k.clone()).or_default().push(*kind);
                 }
                 if let Some(fs) = &a.filesystem {
-                    for p in resolve_path_list(&fs.read, ctx) {
-                        if !fs_read.contains(&p) {
-                            fs_read.push(p);
-                        }
-                    }
-                    for p in resolve_path_list(&fs.write, ctx) {
-                        if !fs_write.contains(&p) {
-                            fs_write.push(p);
-                        }
-                    }
+                    union_with_layer(&mut fs_read, *kind, resolve_path_list(&fs.read, ctx));
+                    union_with_layer(&mut fs_write, *kind, resolve_path_list(&fs.write, ctx));
                 }
                 // Any layer; union across layers (same rule as
                 // passthrough_env) — see "Merge rules" in the v2 design.
-                for k in &a.kits {
-                    if !agent_kits.contains(k) {
-                        agent_kits.push(k.clone());
-                        agent_kits_prov.push((k.clone(), *kind));
-                    }
-                }
+                union_with_layer(&mut agent_kits_prov, *kind, a.kits.clone());
             }
 
             let agent_env_prov: HashMap<String, AgentEnvProvenance> = env_history
@@ -1084,20 +1122,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             let mut final_env: HashMap<String, RawEnvValue> =
                 HashMap::with_capacity(env_by_key.len());
             for (key, (kind, value)) in env_by_key {
-                let scope = match kind {
-                    LayerKind::Global => RefScope::Global {
-                        file: global_file.unwrap(),
-                    },
-                    LayerKind::Local => RefScope::Local,
-                    LayerKind::Repo | LayerKind::ConfigFile => RefScope::RepoLike {
-                        file: repo_file.unwrap(),
-                    },
-                };
-                let pool = match kind {
-                    LayerKind::Global => &global_pool,
-                    LayerKind::Local => &combined_for_local,
-                    LayerKind::Repo | LayerKind::ConfigFile => &repo_pool,
-                };
+                let (scope, pool) = pools.for_layer(kind);
                 let mut single = HashMap::with_capacity(1);
                 single.insert(key.clone(), value);
                 let resolved = resolve_env_table(
@@ -1119,17 +1144,17 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             (
                 Some(config::RawAgentConfig {
                     timeout,
-                    passthrough_env,
+                    passthrough_env: items_of(&passthrough_env_prov),
                     env: final_env,
                     filesystem: if fs_read.is_empty() && fs_write.is_empty() {
                         None
                     } else {
                         Some(config::RawAgentFilesystem {
-                            read: fs_read,
-                            write: fs_write,
+                            read: items_of(&fs_read),
+                            write: items_of(&fs_write),
                         })
                     },
-                    kits: agent_kits,
+                    kits: items_of(&agent_kits_prov),
                 }),
                 passthrough_env_prov,
                 agent_env_prov,
@@ -1184,65 +1209,19 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
     // ── Top-level scalars and lists ──────────────────────────────────────
 
-    let timeout = local_raw
-        .as_ref()
-        .and_then(|c| c.timeout)
-        .or_else(|| repo_raw.as_ref().and_then(|c| c.timeout))
-        .or_else(|| global_raw.as_ref().and_then(|c| c.timeout));
-    let timeout_layer = if local_raw.as_ref().and_then(|c| c.timeout).is_some() {
-        Some(LayerKind::Local)
-    } else if repo_raw.as_ref().and_then(|c| c.timeout).is_some() {
-        Some(repo_kind)
-    } else if global_raw.as_ref().and_then(|c| c.timeout).is_some() {
-        Some(LayerKind::Global)
-    } else {
-        None
-    };
+    let (timeout, timeout_layer) = highest_wins(&ordered, |c| c.timeout.as_ref());
+    let (access, access_layer) = highest_wins(&ordered, |c| c.access.as_ref());
 
-    let access = local_raw
-        .as_ref()
-        .and_then(|c| c.access.clone())
-        .or_else(|| repo_raw.as_ref().and_then(|c| c.access.clone()))
-        .or_else(|| global_raw.as_ref().and_then(|c| c.access.clone()));
-    let access_layer = if local_raw.as_ref().and_then(|c| c.access.as_ref()).is_some() {
-        Some(LayerKind::Local)
-    } else if repo_raw.as_ref().and_then(|c| c.access.as_ref()).is_some() {
-        Some(repo_kind)
-    } else if global_raw
-        .as_ref()
-        .and_then(|c| c.access.as_ref())
-        .is_some()
-    {
-        Some(LayerKind::Global)
-    } else {
-        None
-    };
-
-    let mut fs_read: Vec<String> = Vec::new();
-    let mut fs_write: Vec<String> = Vec::new();
     let mut fs_read_prov: Vec<(String, LayerKind)> = Vec::new();
     let mut fs_write_prov: Vec<(String, LayerKind)> = Vec::new();
-    for (kind, raw) in [
-        (LayerKind::Global, &global_raw),
-        (repo_kind, &repo_raw),
-        (LayerKind::Local, &local_raw),
-    ] {
-        let Some(raw) = raw else { continue };
-        if let Some(fs) = &raw.filesystem {
-            for p in resolve_path_list(&fs.read, ctx) {
-                if !fs_read.contains(&p) {
-                    fs_read.push(p.clone());
-                    fs_read_prov.push((p, kind));
-                }
-            }
-            for p in resolve_path_list(&fs.write, ctx) {
-                if !fs_write.contains(&p) {
-                    fs_write.push(p.clone());
-                    fs_write_prov.push((p, kind));
-                }
-            }
+    for (kind, raw) in ordered {
+        if let Some(fs) = raw.and_then(|r| r.filesystem.as_ref()) {
+            union_with_layer(&mut fs_read_prov, kind, resolve_path_list(&fs.read, ctx));
+            union_with_layer(&mut fs_write_prov, kind, resolve_path_list(&fs.write, ctx));
         }
     }
+    let fs_read = items_of(&fs_read_prov);
+    let fs_write = items_of(&fs_write_prov);
 
     let raw = RawConfig {
         timeout,
