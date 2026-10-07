@@ -35,7 +35,10 @@ fi
 # Step i's `airlock run` sandboxes an agent that itself calls `airlock`
 # (step i's whole point). That inner call resolves "airlock" through PATH
 # like any other command, so a dev build — not installed anywhere —
-# needs its directory on PATH, not just $AIRLOCK, for that to work.
+# needs its directory on PATH, not just $AIRLOCK, for that to work. The
+# agent's sandbox must also be able to read that directory; step i grants
+# it with --allow-read. An installed airlock (Nix, Homebrew, ~/.cargo/bin)
+# is already readable there.
 AIRLOCK_DIR="$(cd "$(dirname "$AIRLOCK")" && pwd)"
 export PATH="$AIRLOCK_DIR:$PATH"
 
@@ -247,8 +250,9 @@ if [[ "$DEMO_SKIP_SANDBOXED" == 1 ]]; then
   note "DEMO_SKIP_SANDBOXED=1: skipping 'airlock run' (it sandboxes the agent"
   note "itself, which can't nest inside another sandbox here)."
 else
-  printf "+ airlock run -- sh -c 'airlock tools list && airlock exec -- printenv DEMO_TOKEN'\n"
-  "$AIRLOCK" run -- sh -c 'airlock tools list && airlock exec -- printenv DEMO_TOKEN'
+  note "--allow-read lets the sandboxed agent run this dev build of airlock"
+  printf "+ airlock run --allow-read %s -- sh -c 'airlock tools list && airlock exec -- printenv DEMO_TOKEN'\n" "$AIRLOCK_DIR"
+  "$AIRLOCK" run --allow-read "$AIRLOCK_DIR" -- sh -c 'airlock tools list && airlock exec -- printenv DEMO_TOKEN'
 
   heading "the session airlock run registered is gone now that the agent exited"
   run session list
