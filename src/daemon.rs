@@ -812,6 +812,32 @@ impl DaemonState {
         })
     }
 
+    /// Builds a session's policy from a `Register`/`Reload` payload, its
+    /// refresh tasks wired to rebuild the global redactor after each
+    /// successful refresh. Holds only a weak reference, so a session's
+    /// refresh tasks never keep the daemon state alive.
+    fn build_policy(
+        self: &Arc<Self>,
+        payload: &protocol::RegisterPayload,
+        id: &protocol::SessionId,
+        existing: Option<&SessionPolicy>,
+    ) -> Result<SessionPolicy, String> {
+        let weak = Arc::downgrade(self);
+        let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+            if let Some(state) = weak.upgrade() {
+                state.rebuild_global_redactor();
+            }
+        });
+        session::build_session_policy(
+            payload,
+            id,
+            &self.runtime,
+            &self.ring_buffer,
+            on_refresh,
+            existing,
+        )
+    }
+
     /// Snapshot of the current global redactor, taken once per exec.
     pub fn global_redactor_snapshot(&self) -> Arc<Redactor> {
         Arc::clone(
@@ -911,12 +937,7 @@ impl DaemonState {
     fn sweep_expired_sessions(&self) {
         let now = SystemTime::now();
         for session in self.sessions.list() {
-            let expired = session
-                .ends
-                .read()
-                .unwrap_or_else(|e| e.into_inner())
-                .is_expired(now);
-            if expired {
+            if session.is_expired(now) {
                 self.end_session(&session.id, EndedReason::Expired);
             }
         }
@@ -1378,12 +1399,7 @@ fn resolve_session(
     if session.token != *token {
         return Err(ErrorKind::NoSession);
     }
-    if session
-        .ends
-        .read()
-        .unwrap_or_else(|e| e.into_inner())
-        .is_expired(SystemTime::now())
-    {
+    if session.is_expired(SystemTime::now()) {
         state.end_session(id, EndedReason::Expired);
         return Err(ErrorKind::SessionExpired);
     }
@@ -1522,21 +1538,7 @@ async fn handle_register(
         }
     };
 
-    let weak = Arc::downgrade(state);
-    let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        if let Some(state) = weak.upgrade() {
-            state.rebuild_global_redactor();
-        }
-    });
-
-    let policy = match session::build_session_policy(
-        &payload,
-        &id,
-        &state.runtime,
-        &state.ring_buffer,
-        on_refresh,
-        None,
-    ) {
+    let policy = match state.build_policy(&payload, &id, None) {
         Ok(p) => p,
         Err(e) => {
             responder.error(ErrorKind::Internal, e).await;
@@ -1546,10 +1548,7 @@ async fn handle_register(
 
     let session_ends = match ends {
         SessionEnds::Lease => Ends::Lease,
-        SessionEnds::Ttl { secs } => Ends::Ttl {
-            ttl: Duration::from_secs(secs),
-            expires_at: SystemTime::now() + Duration::from_secs(secs),
-        },
+        SessionEnds::Ttl { secs } => Ends::ttl_from_now(Duration::from_secs(secs)),
     };
     let is_lease = matches!(session_ends, Ends::Lease);
 
@@ -1558,22 +1557,16 @@ async fn handle_register(
     } else {
         None
     };
-    let token = SessionToken::generate(id.clone());
-
-    let session = Arc::new(Session {
-        id: id.clone(),
-        token: token.clone(),
+    let session = Arc::new(Session::new(
+        id.clone(),
         name,
-        root: payload.root.clone(),
+        payload.root.clone(),
         sandbox,
-        ends: RwLock::new(session_ends),
+        session_ends,
         anchor,
-        started: SystemTime::now(),
-        execs: std::sync::atomic::AtomicU64::new(0),
-        exec_permits: Arc::new(tokio::sync::Semaphore::new(session::EXEC_CAP)),
-        policy: RwLock::new(Arc::new(policy)),
-        lease_closer: CancellationToken::new(),
-    });
+        policy,
+    ));
+    let token = session.token.clone();
 
     state.sessions.insert(Arc::clone(&session));
     state.rebuild_global_redactor();
@@ -1630,21 +1623,7 @@ async fn handle_reload(
 
     let existing_policy = session.current_policy();
 
-    let weak = Arc::downgrade(state);
-    let on_refresh: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
-        if let Some(state) = weak.upgrade() {
-            state.rebuild_global_redactor();
-        }
-    });
-
-    let new_policy = match session::build_session_policy(
-        &payload,
-        &session.id,
-        &state.runtime,
-        &state.ring_buffer,
-        on_refresh,
-        Some(&existing_policy),
-    ) {
+    let new_policy = match state.build_policy(&payload, &session.id, Some(&existing_policy)) {
         Ok(p) => p,
         Err(e) => {
             return DaemonMessage::Error {
@@ -1732,11 +1711,7 @@ fn handle_renew(
             ),
         },
         Ends::Ttl { ttl, .. } => {
-            let new_ttl = ttl_secs.map(Duration::from_secs).unwrap_or(*ttl);
-            *ends = Ends::Ttl {
-                ttl: new_ttl,
-                expires_at: SystemTime::now() + new_ttl,
-            };
+            *ends = Ends::ttl_from_now(ttl_secs.map(Duration::from_secs).unwrap_or(*ttl));
             DaemonMessage::Ok
         }
     }
