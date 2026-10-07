@@ -184,7 +184,7 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
 
 Path traversal rules (`file-read-metadata` for ancestor directories) are generated automatically.
 
-**SBPL injection prevention**: Any path containing ASCII control characters (0x00–0x1F or 0x7F) is rejected. A null byte would truncate the profile string; other control characters could break the S-expression syntax.
+**SBPL injection prevention**: Any path containing ASCII control characters (0x00–0x1F or 0x7F) is rejected. A null byte would truncate the profile string; other control characters could break the S-expression syntax. A path that goes into a `(regex #"...")` rule (the `~/.claude.json` family and `GlobalPreferences` plists, both derived from `HOME`) is also rejected if it contains a double quote: that literal is raw, with no escape for `"`, so a quote would end it early.
 
 The profile is applied via `sandbox_init()` FFI in the `pre_exec` closure, after fork but before exec.
 

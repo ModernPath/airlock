@@ -25,6 +25,11 @@ pub enum SandboxError {
         "path contains a control character and cannot be safely embedded in an SBPL profile: {0:?}"
     )]
     ControlCharacterInPath(PathBuf),
+    /// A path that goes into a Seatbelt `(regex #"...")` rule contains a
+    /// double quote. That literal has no escape for `"`, so the quote would
+    /// end it early and let the rest of the path inject SBPL.
+    #[error("path contains a double quote and cannot be used in an SBPL regex rule: {0:?}")]
+    QuoteInRegexPath(PathBuf),
     /// Profile generation failed for a reason not tied to a specific path.
     #[error("failed to build sandbox profile: {0}")]
     ProfileBuildError(String),
@@ -464,15 +469,37 @@ pub mod macos {
     /// ASCII control character (0x00–0x1F, 0x7F). These are rejected rather than
     /// stripped to prevent SBPL injection attacks.
     fn escape_path(path: &Path) -> Result<String, SandboxError> {
-        let s = path.to_string_lossy();
-        for ch in s.chars() {
-            let code = ch as u32;
-            if code <= 0x1F || code == 0x7F {
-                return Err(SandboxError::ControlCharacterInPath(path.to_path_buf()));
-            }
-        }
+        reject_control_characters(path)?;
         // Escape backslashes first, then double-quotes.
-        Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+        Ok(path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""))
+    }
+
+    fn reject_control_characters(path: &Path) -> Result<(), SandboxError> {
+        if path
+            .to_string_lossy()
+            .chars()
+            .any(|ch| ch <= '\u{1F}' || ch == '\u{7F}')
+        {
+            return Err(SandboxError::ControlCharacterInPath(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    /// Validate a path and escape it for a Seatbelt `(regex #"...")` rule.
+    ///
+    /// The `#"..."` literal is raw: backslashes pass through, and there is
+    /// no escape for `"`. So on top of [`escape_path`]'s control-character
+    /// check, a quote is refused, and ERE metacharacters are escaped.
+    fn escape_regex_path(path: &Path) -> Result<String, SandboxError> {
+        reject_control_characters(path)?;
+        let s = path.to_string_lossy();
+        if s.contains('"') {
+            return Err(SandboxError::QuoteInRegexPath(path.to_path_buf()));
+        }
+        Ok(regex_escape(&s))
     }
 
     /// Emit ancestor directory metadata-access rules for a path.
@@ -1039,12 +1066,9 @@ pub mod macos {
         Ok(out)
     }
 
-    /// Escape ERE metacharacters so a literal path can be safely embedded in
-    /// a Seatbelt `(regex #"...")` pattern.
-    ///
-    /// The output of this function is subsequently passed through
-    /// [`escape_path`]-style escaping for the surrounding SBPL string: a
-    /// literal `\` in the regex produces `\\` in the emitted Rust source.
+    /// Escape ERE metacharacters so a literal path can be embedded in a
+    /// Seatbelt `(regex #"...")` pattern. Paths go through
+    /// [`escape_regex_path`], which also validates them.
     fn regex_escape(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 8);
         for ch in s.chars() {
@@ -1328,7 +1352,7 @@ pub mod macos {
             let prefs = home.join("Library/Preferences");
             let pattern = format!(
                 "^{}/(ByHost/)?\\.GlobalPreferences.*\\.plist$",
-                regex_escape(&prefs.to_string_lossy())
+                escape_regex_path(&prefs)?
             );
             out.push_str(&format!("(allow file-read* (regex #\"{pattern}\"))\n"));
         }
@@ -1372,22 +1396,11 @@ pub mod macos {
         };
 
         let base = home.join(".claude.json");
-        // Reject control characters in the path (same invariant as
-        // `escape_path`) — they would be unsafe inside the SBPL regex literal.
-        for ch in base.to_string_lossy().chars() {
-            let code = ch as u32;
-            if code <= 0x1F || code == 0x7F {
-                return Err(SandboxError::ControlCharacterInPath(base.clone()));
-            }
-        }
 
         // Build an ERE that matches `{base}` plus `{base}.lock` and
         // `{base}.tmp.<anything>`. SBPL `#"..."` is a raw regex literal, so
         // backslashes pass through unescaped.
-        let pattern = format!(
-            "^{}(\\.lock|\\.tmp\\..*)?$",
-            regex_escape(&base.to_string_lossy())
-        );
+        let pattern = format!("^{}(\\.lock|\\.tmp\\..*)?$", escape_regex_path(&base)?);
         out.push_str(&format!(
             "(allow file-read* file-write* (regex #\"{pattern}\"))\n"
         ));
@@ -2667,6 +2680,24 @@ pub mod macos {
                 assert!(
                     !sbpl.contains(needle),
                     "non-relaxed SBPL must not contain {needle}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn quote_in_home_is_refused_in_regex_rules() {
+            use super::super::{AgentProfileKind, SandboxError};
+
+            let policy = super::super::AgentPolicy {
+                home: Some(PathBuf::from("/Users/a\"b")),
+                ..agent_policy_with_home()
+            };
+            for kind in [AgentProfileKind::Claude, AgentProfileKind::ClaudeRelaxed] {
+                let result = MacOSSeatbelt.build_agent(&policy, Some(kind));
+                assert!(
+                    matches!(result, Err(SandboxError::QuoteInRegexPath(_))),
+                    "{kind:?}: expected QuoteInRegexPath, got: {:?}",
+                    result.map(|_| ())
                 );
             }
         }
