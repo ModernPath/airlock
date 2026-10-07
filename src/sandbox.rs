@@ -25,15 +25,21 @@ pub enum SandboxError {
         "path contains a control character and cannot be safely embedded in an SBPL profile: {0:?}"
     )]
     ControlCharacterInPath(PathBuf),
+    /// A path that goes into a Seatbelt `(regex #"...")` rule contains a
+    /// double quote. That literal has no escape for `"`, so the quote would
+    /// end it early and let the rest of the path inject SBPL.
+    #[error("path contains a double quote and cannot be used in an SBPL regex rule: {0:?}")]
+    QuoteInRegexPath(PathBuf),
     /// Profile generation failed for a reason not tied to a specific path.
     #[error("failed to build sandbox profile: {0}")]
     ProfileBuildError(String),
 }
 
 /// How much of the network a tool may reach.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum NetworkAccess {
     /// No sockets at all; the profile's default deny covers it.
+    #[default]
     None,
     /// Unrestricted outbound access plus name resolution.
     Full,
@@ -43,11 +49,48 @@ pub enum NetworkAccess {
     ProxyOnly(u16),
 }
 
+/// How much of the system's dynamic-linking and toolchain filesystem a tool
+/// gets, independent of its config-granted `read_paths`/`read_write_paths`.
+///
+/// Governs only the built-in baseline that `emit_common_rules`/
+/// `build_landlock_profile` add on top of a tool's explicit grants (project
+/// root, `[filesystem]`, `extra_read`/`extra_write`, the tool binary itself,
+/// a proxy tool's CA file) — none of those are affected by this setting.
+/// The agent's own sandbox profile is never governed by this type; it always
+/// gets the equivalent of [`System`](ToolAccess::System).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolAccess {
+    /// The tool's own binary plus the bare minimum any dynamically linked
+    /// program needs to start and exit: the dynamic linker, the shared
+    /// library cache it loads from, and `/dev/null`. Nothing else of the
+    /// system — no `/etc`, no `/usr/share`, no other system binaries.
+    None,
+    /// Today's baseline: system libraries, binaries, shared data, and
+    /// configuration (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,
+    /// random,urandom}`, ...) on macOS; the equivalent fixed path list on
+    /// Linux.
+    System,
+    /// [`System`](ToolAccess::System) plus read-only toolchain roots (`/nix/store`,
+    /// `/opt/homebrew`, `/usr/local`, `/opt/local`,
+    /// `/home/linuxbrew/.linuxbrew`) so dynamically linked tools installed
+    /// by Nix, Homebrew, MacPorts, or Linuxbrew can load their libraries.
+    /// The default when `access` is unset anywhere in config — a deliberate
+    /// widening over the pre-`access` baseline.
+    #[default]
+    Default,
+}
+
 /// Describes what a tool is allowed to access.
 ///
 /// Used as input to a `SandboxBackend` to produce a `SandboxProfile`.
+#[derive(Default)]
 pub struct ToolPolicy {
-    /// Filesystem paths the tool may read (from global `[filesystem]` and tool's `extra_read`).
+    /// Filesystem paths the tool may read (from global `[filesystem]` and
+    /// tool's `extra_read`). May include a single file, not just directories
+    /// — a proxy tool's session CA certificate (`<runtime_base>/ca/<id>.pem`)
+    /// is granted this way: `emit_filesystem_rules`'s `subpath` rule matches
+    /// a leaf file exactly, and the grant is unaffected by the final denies
+    /// below, which cover writes and the `admin.token` read only.
     pub read_paths: Vec<PathBuf>,
     /// Filesystem paths the tool may read and write (from tool's `extra_write`).
     pub read_write_paths: Vec<PathBuf>,
@@ -62,9 +105,43 @@ pub struct ToolPolicy {
     /// for TLS). Without `file-read*` on this path, TLS certificate verification
     /// fails even though `process-exec*` allowed the initial execution.
     ///
+    /// On Linux, this is load-bearing for a different reason: Landlock ties
+    /// execute rights to path coverage, so without an explicit `PathBeneath`
+    /// rule on this exact file, a binary outside the access-level baseline
+    /// and outside `read_paths`/`read_write_paths` (e.g. `~/.cargo/bin/foo`
+    /// under `ToolAccess::None`, or any tool's binary under `None` at all)
+    /// cannot exec. Granted at every access level, same as macOS.
+    ///
     /// Set by the daemon after binary resolution; `None` in unit tests that
     /// don't exercise the full daemon flow.
     pub binary_path: Option<PathBuf>,
+    /// How much of the system's dynamic-linking and toolchain filesystem
+    /// this tool gets. Defaults to [`ToolAccess::Default`].
+    pub access: ToolAccess,
+    /// The daemon's runtime directory (holds the socket, PID file,
+    /// `admin.token`, and session CA certs), when known.
+    ///
+    /// On macOS, when set, the builder appends `(deny file-write* (subpath
+    /// <base>))` and `(deny file-read* (literal <base>/admin.token))` as the
+    /// final rules in the profile (see [Sandbox
+    /// access](../docs/airlock-v2-design.md) and B7). A tool never gets a
+    /// matching read-write grant on the base automatically — only an
+    /// explicit `extra_write` that happens to cover it (e.g. one equal to
+    /// `$TMPDIR`) would, and the deny carves the base back out of it. On
+    /// Linux, Landlock is allow-only and cannot carve a subtree out of a
+    /// grant, so this field has no effect there; nothing in the default
+    /// baseline grants the base, and the anchor check refuses any config
+    /// grant that would.
+    pub runtime_base: Option<PathBuf>,
+    /// `<root>/.git/hooks`, when the sandbox root is a git worktree (F9).
+    ///
+    /// On macOS, appended as `(deny file-write* (subpath <git_hooks_deny>))`
+    /// — the first of the final deny rules — so an agent or a tool with a
+    /// broad write grant on the root cannot install or edit a hook that
+    /// would fire on the user's next `git commit` with no review step. Set
+    /// for both tool and agent profiles. Linux cannot express this; it is
+    /// defense in depth, not a guarantee.
+    pub git_hooks_deny: Option<PathBuf>,
 }
 
 /// Describes what an agent process is allowed to access.
@@ -72,6 +149,7 @@ pub struct ToolPolicy {
 /// Used as input to `SandboxBackend::build_agent` to produce a `SandboxProfile`.
 /// Unlike `ToolPolicy`, there is no `binary_path` field — the entire interactive
 /// session is sandboxed, so there is no single binary path to allow.
+#[derive(Default)]
 pub struct AgentPolicy {
     /// Filesystem paths the agent may read (global filesystem list, toolchain paths,
     /// and any user-declared agent read paths).
@@ -89,6 +167,34 @@ pub struct AgentPolicy {
     /// Always `true` for agents, but included as an explicit field so the
     /// profile generator can be read without assuming.
     pub requires_terminal: bool,
+    /// The daemon's runtime directory, when known. See
+    /// [`ToolPolicy::runtime_base`] for the macOS deny rules this produces.
+    /// Unlike tools, the agent also needs to reach the daemon: when set, the
+    /// macOS builder additionally grants `file-read*` on
+    /// `<runtime_base>/airlock.sock` and an explicit unix-socket
+    /// `network-outbound` to that path, regardless of `requires_network` —
+    /// connecting to the daemon must not depend on the agent's general
+    /// network policy. Neither grant is undone by the final denies, which
+    /// cover writes and the `admin.token` read only.
+    pub runtime_base: Option<PathBuf>,
+    /// The per-session scratch directory (`$TMPDIR` on macOS), when known.
+    ///
+    /// Read from the session's environment snapshot by the caller, never
+    /// by this module. When set, the macOS builder grants
+    /// `file-read* file-write*` on its canonical form, exactly as the
+    /// previous `std::env::var("TMPDIR")` lookup did; silently skipped when
+    /// `None` or when canonicalization fails.
+    pub tmpdir: Option<PathBuf>,
+    /// The user's home directory, when known.
+    ///
+    /// Read from the process environment by the caller, not by this module
+    /// (see `tmpdir` above). Gates the `$HOME/Applications`,
+    /// `~/.CFUserTextEncoding`, and (for the `claude`/`claude-relaxed`
+    /// profiles) `~/.claude.json`-family, `GlobalPreferences`, and
+    /// shell-dotfile rules; each is silently skipped when `None`.
+    pub home: Option<PathBuf>,
+    /// `<root>/.git/hooks`, when known. See [`ToolPolicy::git_hooks_deny`].
+    pub git_hooks_deny: Option<PathBuf>,
 }
 
 /// An opaque, pre-built sandbox configuration produced by a `SandboxBackend`.
@@ -116,6 +222,28 @@ const _: fn() = || {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<SandboxProfile>();
 };
+
+/// Read-only toolchain roots granted to a tool at [`ToolAccess::Default`],
+/// and reused by `run::detect_toolchain_paths` for the agent's own
+/// (unconditional) toolchain grant — one constant so the two lists cannot
+/// drift apart.
+///
+/// Nix (`/nix/store`), Homebrew on Apple Silicon (`/opt/homebrew`) and on
+/// Intel/Linuxbrew (`/usr/local`, `/home/linuxbrew/.linuxbrew`), and
+/// MacPorts (`/opt/local`) all install dynamically linked binaries whose
+/// shared libraries live outside the standard system directories; without
+/// read access here, such a binary fails to load under the sandbox with
+/// "Library not loaded ... (blocked by sandbox)" (macOS) or an equivalent
+/// linker error (Linux). A nonexistent root is harmless to grant — macOS
+/// Seatbelt does not require a path to exist, and Landlock already skips
+/// missing paths (`PathFd::new` fails with `ENOENT`).
+pub(crate) const TOOLCHAIN_ROOTS: &[&str] = &[
+    "/nix/store",
+    "/opt/homebrew",
+    "/usr/local",
+    "/opt/local",
+    "/home/linuxbrew/.linuxbrew",
+];
 
 // ─── Platform type aliases ────────────────────────────────────────────────────
 
@@ -277,7 +405,8 @@ pub mod macos {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile, ToolPolicy,
+        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile,
+        TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
     };
 
     // ─── FFI bindings ────────────────────────────────────────────────────────
@@ -330,15 +459,51 @@ pub mod macos {
     /// ASCII control character (0x00–0x1F, 0x7F). These are rejected rather than
     /// stripped to prevent SBPL injection attacks.
     fn escape_path(path: &Path) -> Result<String, SandboxError> {
-        let s = path.to_string_lossy();
-        for ch in s.chars() {
-            let code = ch as u32;
-            if code <= 0x1F || code == 0x7F {
-                return Err(SandboxError::ControlCharacterInPath(path.to_path_buf()));
-            }
-        }
+        reject_control_characters(path)?;
         // Escape backslashes first, then double-quotes.
-        Ok(s.replace('\\', "\\\\").replace('"', "\\\""))
+        Ok(path
+            .to_string_lossy()
+            .replace('\\', "\\\\")
+            .replace('"', "\\\""))
+    }
+
+    fn reject_control_characters(path: &Path) -> Result<(), SandboxError> {
+        if path
+            .to_string_lossy()
+            .chars()
+            .any(|ch| ch <= '\u{1F}' || ch == '\u{7F}')
+        {
+            return Err(SandboxError::ControlCharacterInPath(path.to_path_buf()));
+        }
+        Ok(())
+    }
+
+    /// Validate a path and escape it for a Seatbelt `(regex #"...")` rule.
+    ///
+    /// The `#"..."` literal is raw: backslashes pass through, and there is
+    /// no escape for `"`. So on top of [`escape_path`]'s control-character
+    /// check, a quote is refused, and ERE metacharacters are escaped.
+    fn escape_regex_path(path: &Path) -> Result<String, SandboxError> {
+        reject_control_characters(path)?;
+        let s = path.to_string_lossy();
+        if s.contains('"') {
+            return Err(SandboxError::QuoteInRegexPath(path.to_path_buf()));
+        }
+        Ok(regex_escape(&s))
+    }
+
+    /// Push `(<rule> (<filter> "<path>"))`, `path` validated and escaped by
+    /// [`escape_path`]: `rule` is the action and operations (`"allow
+    /// file-read*"`), `filter` is `"literal"` or `"subpath"`.
+    fn push_rule(
+        out: &mut String,
+        rule: &str,
+        filter: &str,
+        path: &Path,
+    ) -> Result<(), SandboxError> {
+        let escaped = escape_path(path)?;
+        out.push_str(&format!("({rule} ({filter} \"{escaped}\"))\n"));
+        Ok(())
     }
 
     /// Emit ancestor directory metadata-access rules for a path.
@@ -552,28 +717,75 @@ pub mod macos {
         // `file-read*` on the root literal grants this without exposing any
         // file contents in subdirectories (those require separate subpath rules).
         out.push_str("(allow file-read* (literal \"/\"))\n");
+    }
 
-        // ── System read paths (always allowed, read-only) ───────────────────
-        // These are macOS system directories that virtually every program
-        // needs at runtime. They contain no user secrets — only OS
-        // frameworks, shared libraries, certificates, and configuration.
-        //
-        //  /usr/lib       — system shared libraries (libSystem, dyld stubs)
-        //  /usr/bin       — system binaries (ls, git, ssh, curl, ...)
-        //  /usr/sbin      — system admin binaries
-        //  /usr/share     — shared data (locale, timezone, terminfo)
-        //  /bin           — core binaries (sh, ls, cat, ...)
-        //  /sbin          — core admin binaries
-        //  /System        — OS frameworks, Security.framework trust stores,
-        //                   system keychains (SystemRootCertificates.keychain)
-        //  /Library       — system-wide frameworks, keychains, CA certs
-        //  /private/etc   — system configuration (ssl/openssl.cnf, hosts,
-        //                   resolv.conf); canonical path of /etc symlink
-        //  /dev/null      — required by many programs for I/O redirection
-        //                   (read and write: shells open it O_WRONLY for 2>/dev/null)
-        //  /dev/zero      — source of zero bytes; many programs read it
-        //  /dev/random    — cryptographic random number generation
-        //  /dev/urandom   — non-blocking random number generation
+    /// The dyld shared cache directory, tried in both its modern
+    /// cryptex-mounted location and the pre-cryptex location on older
+    /// macOS releases. `libSystem` lives inside the cache rather than as a
+    /// standalone file, so [`ToolAccess::None`] needs read access to it —
+    /// without it, even `/bin/echo` fails with "Library not loaded" before
+    /// `main()` runs. A path that doesn't exist on the running release is
+    /// harmless to list — see [`TOOLCHAIN_ROOTS`]'s doc comment.
+    const MACOS_DYLD_SHARED_CACHE_DIRS: &[&str] = &[
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+        "/System/Library/dyld",
+    ];
+
+    /// Emit the filesystem rules for [`ToolAccess::None`]: read access to
+    /// the dynamic linker and the shared library cache it loads from (plus
+    /// the ancestor metadata needed to traverse down to both), and
+    /// `/dev/null` read+write with the ioctl/char-device rules shells and
+    /// libc need for `2>/dev/null`-style redirection. Nothing else of the
+    /// system.
+    ///
+    /// Verified empirically with `sandbox-exec`: a profile containing
+    /// exactly these rules (plus what `emit_common_rules` always emits —
+    /// process ops, sysctl, Mach lookups, and the root-directory literal)
+    /// runs `/bin/echo hi` successfully, while `cat /etc/hosts` and
+    /// `ls /usr/share` both fail with "Operation not permitted".
+    fn emit_none_filesystem_baseline(out: &mut String) -> Result<(), SandboxError> {
+        let dyld = Path::new("/usr/lib/dyld");
+        emit_ancestor_rules(dyld, out)?;
+        push_rule(out, "allow file-read*", "literal", dyld)?;
+
+        for cache_dir in MACOS_DYLD_SHARED_CACHE_DIRS {
+            let path = Path::new(cache_dir);
+            emit_ancestor_rules(path, out)?;
+            push_rule(out, "allow file-read*", "subpath", path)?;
+        }
+
+        out.push_str("(allow file-read* (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-read-metadata (literal \"/dev\"))\n");
+        out.push_str("(allow file-ioctl (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-ioctl file-read-data file-write-data\n");
+        out.push_str("  (require-all\n");
+        out.push_str("    (literal \"/dev/null\")\n");
+        out.push_str("    (vnode-type CHARACTER-DEVICE)))\n");
+        Ok(())
+    }
+
+    /// Emit the filesystem rules [`ToolAccess::System`] adds on top of
+    /// [`ToolAccess::None`] — today's baseline, unchanged from before
+    /// `access` existed: system libraries, binaries, shared data, and
+    /// configuration. They contain no user secrets — only OS frameworks,
+    /// shared libraries, certificates, and configuration.
+    ///
+    ///  /usr/lib       — system shared libraries (libSystem, dyld stubs)
+    ///  /usr/bin       — system binaries (ls, git, ssh, curl, ...)
+    ///  /usr/sbin      — system admin binaries
+    ///  /usr/share     — shared data (locale, timezone, terminfo)
+    ///  /bin           — core binaries (sh, ls, cat, ...)
+    ///  /sbin          — core admin binaries
+    ///  /System        — OS frameworks, Security.framework trust stores,
+    ///                   system keychains (SystemRootCertificates.keychain)
+    ///  /Library       — system-wide frameworks, keychains, CA certs
+    ///  /private/etc   — system configuration (ssl/openssl.cnf, hosts,
+    ///                   resolv.conf); canonical path of /etc symlink
+    ///  /dev/zero      — source of zero bytes; many programs read it
+    ///  /dev/random    — cryptographic random number generation
+    ///  /dev/urandom   — non-blocking random number generation
+    fn emit_system_filesystem_baseline(out: &mut String) {
         out.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
         out.push_str("(allow file-read* (subpath \"/usr/bin\"))\n");
         out.push_str("(allow file-read* (subpath \"/usr/sbin\"))\n");
@@ -584,7 +796,6 @@ pub mod macos {
         out.push_str("(allow file-read* (subpath \"/Library\"))\n");
         out.push_str("(allow file-read* (subpath \"/private/etc\"))\n");
         out.push_str("(allow file-read* (subpath \"/etc\"))\n");
-        out.push_str("(allow file-read* (literal \"/dev/null\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/zero\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/random\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/urandom\"))\n");
@@ -595,26 +806,51 @@ pub mod macos {
         // focused on real problems.
         out.push_str("(allow file-read* (literal \"/dev/dtracehelper\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/autofs_nowait\"))\n");
-        out.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         // Ancestor metadata for path traversal into the above directories.
+        // (/dev's own metadata rule is part of the None baseline already.)
         out.push_str("(allow file-read-metadata (literal \"/usr\"))\n");
         out.push_str("(allow file-read-metadata (literal \"/private\"))\n");
-        out.push_str("(allow file-read-metadata (literal \"/dev\"))\n");
 
         // ── File I/O on device files ──────────────────────────────────────────
         // Programs commonly call ioctl() on standard device nodes. Without
         // these rules the sandbox returns EPERM even for benign operations
         // (e.g. querying the terminal window size on /dev/tty).
-        out.push_str("(allow file-ioctl (literal \"/dev/null\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/zero\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/random\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/urandom\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/dtracehelper\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/tty\"))\n");
-        out.push_str("(allow file-ioctl file-read-data file-write-data\n");
-        out.push_str("  (require-all\n");
-        out.push_str("    (literal \"/dev/null\")\n");
-        out.push_str("    (vnode-type CHARACTER-DEVICE)))\n");
+    }
+
+    /// Emit the filesystem rules [`ToolAccess::Default`] adds on top of
+    /// [`ToolAccess::System`]: read-only access to [`TOOLCHAIN_ROOTS`].
+    fn emit_toolchain_filesystem_baseline(out: &mut String) -> Result<(), SandboxError> {
+        for root in TOOLCHAIN_ROOTS {
+            let path = Path::new(root);
+            emit_ancestor_rules(path, out)?;
+            push_rule(out, "allow file-read*", "subpath", path)?;
+        }
+        Ok(())
+    }
+
+    /// Emit the tool filesystem baseline for the given [`ToolAccess`]
+    /// level: [`emit_none_filesystem_baseline`] always, plus
+    /// [`emit_system_filesystem_baseline`] at `System` and `Default`, plus
+    /// [`emit_toolchain_filesystem_baseline`] at `Default` only.
+    fn emit_tool_filesystem_baseline(
+        access: ToolAccess,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        emit_none_filesystem_baseline(out)?;
+        match access {
+            ToolAccess::None => {}
+            ToolAccess::System => emit_system_filesystem_baseline(out),
+            ToolAccess::Default => {
+                emit_system_filesystem_baseline(out);
+                emit_toolchain_filesystem_baseline(out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Emit SBPL filesystem read and write rules for the given path lists.
@@ -643,24 +879,20 @@ pub mod macos {
             // emit ancestor and read rules for both.
             if let Some(canonical) = try_canonicalize(path) {
                 emit_ancestor_rules(&canonical, out)?;
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+                push_rule(out, "allow file-read*", "subpath", &canonical)?;
             }
 
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-read*", "subpath", path)?;
         }
 
         // Write rules are emitted after read rules to respect SBPL precedence.
         for path in read_write_paths {
             // Emit canonical form write rule if needed.
             if let Some(canonical) = try_canonicalize(path) {
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
+                push_rule(out, "allow file-write*", "subpath", &canonical)?;
             }
 
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-write*", "subpath", path)?;
         }
 
         Ok(())
@@ -708,6 +940,62 @@ pub mod macos {
         out.push_str("(allow network-bind (local unix-socket))\n");
     }
 
+    /// Emit the grant every agent profile needs to reach the daemon,
+    /// regardless of `requires_network`: `file-read*` on
+    /// `<runtime_base>/airlock.sock` (the ancestor-metadata idiom used for
+    /// `mDNSResponder` above — a socket connect needs filesystem access to
+    /// the path, not just the network-outbound permission) plus an explicit
+    /// unix-socket `network-outbound` grant to that exact path. The latter
+    /// is redundant with the blanket `(allow network-outbound)` emitted by
+    /// `emit_network_rules`, but connecting to the daemon must not depend on
+    /// that general rule staying unconditional.
+    ///
+    /// The runtime base is not otherwise covered by any read/write path
+    /// unless `$TMPDIR` happens to contain it (the common case — see
+    /// [`ToolPolicy::runtime_base`]), so without this the agent could not
+    /// locate its own socket.
+    fn emit_runtime_base_socket_access(
+        runtime_base: &Path,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        let socket_path = runtime_base.join("airlock.sock");
+        emit_ancestor_rules(&socket_path, out)?;
+        let escaped = escape_path(&socket_path)?;
+        out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+        out.push_str(&format!(
+            "(allow network-outbound (remote unix-socket (path-literal \"{escaped}\")))\n"
+        ));
+        Ok(())
+    }
+
+    /// Emit the deny rules that must be the very last rules in any profile,
+    /// in this order: F9's `.git/hooks` write deny, the runtime base write
+    /// deny, and the `admin.token` read deny.
+    ///
+    /// SBPL's last matching rule wins, so any allow emitted after these
+    /// would re-open what they close — `generate_profile` and
+    /// `generate_agent_profile` each call this exactly once, as the final
+    /// step, which is what makes "last" a structural guarantee rather than a
+    /// property of call order elsewhere in this module.
+    fn emit_final_denies(
+        git_hooks_deny: Option<&Path>,
+        runtime_base: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        if let Some(hooks) = git_hooks_deny {
+            push_rule(out, "deny file-write*", "subpath", hooks)?;
+        }
+        if let Some(base) = runtime_base {
+            push_rule(out, "deny file-write*", "subpath", base)?;
+            let admin_token = base.join("admin.token");
+            let escaped_token = escape_path(&admin_token)?;
+            out.push_str(&format!(
+                "(deny file-read* (literal \"{escaped_token}\"))\n"
+            ));
+        }
+        Ok(())
+    }
+
     /// Emit the only network rule a proxy tool gets: a TCP connect to the
     /// daemon's per-exec proxy listener.
     ///
@@ -731,6 +1019,7 @@ pub mod macos {
         // Tool profiles restrict signal and process-info scope to the process
         // itself — tools run as single processes, not process trees.
         emit_common_rules("self", &mut out);
+        emit_tool_filesystem_baseline(policy.access, &mut out)?;
 
         // ── Binary executable read access ────────────────────────────────────
         // On macOS, Security.framework re-reads the process's own binary at
@@ -742,14 +1031,12 @@ pub mod macos {
         // "SecPolicyCreateSSL error: 0".
         if let Some(ref binary) = policy.binary_path {
             emit_ancestor_rules(binary, &mut out)?;
-            let escaped = escape_path(binary)?;
-            out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+            push_rule(&mut out, "allow file-read*", "literal", binary)?;
             // If the binary path has a different canonical form (e.g., the
             // daemon resolved a symlink), emit rules for both.
             if let Some(canonical) = try_canonicalize(binary) {
                 emit_ancestor_rules(&canonical, &mut out)?;
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+                push_rule(&mut out, "allow file-read*", "literal", &canonical)?;
             }
         }
 
@@ -762,15 +1049,19 @@ pub mod macos {
             NetworkAccess::ProxyOnly(port) => emit_proxy_network_rules(port, &mut out),
         }
 
+        // Must be last: see `emit_final_denies`.
+        emit_final_denies(
+            policy.git_hooks_deny.as_deref(),
+            policy.runtime_base.as_deref(),
+            &mut out,
+        )?;
+
         Ok(out)
     }
 
-    /// Escape ERE metacharacters so a literal path can be safely embedded in
-    /// a Seatbelt `(regex #"...")` pattern.
-    ///
-    /// The output of this function is subsequently passed through
-    /// [`escape_path`]-style escaping for the surrounding SBPL string: a
-    /// literal `\` in the regex produces `\\` in the emitted Rust source.
+    /// Escape ERE metacharacters so a literal path can be embedded in a
+    /// Seatbelt `(regex #"...")` pattern. Paths go through
+    /// [`escape_regex_path`], which also validates them.
     fn regex_escape(s: &str) -> String {
         let mut out = String::with_capacity(s.len() + 8);
         for ch in s.chars() {
@@ -797,6 +1088,11 @@ pub mod macos {
         // the profile. Tool profiles use `(target self)` instead, which is
         // narrower and appropriate for single-process tools.
         emit_common_rules("same-sandbox", &mut out);
+        // The agent's own sandbox baseline is never governed by `ToolAccess`
+        // (that type exists for tools only) — it always gets the `None` plus
+        // `System` filesystem baseline, unchanged from before `access` existed.
+        emit_none_filesystem_baseline(&mut out)?;
+        emit_system_filesystem_baseline(&mut out);
 
         // ── Agent-only system permissions ─────────────────────────────────────
         // User preferences (NSUserDefaults) and distributed notifications are
@@ -847,10 +1143,9 @@ pub mod macos {
         // uses for user-scoped installs (e.g. Claude Code's URL handler
         // bundle). Resolved at profile-build time; skipped silently when HOME
         // is unset.
-        if let Ok(home) = std::env::var("HOME") {
-            let user_apps = std::path::PathBuf::from(&home).join("Applications");
-            let escaped = escape_path(&user_apps)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+        if let Some(home) = &policy.home {
+            let user_apps = home.join("Applications");
+            push_rule(&mut out, "allow file-read*", "subpath", &user_apps)?;
         }
 
         // ── Timezone data ─────────────────────────────────────────────────────
@@ -891,15 +1186,18 @@ pub mod macos {
         // atomic writes, caches, and `mkstemp` output. Canonicalised at
         // profile-build time (the `/var` → `/private/var` symlink must be
         // resolved because Seatbelt evaluates rules against the resolved path).
-        // Silently skipped when `TMPDIR` is unset or cannot be resolved.
-        if let Ok(tmpdir) = std::env::var("TMPDIR") {
-            let tmpdir_path = std::path::PathBuf::from(&tmpdir);
-            if let Ok(canonical) = std::fs::canonicalize(&tmpdir_path) {
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!(
-                    "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
-                ));
-            }
+        // Silently skipped when `tmpdir` is `None` or cannot be resolved. The
+        // value itself is read from the process environment by the caller,
+        // not here — see `AgentPolicy::tmpdir`. This is also normally the
+        // same directory as the runtime base, which is why the final denies
+        // below must come after this grant, not before it.
+        if let Some(tmpdir) = &policy.tmpdir
+            && let Ok(canonical) = std::fs::canonicalize(tmpdir)
+        {
+            let escaped = escape_path(&canonical)?;
+            out.push_str(&format!(
+                "(allow file-read* file-write* (subpath \"{escaped}\"))\n"
+            ));
         }
 
         // ── ~/.CFUserTextEncoding ─────────────────────────────────────────────
@@ -908,10 +1206,9 @@ pub mod macos {
         // Contents are a single short numeric line (encoding id + region); no
         // credentials. Resolved at profile-build time from $HOME; skipped
         // silently if HOME is unset.
-        if let Ok(home) = std::env::var("HOME") {
-            let encoding_path = std::path::PathBuf::from(home).join(".CFUserTextEncoding");
-            let escaped = escape_path(&encoding_path)?;
-            out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+        if let Some(home) = &policy.home {
+            let encoding_path = home.join(".CFUserTextEncoding");
+            push_rule(&mut out, "allow file-read*", "literal", &encoding_path)?;
         }
 
         emit_filesystem_rules(&policy.read_paths, &policy.read_write_paths, &mut out)?;
@@ -920,7 +1217,14 @@ pub mod macos {
         // Extras that cannot be expressed as simple subpath allows and are
         // therefore not routed through `emit_filesystem_rules`.
         if let Some(kind) = profile {
-            emit_profile_rules(kind, &mut out)?;
+            emit_profile_rules(kind, policy.home.as_deref(), &mut out)?;
+        }
+
+        // The daemon connection is not part of the agent's general network
+        // policy — grant it unconditionally so it cannot be switched off by
+        // a future `requires_network: false`.
+        if let Some(base) = &policy.runtime_base {
+            emit_runtime_base_socket_access(base, &mut out)?;
         }
 
         // Agents always require network access; the field governs this conditional
@@ -944,6 +1248,13 @@ pub mod macos {
             out.push_str("(allow network-inbound (local udp \"localhost:*\"))\n");
         }
 
+        // Must be last: see `emit_final_denies`.
+        emit_final_denies(
+            policy.git_hooks_deny.as_deref(),
+            policy.runtime_base.as_deref(),
+            &mut out,
+        )?;
+
         Ok(out)
     }
 
@@ -952,12 +1263,16 @@ pub mod macos {
     /// These rules typically rely on regex patterns — Seatbelt-only — to grant
     /// access to file-name families that can't be covered by a single subpath
     /// rule (atomic-write lockfiles and per-pid temp files, for example).
-    fn emit_profile_rules(kind: AgentProfileKind, out: &mut String) -> Result<(), SandboxError> {
+    fn emit_profile_rules(
+        kind: AgentProfileKind,
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
         match kind {
-            AgentProfileKind::Claude => emit_claude_profile_rules(out),
+            AgentProfileKind::Claude => emit_claude_profile_rules(home, out),
             AgentProfileKind::ClaudeRelaxed => {
-                emit_claude_profile_rules(out)?;
-                emit_claude_relaxed_profile_rules(out)
+                emit_claude_profile_rules(home, out)?;
+                emit_claude_relaxed_profile_rules(home, out)
             }
         }
     }
@@ -970,7 +1285,10 @@ pub mod macos {
     /// browser process, and the dotfiles often carry exported credentials
     /// (`AWS_*`, `GITHUB_TOKEN`). Gated by the explicit `claude-relaxed`
     /// profile choice rather than the standard `claude` profile.
-    fn emit_claude_relaxed_profile_rules(out: &mut String) -> Result<(), SandboxError> {
+    fn emit_claude_relaxed_profile_rules(
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
         // Keychain Mach endpoints. `com.apple.securityd.xpc` is the modern
         // `securityd`/Keychain Services entry point used by `SecItem*`;
         // `com.apple.SecurityServer` is the legacy alias the
@@ -1021,11 +1339,11 @@ pub mod macos {
         // host-specific and unknown at compile time, so match it with a
         // regex. No credentials live in these plists — they are
         // app-binding and locale preferences.
-        if let Ok(home) = std::env::var("HOME") {
-            let prefs = std::path::PathBuf::from(&home).join("Library/Preferences");
+        if let Some(home) = home {
+            let prefs = home.join("Library/Preferences");
             let pattern = format!(
                 "^{}/(ByHost/)?\\.GlobalPreferences.*\\.plist$",
-                regex_escape(&prefs.to_string_lossy())
+                escape_regex_path(&prefs)?
             );
             out.push_str(&format!("(allow file-read* (regex #\"{pattern}\"))\n"));
         }
@@ -1034,7 +1352,7 @@ pub mod macos {
         // interactive spawn — without them the shell starts in a bare
         // environment and the user's PATH, aliases, and prompt functions
         // are missing. Read-only; the agent cannot modify them.
-        if let Ok(home) = std::env::var("HOME") {
+        if let Some(home) = home {
             const DOTFILES: &[&str] = &[
                 ".bashrc",
                 ".bash_profile",
@@ -1046,10 +1364,8 @@ pub mod macos {
                 ".zlogin",
                 ".inputrc",
             ];
-            let home_path = std::path::PathBuf::from(&home);
             for name in DOTFILES {
-                let escaped = escape_path(&home_path.join(name))?;
-                out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+                push_rule(out, "allow file-read*", "literal", &home.join(name))?;
             }
         }
 
@@ -1061,33 +1377,25 @@ pub mod macos {
     /// config writes (`{path}.lock`, `{path}.tmp.{pid}.{ts}`), plus the
     /// top-level `~/.claude.lock` Claude Code uses to serialize concurrent
     /// instances. Skipped silently if `HOME` is unset.
-    fn emit_claude_profile_rules(out: &mut String) -> Result<(), SandboxError> {
-        let Ok(home) = std::env::var("HOME") else {
+    fn emit_claude_profile_rules(
+        home: Option<&Path>,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        let Some(home) = home else {
             return Ok(());
         };
 
-        let base = std::path::PathBuf::from(&home).join(".claude.json");
-        // Reject control characters in the path (same invariant as
-        // `escape_path`) — they would be unsafe inside the SBPL regex literal.
-        for ch in base.to_string_lossy().chars() {
-            let code = ch as u32;
-            if code <= 0x1F || code == 0x7F {
-                return Err(SandboxError::ControlCharacterInPath(base.clone()));
-            }
-        }
+        let base = home.join(".claude.json");
 
         // Build an ERE that matches `{base}` plus `{base}.lock` and
         // `{base}.tmp.<anything>`. SBPL `#"..."` is a raw regex literal, so
         // backslashes pass through unescaped.
-        let pattern = format!(
-            "^{}(\\.lock|\\.tmp\\..*)?$",
-            regex_escape(&base.to_string_lossy())
-        );
+        let pattern = format!("^{}(\\.lock|\\.tmp\\..*)?$", escape_regex_path(&base)?);
         out.push_str(&format!(
             "(allow file-read* file-write* (regex #\"{pattern}\"))\n"
         ));
 
-        let lock = std::path::PathBuf::from(&home).join(".claude.lock");
+        let lock = home.join(".claude.lock");
         let escaped_lock = escape_path(&lock)?;
         out.push_str(&format!(
             "(allow file-read* file-write* (literal \"{escaped_lock}\"))\n"
@@ -1141,15 +1449,25 @@ pub mod macos {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
+        use super::super::{
+            NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
+        };
         use super::MacOSSeatbelt;
 
+        // These helpers pin `access: ToolAccess::System` explicitly rather
+        // than relying on `ToolAccess::default()` (`Default`, which also
+        // grants `TOOLCHAIN_ROOTS`) — every test written before `access`
+        // existed assumed exactly today's unconditional baseline, and that
+        // assumption must keep holding regardless of what the default
+        // level becomes. Tests for `None`/`Default` set `access` explicitly.
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -1159,6 +1477,8 @@ pub mod macos {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -1168,6 +1488,8 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -1177,6 +1499,8 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::Full,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -1251,6 +1575,84 @@ pub mod macos {
                 sbpl.contains("\"hw.pagesize\""),
                 "SBPL sysctl-read block should include hw.pagesize, got: {sbpl}"
             );
+        }
+
+        // ── ToolAccess levels (pure SBPL-text checks) ────────────────────────
+
+        fn policy_with_access(access: ToolAccess) -> ToolPolicy {
+            ToolPolicy {
+                access,
+                network: NetworkAccess::None,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn access_none_grants_dyld_but_no_usr_share_or_private_etc() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::None));
+            assert!(
+                sbpl.contains("/usr/lib/dyld"),
+                "ToolAccess::None should grant the dynamic linker, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains("dyld"),
+                "ToolAccess::None should grant the dyld shared cache, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains("(allow file-read* (literal \"/dev/null\"))"),
+                "ToolAccess::None should grant /dev/null read, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("/usr/share"),
+                "ToolAccess::None must not contain a /usr/share subpath, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("/private/etc"),
+                "ToolAccess::None must not contain a /private/etc subpath, got:\n{sbpl}"
+            );
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    !sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::None must not grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_system_grants_usr_share_but_no_toolchain_roots() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::System));
+            for path in &["/usr/lib", "/usr/share", "/private/etc", "/etc"] {
+                assert!(
+                    sbpl.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
+                    "ToolAccess::System should grant {path}, got:\n{sbpl}"
+                );
+            }
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    !sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::System must not grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_default_grants_system_baseline_plus_toolchain_roots() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::Default));
+            assert!(
+                sbpl.contains("(allow file-read* (subpath \"/usr/share\"))"),
+                "ToolAccess::Default should still grant the system baseline, got:\n{sbpl}"
+            );
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::Default should grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_default_is_the_access_default_value() {
+            assert_eq!(ToolAccess::default(), ToolAccess::Default);
         }
 
         // ── Process self-inspection ─────────────────────────────────────────
@@ -1586,6 +1988,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::ProxyOnly(port),
                 binary_path: None,
+                ..Default::default()
             }
         }
 
@@ -1669,6 +2072,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                ..Default::default()
             };
             let result = MacOSSeatbelt.build(&policy);
             assert!(
@@ -1709,6 +2113,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::Full,
                 binary_path: Some(PathBuf::from("/usr/local/bin/mytool")),
+                ..Default::default()
             };
             let sbpl = sbpl_from_profile(&policy);
             assert!(
@@ -1726,6 +2131,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: Some(PathBuf::from("/opt/homebrew/Cellar/gh/2.0/bin/gh")),
+                ..Default::default()
             };
             let sbpl = sbpl_from_profile(&policy);
             for ancestor in &[
@@ -1775,6 +2181,7 @@ pub mod macos {
                     read_write_paths: vec![],
                     network: NetworkAccess::None,
                     binary_path: Some(symlink_path.clone()),
+                    ..Default::default()
                 };
                 let sbpl = sbpl_from_profile(&policy);
                 let symlink_escaped = symlink_path.to_string_lossy();
@@ -1802,6 +2209,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             }
         }
 
@@ -1811,6 +2219,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             }
         }
 
@@ -1820,6 +2229,23 @@ pub mod macos {
                 read_write_paths: vec![PathBuf::from(path)],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
+            }
+        }
+
+        /// A fixed, fabricated `HOME` for tests that assert on `AgentPolicy::home`-
+        /// gated rules — avoids depending on (and serializing against mutation of)
+        /// the real test process's `HOME`.
+        const TEST_HOME: &str = "/Users/airlock-test";
+
+        fn agent_policy_with_home() -> super::super::AgentPolicy {
+            super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: true,
+                home: Some(PathBuf::from(TEST_HOME)),
+                ..Default::default()
             }
         }
 
@@ -2015,6 +2441,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             let result = MacOSSeatbelt.build_agent(&policy, None);
             assert!(
@@ -2120,12 +2547,9 @@ pub mod macos {
 
         #[test]
         fn agent_profile_includes_cf_user_text_encoding_when_home_set() {
-            // HOME is read by the profile generator; serialize against any
-            // other test that mutates HOME to avoid a flaky parallel race.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
-            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let expected = format!("(allow file-read* (literal \"{home}/.CFUserTextEncoding\"))");
+            let sbpl = sbpl_from_agent_profile(&agent_policy_with_home());
+            let expected =
+                format!("(allow file-read* (literal \"{TEST_HOME}/.CFUserTextEncoding\"))");
             assert!(
                 sbpl.contains(&expected),
                 "agent SBPL should grant read on $HOME/.CFUserTextEncoding, \
@@ -2135,15 +2559,13 @@ pub mod macos {
 
         #[test]
         fn agent_profile_claude_emits_dotclaude_json_regex() {
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::Claude),
             );
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
             // Build the expected ERE pattern the same way emit_claude_profile_rules
             // does: regex-escape the literal path and add the lock/tmp suffix.
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected = format!(
                 "(allow file-read* file-write* (regex #\"^{escaped_home}/\\.claude\\.json(\\.lock|\\.tmp\\..*)?$\"))"
             );
@@ -2153,7 +2575,7 @@ pub mod macos {
                  expected line: {expected}\ngot:\n{sbpl}"
             );
             let expected_lock =
-                format!("(allow file-read* file-write* (literal \"{home}/.claude.lock\"))");
+                format!("(allow file-read* file-write* (literal \"{TEST_HOME}/.claude.lock\"))");
             assert!(
                 sbpl.contains(&expected_lock),
                 "Claude profile SBPL should grant rw on ~/.claude.lock, \
@@ -2178,7 +2600,6 @@ pub mod macos {
             // otherwise `security` reads/writes fail under the relaxed
             // profile too and the `~/Library/Keychains/` write rule we add is
             // pointless.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let relaxed = sbpl_from_agent_profile_with_kind(
                 &agent_policy_empty(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
@@ -2209,13 +2630,11 @@ pub mod macos {
             // `ClaudeRelaxed` must be a superset of `Claude`: the base
             // `.claude.json` regex and `.claude.lock` literal must both appear,
             // alongside the relaxed extras.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
             );
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected_json = format!(
                 "(allow file-read* file-write* (regex #\"^{escaped_home}/\\.claude\\.json(\\.lock|\\.tmp\\..*)?$\"))"
             );
@@ -2225,7 +2644,7 @@ pub mod macos {
                  expected line: {expected_json}\ngot:\n{sbpl}"
             );
             let expected_lock =
-                format!("(allow file-read* file-write* (literal \"{home}/.claude.lock\"))");
+                format!("(allow file-read* file-write* (literal \"{TEST_HOME}/.claude.lock\"))");
             assert!(
                 sbpl.contains(&expected_lock),
                 "ClaudeRelaxed must inherit the base .claude.lock rule from Claude, \
@@ -2256,12 +2675,27 @@ pub mod macos {
         }
 
         #[test]
+        fn quote_in_home_is_refused_in_regex_rules() {
+            use super::super::{AgentProfileKind, SandboxError};
+
+            let policy = super::super::AgentPolicy {
+                home: Some(PathBuf::from("/Users/a\"b")),
+                ..agent_policy_with_home()
+            };
+            for kind in [AgentProfileKind::Claude, AgentProfileKind::ClaudeRelaxed] {
+                let result = MacOSSeatbelt.build_agent(&policy, Some(kind));
+                assert!(
+                    matches!(result, Err(SandboxError::QuoteInRegexPath(_))),
+                    "{kind:?}: expected QuoteInRegexPath, got: {:?}",
+                    result.map(|_| ())
+                );
+            }
+        }
+
+        #[test]
         fn agent_profile_emits_relaxed_bundle_for_claude_relaxed_kind() {
-            // Lock ENV_MUTEX — the relaxed bundle consults HOME for both the
-            // GlobalPreferences regex and the shell-dotfile literal paths.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
-                &agent_policy_empty(),
+                &agent_policy_with_home(),
                 Some(super::super::AgentProfileKind::ClaudeRelaxed),
             );
 
@@ -2288,8 +2722,7 @@ pub mod macos {
             );
 
             // GlobalPreferences plist regex.
-            let home = std::env::var("HOME").expect("HOME should be set in test env");
-            let escaped_home = super::regex_escape(&home);
+            let escaped_home = super::regex_escape(TEST_HOME);
             let expected_regex = format!(
                 "(allow file-read* (regex #\"^{escaped_home}/Library/Preferences/(ByHost/)?\\.GlobalPreferences.*\\.plist$\"))"
             );
@@ -2301,7 +2734,7 @@ pub mod macos {
 
             // Shell init dotfiles.
             for rc in [".bashrc", ".zshrc", ".profile", ".zshenv"] {
-                let expected = format!("(allow file-read* (literal \"{home}/{rc}\"))");
+                let expected = format!("(allow file-read* (literal \"{TEST_HOME}/{rc}\"))");
                 assert!(
                     sbpl.contains(&expected),
                     "ClaudeRelaxed SBPL should allow {rc}, got:\n{sbpl}"
@@ -2312,7 +2745,6 @@ pub mod macos {
         #[test]
         fn agent_profile_omits_relaxed_bundle_for_plain_claude_kind() {
             // The standard Claude profile must NOT emit any of the relaxed extras.
-            let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
             let sbpl = sbpl_from_agent_profile_with_kind(
                 &agent_policy_empty(),
                 Some(super::super::AgentProfileKind::Claude),
@@ -2377,6 +2809,571 @@ pub mod macos {
                 "tool SBPL must not grant loopback UDP bind, got:\n{sbpl}"
             );
         }
+
+        // ── `tmpdir` field (replaces the former `std::env::var("TMPDIR")` read) ─
+
+        #[test]
+        fn agent_profile_tmpdir_field_grants_canonical_scratch_access() {
+            let tmp = tempfile::tempdir().unwrap();
+            let policy = super::super::AgentPolicy {
+                tmpdir: Some(tmp.path().to_path_buf()),
+                requires_network: true,
+                requires_terminal: true,
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            let canonical = std::fs::canonicalize(tmp.path()).unwrap();
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* file-write* (subpath \"{}\"))",
+                    canonical.display()
+                )),
+                "agent SBPL should grant rw on the canonical form of `tmpdir`, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_without_tmpdir_omits_scratch_grant() {
+            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+            assert!(
+                !sbpl.contains("file-read* file-write* (subpath"),
+                "agent SBPL must not grant TMPDIR-style scratch access when `tmpdir` is \
+                 None, got:\n{sbpl}"
+            );
+        }
+
+        // ── Agent reaches the daemon via `runtime_base` regardless of network ──
+
+        #[test]
+        fn agent_profile_grants_runtime_base_socket_access() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let policy = super::super::AgentPolicy {
+                requires_network: false,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            let socket = base.join("airlock.sock");
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* (literal \"{}\"))",
+                    socket.display()
+                )),
+                "agent SBPL should grant file-read* on the runtime socket, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow network-outbound (remote unix-socket (path-literal \"{}\")))",
+                    socket.display()
+                )),
+                "agent SBPL should grant an explicit unix-socket connect to the runtime \
+                 socket even when requires_network is false, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn agent_profile_without_runtime_base_omits_socket_access_rule() {
+            let sbpl = sbpl_from_agent_profile(&agent_policy_empty());
+            assert!(
+                !sbpl.contains("remote unix-socket"),
+                "agent SBPL must not grant a remote unix-socket connect when \
+                 runtime_base is None, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("airlock.sock"),
+                "agent SBPL must not mention airlock.sock when runtime_base is None, \
+                 got:\n{sbpl}"
+            );
+        }
+
+        // ── Proxy tool CA cert read grant (single file) ─────────────────────
+
+        #[test]
+        fn proxy_ca_cert_single_file_read_grant_survives_final_denies() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let ca_dir = base.join("ca");
+            std::fs::create_dir(&ca_dir).unwrap();
+            let ca_path = ca_dir.join("abc123.pem");
+            std::fs::write(&ca_path, b"cert").unwrap();
+
+            let policy = ToolPolicy {
+                read_paths: vec![ca_path.clone()],
+                network: NetworkAccess::ProxyOnly(4242),
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(allow file-read* (subpath \"{}\"))",
+                    ca_path.display()
+                )),
+                "a proxy tool's session CA cert should be readable via `read_paths`, \
+                 got:\n{sbpl}"
+            );
+            // The base write-deny does not cover reads, and the admin-token
+            // read-deny is scoped to that one literal — neither shadows this.
+            assert!(
+                !sbpl.contains(&format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    ca_path.display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        // ── F9 / B7: the final deny rules ────────────────────────────────────
+
+        /// The three rules [`super::emit_final_denies`] appends, in order, for
+        /// the given `git_hooks` and `base` paths.
+        fn expected_final_denies(
+            git_hooks: &std::path::Path,
+            base: &std::path::Path,
+        ) -> [String; 3] {
+            [
+                format!("(deny file-write* (subpath \"{}\"))", git_hooks.display()),
+                format!("(deny file-write* (subpath \"{}\"))", base.display()),
+                format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    base.join("admin.token").display()
+                ),
+            ]
+        }
+
+        /// Asserts that the SBPL's last three non-empty lines are exactly the
+        /// F9 and runtime-base denies, in that order — the structural
+        /// guarantee B7 requires regardless of what allow rules precede them
+        /// (a `$TMPDIR` grant, a grant equal to the base, a grant that is an
+        /// ancestor of the base, or built-in profile rules).
+        fn assert_ends_with_final_denies(
+            sbpl: &str,
+            git_hooks: &std::path::Path,
+            base: &std::path::Path,
+        ) {
+            let expected = expected_final_denies(git_hooks, base);
+            let lines: Vec<&str> = sbpl.trim_end().lines().collect();
+            assert!(
+                lines.len() >= expected.len(),
+                "SBPL too short to contain the final denies, got:\n{sbpl}"
+            );
+            let tail = &lines[lines.len() - expected.len()..];
+            for (actual, expected) in tail.iter().zip(expected.iter()) {
+                assert_eq!(
+                    actual, expected,
+                    "final denies out of order; got full SBPL:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_tmpdir_write_grant() {
+            // Simulates a tool whose config grants `extra_write = ["$TMPDIR"]`
+            // — the write grant lands in `read_write_paths`, since ToolPolicy
+            // itself never grants `$TMPDIR` automatically (see
+            // `tool_profile_tmpdir_field_grants_nothing_automatically`).
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![base.clone()],
+                network: NetworkAccess::Full,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_grant_equal_to_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![base.clone()],
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_tool_profile_final_denies_are_last_with_a_grant_that_is_a_parent_of_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = parent.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                read_write_paths: vec![parent.clone()],
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_tmpdir_write_grant() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                tmpdir: Some(base.clone()),
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_grant_equal_to_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                read_write_paths: vec![base.clone()],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_agent_profile_final_denies_are_last_with_a_grant_that_is_a_parent_of_the_base() {
+            let tmp = tempfile::tempdir().unwrap();
+            let parent = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = parent.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = super::super::AgentPolicy {
+                read_write_paths: vec![parent.clone()],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base.clone()),
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_agent_profile(&policy);
+            assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+        }
+
+        #[test]
+        fn b7_final_denies_are_last_for_claude_and_claude_relaxed_profiles() {
+            // The Claude-specific rules (emit_profile_rules) are emitted
+            // before the socket-access and network blocks; this proves the
+            // final denies still land after them, not just after the
+            // generic filesystem/network rules.
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            for kind in [
+                super::super::AgentProfileKind::Claude,
+                super::super::AgentProfileKind::ClaudeRelaxed,
+            ] {
+                let policy = super::super::AgentPolicy {
+                    read_paths: vec![],
+                    read_write_paths: vec![base.clone()],
+                    requires_network: true,
+                    requires_terminal: true,
+                    runtime_base: Some(base.clone()),
+                    tmpdir: Some(base.clone()),
+                    home: Some(PathBuf::from(TEST_HOME)),
+                    git_hooks_deny: Some(git_hooks.clone()),
+                };
+                let sbpl = sbpl_from_agent_profile_with_kind(&policy, Some(kind));
+                assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
+            }
+        }
+
+        #[test]
+        fn git_hooks_deny_emits_rule_when_set() {
+            let git_hooks = PathBuf::from("/project/.git/hooks");
+            let policy = ToolPolicy {
+                git_hooks_deny: Some(git_hooks.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    git_hooks.display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn git_hooks_deny_omitted_when_none() {
+            let sbpl = sbpl_from_profile(&empty_policy());
+            assert!(
+                !sbpl.contains(".git/hooks"),
+                "SBPL must not mention .git/hooks when git_hooks_deny is None, got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn runtime_base_denies_emitted_when_set() {
+            let tmp = tempfile::tempdir().unwrap();
+            let base = std::fs::canonicalize(tmp.path()).unwrap();
+            let policy = ToolPolicy {
+                runtime_base: Some(base.clone()),
+                ..Default::default()
+            };
+            let sbpl = sbpl_from_profile(&policy);
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-write* (subpath \"{}\"))",
+                    base.display()
+                )),
+                "got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains(&format!(
+                    "(deny file-read* (literal \"{}\"))",
+                    base.join("admin.token").display()
+                )),
+                "got:\n{sbpl}"
+            );
+        }
+
+        #[test]
+        fn runtime_base_denies_omitted_when_none() {
+            let sbpl = sbpl_from_profile(&empty_policy());
+            assert!(
+                !sbpl.contains("admin.token"),
+                "SBPL must not mention admin.token when runtime_base is None, got:\n{sbpl}"
+            );
+        }
+
+        // ── Ignored: needs a real nested sandbox (see module docs) ──────────
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn agent_profile_isolates_runtime_base_from_tmpdir_grant() {
+            use std::os::unix::net::UnixListener;
+            use std::os::unix::process::CommandExt;
+            use std::process::Command;
+
+            // `base` sits inside `tmp`, mirroring the real layout where the
+            // runtime base is normally the same directory as `$TMPDIR`.
+            let tmp = tempfile::tempdir().unwrap();
+            let tmp_path = std::fs::canonicalize(tmp.path()).unwrap();
+            let base = tmp_path.join("airlock");
+            std::fs::create_dir(&base).unwrap();
+            std::fs::write(base.join("admin.token"), b"secret").unwrap();
+            let socket_path = base.join("airlock.sock");
+            let listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+            std::thread::spawn(move || for _ in listener.incoming() {});
+
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: false,
+                runtime_base: Some(base.clone()),
+                tmpdir: Some(tmp_path.clone()),
+                home: None,
+                git_hooks_deny: None,
+            };
+
+            let profile = MacOSSeatbelt
+                .build_agent(&policy, None)
+                .expect("agent profile should build");
+            // usize round-trip keeps the captured value Send for pre_exec —
+            // the pointer is only dereferenced in the child, after fork, and
+            // `profile` (which owns the bytes) outlives `cmd.status()` below.
+            let sbpl_addr = profile.as_ptr() as usize;
+
+            // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
+            // admin.token WAS readable, bit 2 = the socket connect FAILED.
+            // A correctly isolated sandbox exits 0.
+            // The write probe runs in a subshell: a failed redirection on the
+            // `:` special builtin ends a POSIX shell, which would read as a
+            // probe result. macOS's BSD `nc` always exits 1 for `-z` with
+            // `-U`, so the connect probe is a plain `nc -U` that exits as
+            // soon as its stdin is at EOF.
+            let probe_script = format!(
+                r#"
+                code=0
+                if ( : > "{base}/probe" ) 2>/dev/null; then code=1; fi
+                if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
+                if ! nc -U "{base}/airlock.sock" </dev/null >/dev/null 2>&1; then code=$((code | 4)); fi
+                exit "$code"
+                "#,
+                base = base.display(),
+            );
+
+            let mut cmd = Command::new("/bin/sh");
+            cmd.arg("-c").arg(&probe_script);
+            // SAFETY: sandbox_init takes only its own argument and a
+            // thread-local error pointer; no allocation; same call made by
+            // exec::spawn() in production.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let sbpl_ptr = sbpl_addr as *const std::os::raw::c_char;
+                    let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+                    if crate::sandbox::macos::sandbox_init(sbpl_ptr, 0, &mut errorbuf) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+
+            let status = cmd.status().expect("probe process should spawn");
+            let code = status.code().unwrap_or(-1);
+            assert_eq!(
+                code, 0,
+                "bit 0 (1) = base write NOT denied, bit 1 (2) = admin.token WAS \
+                 readable, bit 2 (4) = socket connect FAILED; got exit code {code}"
+            );
+        }
+
+        // ── ToolAccess levels (needs a real nested sandbox) ──────────────────
+
+        /// Run `program` under `profile` and return its output. Mirrors the
+        /// `pre_exec`/`sandbox_init` pattern in
+        /// `agent_profile_isolates_runtime_base_from_tmpdir_grant` above.
+        fn run_under_profile(
+            profile: &super::SandboxProfile,
+            program: &str,
+            args: &[&str],
+        ) -> std::process::Output {
+            use std::os::unix::process::CommandExt;
+            use std::process::Command;
+
+            let sbpl_addr = profile.as_ptr() as usize;
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            // SAFETY: sandbox_init takes only its own argument and a
+            // thread-local error pointer; no allocation; same call made by
+            // exec::spawn() in production. `profile` outlives this call.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let sbpl_ptr = sbpl_addr as *const std::os::raw::c_char;
+                    let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+                    if crate::sandbox::macos::sandbox_init(sbpl_ptr, 0, &mut errorbuf) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.output().expect("probe process should spawn")
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_none_runs_echo_but_denies_system_paths() {
+            // Empirically determined minimum (see `emit_none_filesystem_baseline`):
+            // verified directly with `sandbox-exec` before being ported here.
+            let policy = ToolPolicy {
+                access: ToolAccess::None,
+                binary_path: Some(PathBuf::from("/bin/echo")),
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("none-access profile should build");
+
+            let echo = run_under_profile(&profile, "/bin/echo", &["hi"]);
+            assert!(
+                echo.status.success(),
+                "echo should run under ToolAccess::None, stderr:\n{}",
+                String::from_utf8_lossy(&echo.stderr)
+            );
+            assert_eq!(echo.stdout, b"hi\n");
+
+            let cat = run_under_profile(&profile, "/bin/cat", &["/etc/hosts"]);
+            assert!(
+                !cat.status.success(),
+                "reading /etc/hosts must fail under ToolAccess::None"
+            );
+
+            let ls = run_under_profile(&profile, "/bin/ls", &["/usr/share"]);
+            assert!(
+                !ls.status.success(),
+                "listing /usr/share must fail under ToolAccess::None"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_system_reads_etc_but_denies_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            let policy = ToolPolicy {
+                access: ToolAccess::System,
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("system-access profile should build");
+
+            let hosts = run_under_profile(&profile, "/bin/cat", &["/etc/hosts"]);
+            assert!(
+                hosts.status.success(),
+                "reading /etc/hosts should succeed under ToolAccess::System, stderr:\n{}",
+                String::from_utf8_lossy(&hosts.stderr)
+            );
+
+            let listing = run_under_profile(&profile, "/bin/ls", &[root]);
+            assert!(
+                !listing.status.success(),
+                "listing toolchain root {root} must fail under ToolAccess::System"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_default_reads_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            let policy = ToolPolicy {
+                access: ToolAccess::Default,
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("default-access profile should build");
+
+            let listing = run_under_profile(&profile, "/bin/ls", &[root]);
+            assert!(
+                listing.status.success(),
+                "listing toolchain root {root} should succeed under ToolAccess::Default, \
+                 stderr:\n{}",
+                String::from_utf8_lossy(&listing.stderr)
+            );
+        }
     }
 }
 
@@ -2392,7 +3389,8 @@ pub mod linux {
     };
 
     use super::{
-        AgentPolicy, NetworkAccess, SandboxBackend, SandboxError, SandboxProfile, ToolPolicy,
+        AgentPolicy, NetworkAccess, SandboxBackend, SandboxError, SandboxProfile, TOOLCHAIN_ROOTS,
+        ToolAccess, ToolPolicy,
     };
 
     /// Convert any `Display`-able Landlock error into a [`SandboxError::ProfileBuildError`].
@@ -2443,6 +3441,31 @@ pub mod linux {
         "/dev/random",
         "/dev/urandom",
     ];
+
+    /// Baseline read-only paths for [`ToolAccess::None`]: the dynamic loader,
+    /// libc, and the loader's own cache file — the bare minimum a
+    /// dynamically linked binary needs to resolve its shared libraries and
+    /// then exit. No shared data, no other system binaries, no system
+    /// configuration beyond the loader cache.
+    const LINUX_NONE_BASELINE_READ_PATHS: &[&str] = &[
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+        "/dev/null",
+    ];
+
+    /// Returns the baseline read-only path list for a [`ToolAccess`] level,
+    /// before the caller appends [`TOOLCHAIN_ROOTS`] for
+    /// [`ToolAccess::Default`]. A pure function (no kernel/Landlock
+    /// involved) so it can be unit-tested directly.
+    fn baseline_paths_for_access(access: ToolAccess) -> &'static [&'static str] {
+        match access {
+            ToolAccess::None => LINUX_NONE_BASELINE_READ_PATHS,
+            ToolAccess::System | ToolAccess::Default => LINUX_BASELINE_READ_PATHS,
+        }
+    }
 
     /// Extended baseline read-only paths granted to every agent process.
     ///
@@ -2649,14 +3672,16 @@ pub mod linux {
 
     /// Build a Landlock profile from explicit path lists and a baseline slice.
     ///
-    /// Shared by `LinuxLandlock::build` (tool baseline) and
-    /// `LinuxLandlock::build_agent` (agent baseline + `/usr/sbin`).
-    /// The caller selects the baseline constant; all other logic is identical.
+    /// Shared by `LinuxLandlock::build` (tool baseline, `binary_path: Some`)
+    /// and `LinuxLandlock::build_agent` (agent baseline + `/usr/sbin`,
+    /// `binary_path: None` — `AgentPolicy` has no such field). The caller
+    /// selects the baseline constant; all other logic is identical.
     fn build_landlock_profile(
         baseline: &[&str],
         read_paths: &[std::path::PathBuf],
         read_write_paths: &[std::path::PathBuf],
         network: NetworkAccess,
+        binary_path: Option<&std::path::Path>,
     ) -> Result<SandboxProfile, SandboxError> {
         let abi = ABI::V1;
 
@@ -2707,6 +3732,25 @@ pub mod linux {
                 .map_err(to_profile_err)?;
         }
 
+        // ── The tool's own binary ──────────────────────────────────────────
+        // Granted at every access level, mirroring macOS's unconditional
+        // `(allow file-read* (literal <binary>))`: `access` governs only the
+        // built-in baseline, not a tool's own grants. Landlock ties execute
+        // rights to path coverage, so without this a tool whose binary sits
+        // outside the baseline and outside `read_paths`/`read_write_paths`
+        // (any tool under `ToolAccess::None`; any tool installed to
+        // `~/.cargo/bin`, `~/.local/bin`, etc. at every level) cannot exec at
+        // all. The path is a single file, so `read_access_for_path` already
+        // returns the file-compatible `Execute | ReadFile` subset.
+        if let Some(binary) = binary_path
+            && let Ok(path_fd) = PathFd::new(binary)
+        {
+            let access = read_access_for_path(binary, abi);
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(path_fd, access))
+                .map_err(to_profile_err)?;
+        }
+
         // ── Baseline read-only system paths ───────────────────────────────
         // Always-allowed reads for the dynamic linker, libc, system
         // config, and entropy. Mirrors the macOS Seatbelt baseline so
@@ -2716,7 +3760,12 @@ pub mod linux {
             let Ok(path_fd) = PathFd::new(path) else {
                 continue;
             };
-            let access = read_access_for_path(std::path::Path::new(path), abi);
+            let mut access = read_access_for_path(std::path::Path::new(path), abi);
+            // Shells open /dev/null for writing on every `2>/dev/null`; the
+            // macOS baseline grants the same.
+            if *path == "/dev/null" {
+                access |= AccessFs::WriteFile;
+            }
             ruleset = ruleset
                 .add_rule(PathBeneath::new(path_fd, access))
                 .map_err(to_profile_err)?;
@@ -2799,11 +3848,16 @@ pub mod linux {
 
     impl SandboxBackend for LinuxLandlock {
         fn build(&self, policy: &ToolPolicy) -> Result<SandboxProfile, SandboxError> {
+            let mut baseline: Vec<&str> = baseline_paths_for_access(policy.access).to_vec();
+            if policy.access == ToolAccess::Default {
+                baseline.extend_from_slice(TOOLCHAIN_ROOTS);
+            }
             build_landlock_profile(
-                LINUX_BASELINE_READ_PATHS,
+                &baseline,
                 &policy.read_paths,
                 &policy.read_write_paths,
                 policy.network,
+                policy.binary_path.as_deref(),
             )
         }
 
@@ -2820,6 +3874,7 @@ pub mod linux {
                 &policy.read_paths,
                 &policy.read_write_paths,
                 NetworkAccess::Full,
+                None,
             )
         }
     }
@@ -2830,15 +3885,25 @@ pub mod linux {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
-        use super::{FdClosedProbe, LinuxLandlock, check_landlock_availability};
+        use super::super::{
+            NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
+        };
+        use super::{
+            FdClosedProbe, LINUX_BASELINE_READ_PATHS, LinuxLandlock, check_landlock_availability,
+        };
 
+        // Pinned to `ToolAccess::System` for the same reason as the macOS
+        // test helpers: these predate `access` and assume today's
+        // unconditional baseline, independent of whatever the default
+        // level becomes.
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -2848,6 +3913,8 @@ pub mod linux {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -2857,6 +3924,8 @@ pub mod linux {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
+                ..Default::default()
             }
         }
 
@@ -2951,6 +4020,7 @@ pub mod linux {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             let profile = LinuxLandlock
                 .build_agent(&policy, None)
@@ -2989,6 +4059,50 @@ pub mod linux {
             );
         }
 
+        // ── ToolAccess baseline path-set (pure function, no kernel needed) ───
+
+        #[test]
+        fn baseline_paths_for_access_none_excludes_system_extras() {
+            use super::{LINUX_NONE_BASELINE_READ_PATHS, baseline_paths_for_access};
+
+            let none = baseline_paths_for_access(super::super::ToolAccess::None);
+            assert_eq!(none, LINUX_NONE_BASELINE_READ_PATHS);
+            assert!(
+                none.contains(&"/usr/lib"),
+                "None baseline should include /usr/lib"
+            );
+            assert!(
+                none.contains(&"/etc/ld.so.cache"),
+                "None baseline should include the loader cache file"
+            );
+            assert!(
+                !none.contains(&"/usr/share"),
+                "None baseline must not include /usr/share"
+            );
+            assert!(
+                !none.contains(&"/etc"),
+                "None baseline must not include the whole of /etc, only ld.so.cache"
+            );
+            assert!(
+                !none.contains(&"/usr/bin") && !none.contains(&"/bin"),
+                "None baseline must not include system binary directories"
+            );
+        }
+
+        #[test]
+        fn baseline_paths_for_access_system_and_default_share_the_full_baseline() {
+            use super::baseline_paths_for_access;
+
+            assert_eq!(
+                baseline_paths_for_access(super::super::ToolAccess::System),
+                LINUX_BASELINE_READ_PATHS
+            );
+            assert_eq!(
+                baseline_paths_for_access(super::super::ToolAccess::Default),
+                LINUX_BASELINE_READ_PATHS
+            );
+        }
+
         // ── build_platform_agent_sandbox_profile smoke test (Linux) ──────────
 
         #[test]
@@ -2998,9 +4112,289 @@ pub mod linux {
                 read_write_paths: vec![],
                 requires_network: true,
                 requires_terminal: true,
+                ..Default::default()
             };
             super::super::build_platform_agent_sandbox_profile(&policy, None)
                 .expect("build_platform_agent_sandbox_profile should return Ok on Linux");
+        }
+
+        // ── Runtime base: Landlock has no carve-out, so nothing grants it ────
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_profile_can_redirect_to_dev_null() {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = LinuxLandlock
+                .build(&ToolPolicy {
+                    network: NetworkAccess::None,
+                    ..Default::default()
+                })
+                .expect("tool profile should build");
+            let mut env = std::collections::HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            let request = crate::exec::ExecRequest {
+                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                arg0: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "echo hidden >/dev/null 2>/dev/null".to_string(),
+                ],
+                work_dir: std::fs::canonicalize(tmp.path()).unwrap(),
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            let status = spawned.child.wait().await.expect("wait should succeed");
+            assert!(
+                status.success(),
+                "redirecting to /dev/null failed: {status:?}"
+            );
+        }
+
+        // ── ToolAccess levels (needs a real nested sandbox) ──────────────────
+
+        /// Build a tool profile at `access` with `/bin/sh` as `binary_path`
+        /// (the grant every tool's own binary gets at every level — see
+        /// `ToolPolicy::binary_path`), spawn `/bin/sh -c script` under it,
+        /// and return its exit status.
+        async fn run_under_access(access: ToolAccess, script: &str) -> std::process::ExitStatus {
+            let tmp = tempfile::tempdir().unwrap();
+            let sh = std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist");
+            let profile = LinuxLandlock
+                .build(&ToolPolicy {
+                    access,
+                    binary_path: Some(sh.clone()),
+                    network: NetworkAccess::None,
+                    ..Default::default()
+                })
+                .expect("tool profile should build");
+            let mut env = std::collections::HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            let request = crate::exec::ExecRequest {
+                binary: sh,
+                arg0: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                work_dir: std::fs::canonicalize(tmp.path()).unwrap(),
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            spawned.child.wait().await.expect("wait should succeed")
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_none_runs_sh_but_denies_etc() {
+            // `exit 0` and the `exec 3<...` redirection below are both shell
+            // builtins — neither forks/execs a second binary — so this
+            // proves the `binary_path` grant on `/bin/sh` alone (no baseline
+            // `/bin` or `/usr/bin` grant, which `ToolAccess::None` doesn't
+            // have) is what lets the tool's own binary exec at all.
+            let ran = run_under_access(ToolAccess::None, "exit 0").await;
+            assert!(
+                ran.success(),
+                "sh itself should exec under ToolAccess::None with only binary_path \
+                 granted, got {ran:?}"
+            );
+
+            let denied = run_under_access(ToolAccess::None, "exec 3</etc/hosts").await;
+            assert!(
+                !denied.success(),
+                "reading /etc/hosts must fail under ToolAccess::None, got {denied:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_system_reads_etc_but_denies_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            // `cat`/`ls` here are external binaries, covered by the `system`
+            // baseline's `/bin`+`/usr/bin` grants, not by `binary_path`
+            // (which only covers `sh` itself).
+            let hosts_status =
+                run_under_access(ToolAccess::System, "cat /etc/hosts >/dev/null").await;
+            assert!(
+                hosts_status.success(),
+                "reading /etc/hosts should succeed under ToolAccess::System, got {hosts_status:?}"
+            );
+
+            let listing_status =
+                run_under_access(ToolAccess::System, &format!("ls {root} >/dev/null")).await;
+            assert!(
+                !listing_status.success(),
+                "listing toolchain root {root} must fail under ToolAccess::System, \
+                 got {listing_status:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_default_reads_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            let listing_status =
+                run_under_access(ToolAccess::Default, &format!("ls {root} >/dev/null")).await;
+            assert!(
+                listing_status.success(),
+                "listing toolchain root {root} should succeed under ToolAccess::Default, \
+                 got {listing_status:?}"
+            );
+        }
+
+        #[test]
+        fn landlock_baseline_never_grants_tmp_or_run_user() {
+            // The runtime base lives under /run/user/<uid> or /tmp (see
+            // runtime_dir.rs). Landlock is allow-only and cannot carve a
+            // subtree back out of a grant, so the only protection is that
+            // nothing in the default baseline grants either path — the
+            // anchor check (anchors.rs) refuses any config or `--allow-write`
+            // that would.
+            use super::{LINUX_AGENT_BASELINE_READ_PATHS, LINUX_BASELINE_READ_PATHS};
+
+            for path in LINUX_BASELINE_READ_PATHS
+                .iter()
+                .chain(LINUX_AGENT_BASELINE_READ_PATHS.iter())
+            {
+                assert_ne!(*path, "/tmp", "the baseline must not grant /tmp");
+                assert!(
+                    !path.starts_with("/run/user"),
+                    "the baseline must not grant /run/user, got {path}"
+                );
+            }
+        }
+
+        #[test]
+        fn landlock_tool_build_ignores_the_runtime_base_field() {
+            // `runtime_base` exists on `ToolPolicy` for parity with macOS
+            // (whose Seatbelt builder reads it to emit the final deny
+            // rules); `build_landlock_profile` never reads it, so setting it
+            // — to a path absent from read_paths/read_write_paths — must not
+            // change, gate, or fail the build.
+            let base = tempfile::tempdir().unwrap();
+            let base_path = std::fs::canonicalize(base.path()).unwrap();
+
+            let mut policy = read_write_policy("/tmp");
+            policy.runtime_base = Some(base_path);
+            LinuxLandlock
+                .build(&policy)
+                .expect("build must succeed with runtime_base set");
+        }
+
+        #[test]
+        fn landlock_agent_build_ignores_the_runtime_base_field() {
+            let base = tempfile::tempdir().unwrap();
+            let base_path = std::fs::canonicalize(base.path()).unwrap();
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![],
+                requires_network: true,
+                requires_terminal: true,
+                runtime_base: Some(base_path),
+                ..Default::default()
+            };
+            LinuxLandlock
+                .build_agent(&policy, None)
+                .expect("build_agent must succeed with runtime_base set");
+        }
+
+        // ── Ignored: needs a real nested sandbox (see module docs) ──────────
+
+        /// Proves the only protection Linux has for the runtime base: nothing
+        /// grants it, so a sandboxed agent cannot write into it or read
+        /// `admin.token` inside it — while still being able to connect to a
+        /// listening unix socket there, since Landlock (through ABI v4, the
+        /// level this crate uses) only mediates TCP/UDP ports via `AccessNet`
+        /// and has no mechanism to restrict a path-based unix-socket
+        /// `connect()`.
+        ///
+        /// `base` is a sibling of the granted `work` directory, not nested
+        /// inside it — the real layout, since the anchor check refuses any
+        /// config that would put a write grant over or inside the base.
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn agent_profile_isolates_runtime_base_from_a_sibling_write_grant() {
+            use std::collections::HashMap;
+            use std::os::unix::net::UnixListener;
+
+            let tmp = tempfile::tempdir().unwrap();
+            let root = std::fs::canonicalize(tmp.path()).unwrap();
+            let work = root.join("work");
+            let base = root.join("base");
+            std::fs::create_dir(&work).unwrap();
+            std::fs::create_dir(&base).unwrap();
+            std::fs::write(base.join("admin.token"), b"secret").unwrap();
+            let socket_path = base.join("airlock.sock");
+            let _listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+
+            let policy = super::super::AgentPolicy {
+                read_paths: vec![],
+                read_write_paths: vec![work.clone()],
+                requires_network: true,
+                requires_terminal: false,
+                runtime_base: Some(base.clone()),
+                tmpdir: None,
+                home: None,
+                git_hooks_deny: None,
+            };
+            let profile = LinuxLandlock
+                .build_agent(&policy, None)
+                .expect("agent profile should build");
+
+            // Bitmask result: bit 0 = the base write was NOT denied, bit 1 =
+            // admin.token WAS readable, bit 2 = the socket connect FAILED.
+            // A correctly isolated sandbox exits 0.
+            // The write probe runs in a subshell: a failed redirection on the
+            // `:` special builtin ends a POSIX shell, which would read as a
+            // probe result.
+            let probe_script = format!(
+                r#"
+                code=0
+                if ( : > "{base}/probe" ) 2>"{work}/err"; then code=1; fi
+                if cat "{base}/admin.token" >"{work}/out" 2>"{work}/err"; then code=$((code | 2)); fi
+                if command -v nc >"{work}/out" 2>&1 &&
+                    ! nc -zU "{base}/airlock.sock" 2>"{work}/err"; then code=$((code | 4)); fi
+                exit "$code"
+                "#,
+                base = base.display(),
+                work = work.display(),
+            );
+
+            let mut env = HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+
+            let request = crate::exec::ExecRequest {
+                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                arg0: "sh".to_string(),
+                args: vec!["-c".to_string(), probe_script],
+                work_dir: work,
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            let status = spawned.child.wait().await.expect("wait should succeed");
+            let code = status.code().unwrap_or(-1);
+            assert_eq!(
+                code, 0,
+                "bit 0 (1) = base write NOT denied, bit 1 (2) = admin.token WAS \
+                 readable, bit 2 (4) = socket connect FAILED; got exit code {code}"
+            );
         }
     }
 }

@@ -1,0 +1,1466 @@
+//! Daemon tests: a real async server, started in-process (no fork), talked
+//! to over a real Unix socket in a temp runtime dir.
+
+use super::*;
+use crate::protocol::{
+    self, AdminRequest, AdminToken, Auth, ClientHello, RegisterPayload, RegisterRequest,
+    RequestBody, SandboxKind, SessionEnds, WireAnchors, WireMode,
+};
+use std::path::PathBuf;
+use std::time::Duration;
+
+// ─── Test harness ────────────────────────────────────────────────────────────
+
+/// Keeps the temp dir alive for the test's duration and gives access to the
+/// running daemon's state (socket path, admin token, etc.) without going
+/// through a real fork.
+struct TestDaemon {
+    state: Arc<DaemonState>,
+    admin_token: AdminToken,
+    _tmp: tempfile::TempDir,
+}
+
+impl TestDaemon {
+    async fn client(&self) -> TestClient {
+        TestClient::connect(&self.state.runtime.socket_path()).await
+    }
+}
+
+fn assert_error(reply: &DaemonMessage, kind: ErrorKind) {
+    assert!(
+        matches!(reply, DaemonMessage::Error { kind: k, .. } if *k == kind),
+        "expected a {kind:?} error, got {reply:?}"
+    );
+}
+
+/// Polls `done` until it holds, failing with `what` after `timeout`.
+async fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            panic!("{what}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+async fn start_test_daemon(mode: DaemonMode) -> TestDaemon {
+    start_test_daemon_with_idle(mode, Some(Duration::from_millis(150))).await
+}
+
+async fn start_test_daemon_with_idle(mode: DaemonMode, idle_exit: Option<Duration>) -> TestDaemon {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let runtime = RuntimeDir::at(tmp.path().join("rt"));
+    runtime.create_and_validate().expect("create_and_validate");
+
+    let listener = bind_owner_only(&runtime.socket_path()).expect("bind");
+    verify_socket_permissions(&runtime.socket_path()).expect("verify perms");
+
+    let admin_token = AdminToken::generate();
+    write_admin_token(&runtime.admin_token_path(), &admin_token).expect("write admin token");
+    let lock = acquire_startup_lock(&runtime.lock_path()).expect("acquire startup lock");
+
+    listener.set_nonblocking(true).expect("nonblocking");
+    let tokio_listener = tokio::net::UnixListener::from_std(listener).expect("from_std");
+
+    let state = DaemonState::new(
+        runtime,
+        admin_token.clone(),
+        lock,
+        mode,
+        idle_exit,
+        RingBuffer::new(),
+    );
+    let daemon = Daemon {
+        state: Arc::clone(&state),
+        listener: tokio_listener,
+    };
+    tokio::spawn(daemon.serve());
+
+    TestDaemon {
+        state,
+        admin_token,
+        _tmp: tmp,
+    }
+}
+
+/// A test client speaking the v2 protocol over a real socket.
+struct TestClient {
+    reader: tokio::io::BufReader<tokio::net::unix::OwnedReadHalf>,
+    writer: tokio::net::unix::OwnedWriteHalf,
+}
+
+impl TestClient {
+    async fn connect(socket: &Path) -> Self {
+        let stream = tokio::net::UnixStream::connect(socket)
+            .await
+            .expect("connect");
+        let (r, w) = stream.into_split();
+        TestClient {
+            reader: tokio::io::BufReader::new(r),
+            writer: w,
+        }
+    }
+
+    async fn send<T: serde::Serialize>(&mut self, value: &T) {
+        use tokio::io::AsyncWriteExt;
+        let line = protocol::encode_line(value);
+        self.writer.write_all(&line).await.expect("write");
+    }
+
+    async fn read(&mut self) -> DaemonMessage {
+        use tokio::io::AsyncBufReadExt;
+        let mut line = String::new();
+        let n = self.reader.read_line(&mut line).await.expect("read_line");
+        assert!(n > 0, "connection closed before a reply arrived");
+        serde_json::from_str(line.trim()).unwrap_or_else(|e| panic!("bad reply {line:?}: {e}"))
+    }
+
+    /// Full handshake with the real protocol version, discarding the
+    /// `Hello` reply.
+    async fn hello(&mut self) {
+        self.send(&ClientHello {
+            protocol: protocol::PROTOCOL_VERSION,
+            version: "test".to_string(),
+        })
+        .await;
+        let _ = self.read().await;
+    }
+
+    async fn hello_with_protocol(&mut self, version: u32) -> DaemonMessage {
+        self.send(&ClientHello {
+            protocol: version,
+            version: "test".to_string(),
+        })
+        .await;
+        self.read().await
+    }
+
+    /// Handshake, send one request, return its reply.
+    async fn request(&mut self, req: Request) -> DaemonMessage {
+        self.hello().await;
+        self.send(&req).await;
+        self.read().await
+    }
+}
+
+fn admin_request(admin_token: &AdminToken, body: AdminRequest) -> Request {
+    Request {
+        auth: Auth::Admin {
+            token: admin_token.clone(),
+        },
+        body: RequestBody::Admin(body),
+    }
+}
+
+fn session_request(token: crate::protocol::SessionToken, body: SessionRequest) -> Request {
+    Request {
+        auth: Auth::Session { token },
+        body: RequestBody::Session(body),
+    }
+}
+
+fn test_payload(root: &Path, toml_src: &str) -> RegisterPayload {
+    let raw: crate::config::RawConfig = toml::from_str(toml_src).expect("valid test TOML");
+    RegisterPayload {
+        root: root.to_path_buf(),
+        mode: WireMode::Default,
+        layers: Vec::new(),
+        config: raw,
+        secrets: Vec::new(),
+        env_snapshot: Default::default(),
+        path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        dropped_path: Vec::new(),
+        write_grants: Vec::new(),
+        anchors: WireAnchors {
+            runtime_base: PathBuf::from("/tmp/airlock-test-rt"),
+            trust_store: PathBuf::from("/tmp/airlock-test-trust"),
+            global_config: PathBuf::from("/tmp/airlock-test-global.toml"),
+        },
+        agent_hash: "deadbeef".to_string(),
+    }
+}
+
+fn with_secret(mut payload: RegisterPayload, label: &str, value: &str) -> RegisterPayload {
+    payload.secrets = vec![crate::protocol::WireSecret {
+        label: label.to_string(),
+        value: zeroize::Zeroizing::new(value.to_string()),
+    }];
+    payload
+}
+
+async fn register(
+    client: &mut TestClient,
+    admin_token: &AdminToken,
+    root: &Path,
+    toml_src: &str,
+    name: &str,
+    ends: SessionEnds,
+) -> (crate::protocol::SessionId, crate::protocol::SessionToken) {
+    let payload = test_payload(root, toml_src);
+    let req = admin_request(
+        admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: name.to_string(),
+            sandbox: SandboxKind::External,
+            ends,
+        })),
+    );
+    match client.request(req).await {
+        DaemonMessage::Registered { id, token, .. } => (id, token),
+        other => panic!("expected Registered, got {other:?}"),
+    }
+}
+
+// ─── Handshake ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn handshake_version_mismatch_gives_incompatible_protocol() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let mut client = daemon.client().await;
+
+    let hello = client
+        .hello_with_protocol(protocol::PROTOCOL_VERSION + 1)
+        .await;
+    assert!(matches!(hello, DaemonMessage::Hello { .. }));
+
+    let err = client.read().await;
+    assert_error(&err, ErrorKind::IncompatibleProtocol);
+}
+
+// ─── Admin auth ──────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn admin_auth_wrong_token_is_unauthorized() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let mut client = daemon.client().await;
+
+    let bad_token = AdminToken::generate();
+    let reply = client
+        .request(admin_request(&bad_token, AdminRequest::ListSessions))
+        .await;
+    assert_error(&reply, ErrorKind::Unauthorized);
+}
+
+#[tokio::test]
+async fn admin_auth_correct_token_succeeds() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let mut client = daemon.client().await;
+
+    let reply = client
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::ListSessions,
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Sessions { .. }), "{reply:?}");
+}
+
+#[tokio::test]
+async fn family_mismatch_is_unauthorized() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let mut client = daemon.client().await;
+
+    // An admin token presented with a session-family body.
+    let req = Request {
+        auth: Auth::Admin {
+            token: daemon.admin_token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::List),
+    };
+    let reply = client.request(req).await;
+    assert_error(&reply, ErrorKind::Unauthorized);
+}
+
+// ─── Session auth ────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn session_auth_unknown_token_gives_no_session() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let mut client = daemon.client().await;
+
+    let bogus = crate::protocol::SessionToken::generate(crate::protocol::SessionId::generate());
+    let reply = client
+        .request(session_request(bogus, SessionRequest::List))
+        .await;
+    assert_error(&reply, ErrorKind::NoSession);
+}
+
+#[tokio::test]
+async fn revoke_then_use_gives_session_ended() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "shell",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let mut admin2 = daemon.client().await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Revoke {
+                sessions: vec![id.to_string()],
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Ok), "{reply:?}");
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(token, SessionRequest::List))
+        .await;
+    assert_error(&reply, ErrorKind::SessionEnded);
+}
+
+#[tokio::test]
+async fn expired_ttl_gives_session_expired() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (_id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "shell",
+        SessionEnds::Ttl { secs: 0 },
+    )
+    .await;
+
+    // Force the session's TTL into the past directly, rather than waiting:
+    // the only thing under test is that `resolve_session` honors expiry.
+    {
+        let session = daemon.state.sessions.get(token.id()).unwrap();
+        *session.ends.write().unwrap() = crate::session::Ends::Ttl {
+            ttl: Duration::from_secs(1),
+            expires_at: std::time::SystemTime::now() - Duration::from_secs(10),
+        };
+    }
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(token, SessionRequest::List))
+        .await;
+    assert_error(&reply, ErrorKind::SessionExpired);
+}
+
+#[tokio::test]
+async fn process_tree_binding_refuses_a_non_descendant() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+
+    // An anchor that is not an ancestor of this test process: a `sleep`
+    // child of ours is a descendant of *us*, not the other way around.
+    let mut child = tokio::process::Command::new("sleep")
+        .arg("5")
+        .spawn()
+        .expect("spawn sleep");
+    let child_pid = child.id().expect("pid") as i32;
+    let anchor = crate::process_tree::proc_id(child_pid).expect("proc_id");
+
+    let session = Arc::new(Session::new(
+        crate::protocol::SessionId::generate(),
+        "outsider".to_string(),
+        PathBuf::from("/tmp"),
+        SandboxKind::External,
+        crate::session::Ends::Lease,
+        anchor,
+        crate::session::empty_policy(),
+    ));
+    let token = session.token.clone();
+    daemon.state.sessions.insert(session);
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(token, SessionRequest::List))
+        .await;
+    assert_error(&reply, ErrorKind::OutsideProcessTree);
+
+    let _ = child.kill().await;
+}
+
+// ─── Register / list / tools / check ────────────────────────────────────────
+
+#[tokio::test]
+async fn register_then_list_tools_and_check() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\ndescription = \"a shell\"\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let _ = admin;
+    let mut admin2 = daemon.client().await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::ListSessions,
+        ))
+        .await;
+    let DaemonMessage::Sessions { sessions } = reply else {
+        panic!("expected Sessions")
+    };
+    assert_eq!(sessions.len(), 1);
+    assert_eq!(sessions[0].id, id);
+    assert_eq!(sessions[0].name, "claude");
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(token.clone(), SessionRequest::List))
+        .await;
+    let DaemonMessage::Tools { tools, .. } = reply else {
+        panic!("expected Tools")
+    };
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "sh");
+    assert_eq!(tools[0].description, Some("a shell".to_string()));
+
+    let mut client2 = daemon.client().await;
+    let reply = client2
+        .request(session_request(token, SessionRequest::Check))
+        .await;
+    assert!(
+        matches!(reply, DaemonMessage::CheckResult { .. }),
+        "{reply:?}"
+    );
+}
+
+#[tokio::test]
+async fn reload_swaps_tools_and_reports_changes() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.gh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let session = daemon.state.sessions.get(&id).unwrap();
+    let old_policy = session.current_policy();
+
+    let mut admin2 = daemon.client().await;
+    let payload = test_payload(tmp.path(), "[tools.psql]\n");
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    let DaemonMessage::Reloaded { changes, .. } = reply else {
+        panic!("expected Reloaded, got {reply:?}")
+    };
+    assert!(changes.contains(&"tools +psql".to_string()), "{changes:?}");
+    assert!(changes.contains(&"tools -gh".to_string()), "{changes:?}");
+
+    // The earlier Arc the first caller held is still a valid, unmodified
+    // snapshot of the pre-reload policy.
+    assert!(old_policy.config.tools.contains_key("gh"));
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(token, SessionRequest::List))
+        .await;
+    let DaemonMessage::Tools { tools, .. } = reply else {
+        panic!("expected Tools")
+    };
+    assert_eq!(tools.len(), 1);
+    assert_eq!(tools[0].name, "psql");
+}
+
+#[tokio::test]
+async fn reload_never_drops_a_write_grant() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let root = tempfile::tempdir().unwrap();
+    let grant = tempfile::tempdir().unwrap();
+    let grant_bin = grant.path().join("bin");
+    std::fs::create_dir(&grant_bin).unwrap();
+
+    let mut register_payload = test_payload(root.path(), "[tools.gh]\n");
+    register_payload.write_grants = vec![grant.path().to_path_buf()];
+    let mut admin = daemon.client().await;
+    let reply = admin
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Register(Box::new(RegisterRequest {
+                payload: register_payload,
+                name: "claude".to_string(),
+                sandbox: SandboxKind::Airlock,
+                ends: SessionEnds::Ttl { secs: 3600 },
+            })),
+        ))
+        .await;
+    let DaemonMessage::Registered { id, .. } = reply else {
+        panic!("expected Registered, got {reply:?}")
+    };
+
+    // A launcher that forgot the agent's grant, and so left a directory
+    // inside it on `PATH`.
+    let mut reload_payload = test_payload(root.path(), "[tools.gh]\n");
+    reload_payload.path.insert(0, grant_bin.clone());
+    let mut admin2 = daemon.client().await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(reload_payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let policy = daemon.state.sessions.get(&id).unwrap().current_policy();
+    assert_eq!(policy.write_grants, vec![grant.path().to_path_buf()]);
+    assert!(
+        !policy.path.entries.contains(&grant_bin),
+        "{:?}",
+        policy.path
+    );
+    assert!(
+        policy
+            .path
+            .dropped
+            .iter()
+            .any(|(entry, reason)| entry == &grant_bin.to_string_lossy()
+                && reason == "writable from a sandbox"),
+        "{:?}",
+        policy.path.dropped
+    );
+    assert_eq!(
+        daemon.state.sessions.get(&id).unwrap().info().write_grants,
+        vec![grant.path().to_path_buf()]
+    );
+}
+
+// ─── Proxy CA lifecycle ───────────────────────────────────────────────────────
+
+fn proxy_config(host: &str) -> String {
+    format!("[tools.curl]\nproxy = true\n\n[[tools.curl.routes]]\nhost = {host:?}\n")
+}
+
+#[tokio::test]
+async fn reload_keeps_the_same_ca_when_routes_are_unchanged() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    let cert_before = std::fs::read(&ca_path).expect("CA file written at register");
+
+    // Reload with the same route (a static tool added alongside it is
+    // enough to make this a real reload, not a no-op).
+    let mut admin2 = daemon.client().await;
+    let mut toml = proxy_config("example.com");
+    toml.push_str("[tools.sh]\n");
+    let payload = test_payload(tmp.path(), &toml);
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let cert_after = std::fs::read(&ca_path).expect("CA file still present after reload");
+    assert_eq!(
+        cert_before, cert_after,
+        "unchanged routes should keep the same CA, not mint and rewrite a new one"
+    );
+}
+
+#[tokio::test]
+async fn reload_regenerates_the_ca_when_routes_change() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    let cert_before = std::fs::read(&ca_path).expect("CA file written at register");
+
+    let mut admin2 = daemon.client().await;
+    let payload = test_payload(tmp.path(), &proxy_config("other.example"));
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    let cert_after = std::fs::read(&ca_path).expect("CA file still present after reload");
+    assert_ne!(
+        cert_before, cert_after,
+        "a changed route must mint a new CA — the old one's name constraints don't cover it"
+    );
+}
+
+#[tokio::test]
+async fn reload_removes_the_ca_file_when_the_last_proxy_tool_is_dropped() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        &proxy_config("example.com"),
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    assert!(ca_path.exists(), "CA file should exist after register");
+
+    let mut admin2 = daemon.client().await;
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Reload {
+                session: id.to_string(),
+                payload: Box::new(payload),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Reloaded { .. }), "{reply:?}");
+
+    assert!(
+        !ca_path.exists(),
+        "dropping the session's last proxy tool should remove its CA file"
+    );
+}
+
+#[tokio::test]
+async fn end_session_removes_a_leftover_ca_file_even_without_a_proxy_tool() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    // No proxy tool in this session's config, but a CA file exists anyway —
+    // e.g. left behind by a reload from before `end_session` removed it
+    // unconditionally rather than only when the *current* policy has a
+    // proxy tool.
+    let ca_path = daemon.state.runtime.ca_path(id.as_str());
+    std::fs::write(&ca_path, b"stale CA").unwrap();
+    assert!(ca_path.exists());
+
+    daemon.state.end_session(&id, EndedReason::Revoked);
+    assert!(!ca_path.exists());
+}
+
+// ─── Revoke by prefix / name / ambiguity ─────────────────────────────────────
+
+#[tokio::test]
+async fn revoke_by_unique_prefix_and_name() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let _ = admin;
+    let prefix = &id.as_str()[..4];
+    let mut admin2 = daemon.client().await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Revoke {
+                sessions: vec![prefix.to_string()],
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Ok), "{reply:?}");
+    assert!(daemon.state.sessions.get(&id).is_none());
+}
+
+#[tokio::test]
+async fn revoke_ambiguous_ref_errors_and_revokes_nothing() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id_a, _) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "one",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+    let mut admin2 = daemon.client().await;
+    let (id_b, _) = register(
+        &mut admin2,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "two",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    // Find a common prefix length that matches both (there always is one:
+    // the empty string), long enough to still be ambiguous — the empty
+    // string itself always works since it prefixes every id.
+    let mut admin3 = daemon.client().await;
+    let reply = admin3
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Revoke {
+                sessions: vec![String::new()],
+            },
+        ))
+        .await;
+    assert_error(&reply, ErrorKind::Malformed);
+    assert!(daemon.state.sessions.get(&id_a).is_some());
+    assert!(daemon.state.sessions.get(&id_b).is_some());
+}
+
+// ─── Renew ───────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn renew_restarts_the_ttl() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "shell",
+        SessionEnds::Ttl { secs: 1 },
+    )
+    .await;
+
+    let _ = admin;
+    let mut admin2 = daemon.client().await;
+    let reply = admin2
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Renew {
+                session: id.to_string(),
+                ttl_secs: Some(3600),
+            },
+        ))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Ok), "{reply:?}");
+
+    let session = daemon.state.sessions.get(&id).unwrap();
+    let expired = session
+        .ends
+        .read()
+        .unwrap()
+        .is_expired(std::time::SystemTime::now());
+    assert!(!expired);
+}
+
+#[tokio::test]
+async fn renew_refuses_a_lease_session() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    // A lease session keeps its connection open, so register it from a
+    // background task and keep the handle alive for the duration of this
+    // test.
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let mut lease_conn = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "run".to_string(),
+            sandbox: SandboxKind::Airlock,
+            ends: SessionEnds::Lease,
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = lease_conn.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    let mut admin = daemon.client().await;
+    let reply = admin
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Renew {
+                session: id.to_string(),
+                ttl_secs: None,
+            },
+        ))
+        .await;
+    assert_error(&reply, ErrorKind::Malformed);
+}
+
+// ─── Lease lifecycle ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn lease_eof_revokes_the_session() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let mut lease_conn = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "run".to_string(),
+            sandbox: SandboxKind::Airlock,
+            ends: SessionEnds::Lease,
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = lease_conn.request(req).await else {
+        panic!("expected Registered")
+    };
+    assert!(daemon.state.sessions.get(&id).is_some());
+
+    drop(lease_conn);
+
+    // The daemon learns about the EOF asynchronously; poll briefly.
+    wait_until(
+        Duration::from_secs(2),
+        || !daemon.state.sessions.get(&id).is_some(),
+        "lease EOF did not revoke the session in time",
+    )
+    .await;
+    assert_eq!(
+        daemon.state.sessions.ended_reason(&id),
+        Some(crate::session::EndedReason::LeaseClosed)
+    );
+}
+
+#[tokio::test]
+async fn lease_stays_open_from_the_daemon_side_while_the_session_lives() {
+    use tokio::io::AsyncReadExt;
+
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let mut lease_conn = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "run".to_string(),
+            sandbox: SandboxKind::Airlock,
+            ends: SessionEnds::Lease,
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = lease_conn.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    // The launcher reads EOF on the lease as "the session ended", so the
+    // daemon must not half-close it after the reply.
+    let mut buf = [0u8; 1];
+    let read =
+        tokio::time::timeout(Duration::from_millis(300), lease_conn.reader.read(&mut buf)).await;
+    assert!(
+        read.is_err(),
+        "lease connection got {read:?} instead of staying quiet"
+    );
+    assert!(daemon.state.sessions.get(&id).is_some());
+}
+
+// ─── Logs ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn logs_filtered_by_session() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id_a, _) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "one",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+    let mut admin2 = daemon.client().await;
+    let (id_b, _) = register(
+        &mut admin2,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "two",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let mut admin3 = daemon.client().await;
+    let reply = admin3
+        .request(admin_request(
+            &daemon.admin_token,
+            AdminRequest::Logs {
+                session: Some(id_a.to_string()),
+            },
+        ))
+        .await;
+    let DaemonMessage::LogsResponse { entries } = reply else {
+        panic!("expected LogsResponse")
+    };
+    assert!(
+        entries
+            .iter()
+            .all(|e| e.session.as_deref() != Some(id_b.as_str()))
+    );
+    assert!(
+        entries
+            .iter()
+            .any(|e| e.session.as_deref() == Some(id_a.as_str()))
+    );
+}
+
+// ─── Stop ────────────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn stop_shuts_down_and_removes_files() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let socket_path = daemon.state.runtime.socket_path();
+    let pid_path = daemon.state.runtime.pid_path();
+    // No PID file in this harness (that's written by `async_main_inner`,
+    // which this test bypasses) — write one so the cleanup path is exercised.
+    std::fs::write(&pid_path, b"1\n").unwrap();
+
+    let mut admin = TestClient::connect(&socket_path).await;
+    let reply = admin
+        .request(admin_request(&daemon.admin_token, AdminRequest::Stop))
+        .await;
+    assert!(matches!(reply, DaemonMessage::Ok));
+
+    wait_until(
+        Duration::from_secs(2),
+        || !socket_path.exists(),
+        "socket was not removed after Stop",
+    )
+    .await;
+    assert!(!pid_path.exists());
+    assert!(!daemon.state.runtime.admin_token_path().exists());
+}
+
+// ─── Startup lock ─────────────────────────────────────────────────────────────
+
+/// A second, concurrent `daemon start` must not be able to take the lock
+/// while the first is still starting (or running) — the mechanism that
+/// stops it from racing `check_and_cleanup_stale_state` against the
+/// winner's own bind/admin-token write.
+#[test]
+fn acquire_startup_lock_refuses_a_second_concurrent_holder() {
+    let tmp = tempfile::tempdir().unwrap();
+    let path = tmp.path().join("airlock.lock");
+
+    let first = acquire_startup_lock(&path).expect("first holder should succeed");
+    assert!(matches!(
+        acquire_startup_lock(&path),
+        Err(DaemonError::StartInProgress)
+    ));
+
+    // Once released (the holder's fd closes), a new start can take it —
+    // mirroring the winner's daemon exiting and a later `daemon start`
+    // succeeding.
+    drop(first);
+    assert!(acquire_startup_lock(&path).is_ok());
+}
+
+// ─── Idle exit ───────────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn automatic_daemon_idle_exits_with_no_sessions() {
+    let daemon =
+        start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(100))).await;
+    let socket_path = daemon.state.runtime.socket_path();
+
+    wait_until(
+        Duration::from_secs(3),
+        || daemon.state.shutdown.is_cancelled(),
+        "automatic daemon did not idle-exit",
+    )
+    .await;
+    let _ = socket_path;
+}
+
+#[tokio::test]
+async fn manual_daemon_never_idle_exits() {
+    let daemon = start_test_daemon_with_idle(DaemonMode::Manual, None).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(!daemon.state.shutdown.is_cancelled());
+}
+
+/// A connection that never registers a session — like a polling `airlock
+/// status`'s Hello + `ListSessions` — must not reset the idle-exit grace
+/// period just by existing: idle-exit is based on the session count, not
+/// on whether anything is currently connected.
+#[tokio::test]
+async fn repeated_status_style_polling_does_not_block_idle_exit() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let daemon =
+        start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(100))).await;
+    let socket_path = daemon.state.runtime.socket_path();
+
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !daemon.state.shutdown.is_cancelled() {
+        if std::time::Instant::now() > deadline {
+            panic!(
+                "automatic daemon did not idle-exit despite having no sessions, \
+                 just because something kept polling it"
+            );
+        }
+        // Best-effort, not `TestClient` (which panics on any I/O error):
+        // once idle-exit fires, the daemon starts tearing down its socket,
+        // and a poll landing in that window failing is expected, not a bug.
+        if let Ok(mut stream) = tokio::net::UnixStream::connect(&socket_path).await {
+            let hello = protocol::encode_line(&ClientHello {
+                protocol: protocol::PROTOCOL_VERSION,
+                version: "test".to_string(),
+            });
+            let mut buf = [0u8; 512];
+            if stream.write_all(&hello).await.is_ok() && stream.read(&mut buf).await.is_ok() {
+                let req = admin_request(&daemon.admin_token, AdminRequest::ListSessions);
+                let line = protocol::encode_line(&req);
+                if stream.write_all(&line).await.is_ok() {
+                    let _ = stream.read(&mut buf).await;
+                }
+            }
+        }
+        // Faster than the idle grace period above: under the bug, each of
+        // these connections reset the grace timer, so it never elapsed.
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// The gap `handle_register` covers: a session can still be in the middle
+/// of being created — zero sessions inserted yet — while the daemon is
+/// plainly not idle. `registrations_in_flight` (which `RegistrationGuard`
+/// holds for a real `Register`) must block idle-exit here exactly as a
+/// live session would, and release it the same way once it clears.
+#[tokio::test]
+async fn registration_in_flight_blocks_idle_exit_with_zero_sessions() {
+    let daemon =
+        start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(50))).await;
+
+    daemon
+        .state
+        .registrations_in_flight
+        .fetch_add(1, Ordering::SeqCst);
+    daemon.state.note_activity();
+
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(
+        !daemon.state.shutdown.is_cancelled(),
+        "a registration in flight must block idle-exit even with zero sessions"
+    );
+
+    daemon
+        .state
+        .registrations_in_flight
+        .fetch_sub(1, Ordering::SeqCst);
+    daemon.state.note_activity();
+
+    wait_until(
+        Duration::from_secs(2),
+        || daemon.state.shutdown.is_cancelled(),
+        "daemon did not idle-exit once the registration finished",
+    )
+    .await;
+}
+
+// ─── Global redactor ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn global_redactor_masks_another_sessions_secret() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = with_secret(
+        test_payload(tmp.path(), "[tools.sh]\n"),
+        "TOK",
+        "s3cr3t-value",
+    );
+    let mut admin = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "one".to_string(),
+            sandbox: SandboxKind::External,
+            ends: SessionEnds::Ttl { secs: 3600 },
+        })),
+    );
+    let DaemonMessage::Registered { .. } = admin.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    let redactor = daemon.state.global_redactor_snapshot();
+    let out = redactor.redact_bytes(b"leaked: s3cr3t-value");
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("s3cr3t-value"), "{out}");
+}
+
+#[tokio::test]
+async fn global_redactor_masks_another_sessions_previous_value() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = with_secret(
+        test_payload(tmp.path(), "[tools.sh]\n"),
+        "TOK",
+        "new-s3cr3t-value",
+    );
+    let mut admin = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "one".to_string(),
+            sandbox: SandboxKind::External,
+            ends: SessionEnds::Ttl { secs: 3600 },
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = admin.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    // What a refresh leaves behind: the value the secret held before it.
+    let policy = daemon.state.sessions.get(&id).unwrap().current_policy();
+    policy.previous_secrets.lock().unwrap().insert(
+        "TOK".to_string(),
+        Arc::new(crate::secrets::Secret::new("old-s3cr3t-value".to_string())),
+    );
+    daemon.state.rebuild_global_redactor();
+
+    let redactor = daemon.state.global_redactor_snapshot();
+    let out = redactor.redact_bytes(b"leaked: old-s3cr3t-value new-s3cr3t-value");
+    let out = String::from_utf8_lossy(&out);
+    assert!(!out.contains("s3cr3t-value"), "{out}");
+}
+
+/// Hands out one chunk per read, so a test controls exactly where a read
+/// boundary falls.
+struct ChunkedReader(std::collections::VecDeque<&'static [u8]>);
+
+impl tokio::io::AsyncRead for ChunkedReader {
+    fn poll_read(
+        mut self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        if let Some(chunk) = self.0.pop_front() {
+            buf.put_slice(chunk);
+        }
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+#[tokio::test]
+async fn redaction_pipeline_catches_secrets_split_across_reads() {
+    let own = crate::secrets::Secret::new("own-s3cr3t-value".to_string());
+    let other = crate::secrets::Secret::new("other-s3cr3t-value".to_string());
+    let session_redactor = Arc::new(Redactor::new([("OWN", &own)]).unwrap());
+    let global_redactor = Arc::new(Redactor::new([("OTHER", &other)]).unwrap());
+    let reader = ChunkedReader(
+        [
+            b"a: own-s3cr3t-".as_slice(),
+            b"value\nb: other-s3c",
+            b"r3t-val",
+            b"ue",
+        ]
+        .into(),
+    );
+
+    let (task, mut rx) = spawn_redaction_pipeline(session_redactor, global_redactor, reader);
+    task.await.unwrap();
+    let mut out = Vec::new();
+    while let Ok(chunk) = rx.try_recv() {
+        out.extend(chunk);
+    }
+
+    assert_eq!(
+        String::from_utf8(out).unwrap(),
+        "a: [REDACTED:OWN]\nb: [REDACTED:OTHER]"
+    );
+}
+
+/// `resolve_tool_env` turns a stale secret's refresh-failure reason into the
+/// `StaleSecret` error's `message` — and that reason is the refresh
+/// command's own captured stderr, not text the daemon composed. Before this
+/// was wired through the redaction choke point in `write_ndjson_message`,
+/// an `Error` leaving the daemon skipped redaction entirely, so a reason
+/// that happened to echo the secret's current value went to the client raw.
+#[tokio::test]
+async fn stale_secret_reason_is_redacted_in_the_error_message() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = with_secret(
+        test_payload(
+            tmp.path(),
+            "[secrets.TOK]\nsource = \"env\"\n\n[tools.sh.env]\nTOK = { secret = \"TOK\" }\n",
+        ),
+        "TOK",
+        "s3cr3t-value",
+    );
+
+    let mut admin = daemon.client().await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "claude".to_string(),
+            sandbox: SandboxKind::External,
+            ends: SessionEnds::Ttl { secs: 3600 },
+        })),
+    );
+    let (id, token) = match admin.request(req).await {
+        DaemonMessage::Registered { id, token, .. } => (id, token),
+        other => panic!("expected Registered, got {other:?}"),
+    };
+
+    // Simulate a background refresh failure whose captured stderr happens
+    // to echo the secret's own (still-current) value — exactly the shape
+    // `resolve_tool_env` turns into the `StaleSecret` error's reason.
+    let session = daemon.state.sessions.get(&id).expect("session");
+    {
+        let policy = session.current_policy();
+        let mut slot = policy
+            .secrets
+            .get("TOK")
+            .expect("secret slot")
+            .write()
+            .unwrap();
+        slot.health = crate::secrets::Health::Stale {
+            reason: "exited with status 1: leaked value s3cr3t-value".to_string(),
+            since: std::time::Instant::now(),
+        };
+    }
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(
+            token,
+            SessionRequest::Exec {
+                tool: "sh".to_string(),
+                args: vec![],
+                cwd: tmp.path().to_path_buf(),
+            },
+        ))
+        .await;
+
+    match reply {
+        DaemonMessage::Error {
+            kind: ErrorKind::StaleSecret,
+            message,
+        } => {
+            assert!(!message.contains("s3cr3t-value"), "{message}");
+            assert!(message.contains("[REDACTED:TOK]"), "{message}");
+        }
+        other => panic!("expected a StaleSecret error, got {other:?}"),
+    }
+}
+
+// ─── Exec: pre-spawn errors (no sandbox needed) ──────────────────────────────
+
+#[tokio::test]
+async fn exec_unknown_tool_is_refused() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (_id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(
+            token,
+            SessionRequest::Exec {
+                tool: "nope".to_string(),
+                args: vec![],
+                cwd: tmp.path().to_path_buf(),
+            },
+        ))
+        .await;
+    assert_error(&reply, ErrorKind::UnknownTool);
+}
+
+#[tokio::test]
+async fn exec_outside_root_is_refused() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (_id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(
+            token,
+            SessionRequest::Exec {
+                tool: "sh".to_string(),
+                args: vec![],
+                cwd: outside.path().to_path_buf(),
+            },
+        ))
+        .await;
+    assert_error(&reply, ErrorKind::OutsideRoot);
+}
+
+#[tokio::test]
+async fn exec_binary_unusable_when_tool_not_on_filtered_path() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    // `[tools.doesnotexistanywhere]` is declared but nothing by that name
+    // is on the session's (narrow) filtered PATH.
+    let (_id, token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.doesnotexistanywhere]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let mut client = daemon.client().await;
+    let reply = client
+        .request(session_request(
+            token,
+            SessionRequest::Exec {
+                tool: "doesnotexistanywhere".to_string(),
+                args: vec![],
+                cwd: tmp.path().to_path_buf(),
+            },
+        ))
+        .await;
+    assert_error(&reply, ErrorKind::BinaryUnusable);
+}
+
+#[tokio::test]
+async fn exec_cap_refuses_the_seventeenth_concurrent_exec() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let mut admin = daemon.client().await;
+    let (id, _token) = register(
+        &mut admin,
+        &daemon.admin_token,
+        tmp.path(),
+        "[tools.sh]\n",
+        "claude",
+        SessionEnds::Ttl { secs: 3600 },
+    )
+    .await;
+
+    let session = daemon.state.sessions.get(&id).unwrap();
+    // Hold every permit directly, rather than spawning 16 real tools —
+    // this test is about the cap, not about exec's happy path.
+    let mut held = Vec::new();
+    for _ in 0..session::EXEC_CAP {
+        held.push(
+            Arc::clone(&session.exec_permits)
+                .try_acquire_owned()
+                .unwrap(),
+        );
+    }
+    assert!(
+        Arc::clone(&session.exec_permits)
+            .try_acquire_owned()
+            .is_err()
+    );
+    drop(held);
+}

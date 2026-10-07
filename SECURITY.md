@@ -20,12 +20,14 @@ This document describes the security boundaries, secret lifecycle, and threat mi
 ┌─────────────────────────────────────────────────────────┐
 │  Secret source (1Password, Vault, env, secretspec, ...) │
 └────────────────────────┬────────────────────────────────┘
-                         │ env vars at startup, or command sources
+                         │ resolved by the launcher (`airlock run`,
+                         │ `session start`), in your terminal
                          ▼
               ┌─────────────────────┐
-              │   airlock daemon    │  ← TRUSTED
-              │                     │     holds secrets in memory
-              │  Unix socket API    │     applies sandbox + redaction
+              │   airlock daemon    │  ← TRUSTED, one per user
+              │  (every project's   │     holds every session's secrets
+              │   sessions live     │     applies sandbox + redaction
+              │   here)             │
               └──────────┬──────────┘
                          │ NDJSON (redacted output only)
                          ▼
@@ -35,9 +37,11 @@ This document describes the security boundaries, secret lifecycle, and threat mi
               └─────────────────────┘
 ```
 
-The **daemon** is the trust boundary. It holds secrets, constructs sandbox policies, spawns tool processes, and redacts output. The **client** (`airlock exec`) is unprivileged — it connects over a Unix domain socket, sends a tool name and arguments, and receives only redacted stdout/stderr.
+The **daemon** is the trust boundary. It holds every session's secrets, constructs sandbox policies, spawns tool processes, and redacts output. The **client** (`airlock exec`, `tools list`, `agent check`) is unprivileged — it connects over a Unix domain socket, presents a session token, sends a tool name and arguments, and receives only redacted stdout/stderr.
 
-An AI agent interacts exclusively through the client side. It can request tool execution but never observes the raw values of tool secrets.
+An AI agent interacts exclusively through the client side, within one session. It can request tool execution in its own project but never observes the raw values of tool secrets, and a session token proves nothing about any project but the one it was issued for.
+
+**The socket alone is not the trust boundary; the session token is.** One daemon now serves every project a user has, and every process reaching the socket shares the user's uid — a `connect(2)` on the socket says only "I am this user", which an agent's own sandboxed process already is. What limits an agent to its own project is a **session**: a token, handed out only to a process holding `admin.token` (which no Airlock sandbox can read), scoped to one root and one approved config. See [Sessions](#sessions) below.
 
 ### Agent credentials (`[agent.env]`)
 
@@ -45,30 +49,46 @@ An AI agent interacts exclusively through the client side. It can request tool e
 
 ### Socket peer authentication
 
-The Unix socket is the entire trust boundary — anything that can `connect(2)` to it can ask for tool execution. Airlock authenticates peers by filesystem permission:
+The Unix socket is necessary but not sufficient — anything that can `connect(2)` to it is the same user the daemon runs as, which an agent already is. Filesystem permission narrows *who can reach the socket at all*; the session token (below) narrows *what a connection may do once there*.
 
 - The daemon sets `umask(0o077)` around `bind(2)`, creating the socket with mode `0o700` (owner-only) regardless of the ambient umask. The original umask is restored even if bind fails.
 - Immediately after bind, the daemon `stat`s the socket and **refuses to start** if any group/other bit is set. This catches filesystems that silently ignore mode bits (some network filesystems, certain FUSE mounts) or external umask overrides. The insecure socket is left on disk for the operator to inspect rather than auto-removed.
-- The PID file is created with `O_CREAT | O_EXCL` and mode `0o600` in a single `open(2)` call, so it is never visible with a more permissive mode and a second daemon racing past the stale-cleanup check cannot overwrite it.
+- The runtime directory holding the socket, PID file and `admin.token` is validated the same way (owned by the effective uid, mode 0700, not a symlink) before use — see [Protecting the anchors](#protecting-the-anchors).
 
-A peer-credential check (`SO_PEERCRED` / `LOCAL_PEERCRED`) on `accept(2)` is not yet implemented; it would be defense-in-depth on top of the filesystem mode. Tracked in [TODO.md](TODO.md).
+## Sessions
+
+One daemon serves every project. Registering a session — the only way to get a token that `exec`, `tools list` or `agent check` will accept — needs `admin.token`, a 32-byte value written to the runtime directory at daemon start with mode 0600. No sandbox Airlock builds can read it: Landlock never grants the runtime directory on Linux, and every Seatbelt profile (agent and tool) carries an explicit `(deny file-read* (literal ".../admin.token"))` as its last rule. A single per-daemon token in the agent's environment was considered and rejected: it would stay valid for the daemon's whole lifetime and couldn't tell two agents' sessions apart.
+
+A **launcher** (`airlock run`, `airlock session start`) does everything that needs your terminal or your project's environment — discover and approve config, resolve secrets — and then sends a `Register` request with `admin.token`, the merged config, the resolved secret values, an environment snapshot and a filtered `PATH`. The daemon answers with a session id and a 32-byte random token. `exec`, `tools list` and `agent check` read that token (and the daemon's address) from `AIRLOCK_ADDR` / `AIRLOCK_SESSION` and nothing else — no fallback to `admin.token`, no config discovery, so a nested `airlock.toml` the agent's own working directory happens to contain cannot redirect anything.
+
+### Token binding
+
+A session token lives in every process the harness starts, and a same-uid process outside any sandbox can read another process's environment: `ps eww` on macOS, `/proc/<pid>/environ` on Linux. So an agent running under an external sandbox that permits process inspection — or any unsandboxed process of the user — could in principle copy another agent's token out of its environment.
+
+The daemon closes this by binding each token to a **process tree**, not just its bytes. On every connection it takes the peer PID off the socket (`LOCAL_PEERPID` on macOS, `SO_PEERCRED` on Linux) and walks the parent chain, checking that the session's recorded anchor process — the launcher, for `airlock run`; the shell that ran it, for `session start` — is an ancestor. The anchor is recorded with its start time, so a reused PID can't match. A copied token is then useless outside the tree it was issued to; this does not help against a process that is already inside the tree, which holds the token legitimately anyway. Airlock's own agent sandbox also allows process inspection only `(target same-sandbox)`, so two Airlock-sandboxed agents can't read each other's environment in the first place.
+
+This binding is a property of the Unix transport (peer PID is meaningless over a network); a future transport would need tokens bound to a TLS client identity instead.
+
+For `session start`, the anchor is the *parent* of the `session start` process itself — ordinarily the interactive shell that ran it, since `eval "$(airlock session start)"` execs `session start` as a direct child of that shell with no extra fork. Piping the command through anything else (`eval "$(airlock session start | cat)"`, or capturing it inside a script that then `eval`s the result in a different shell) forces an extra fork: the anchor becomes that pipeline's subshell, which exits as soon as the pipe finishes, and every later request is refused with `OutsideProcessTree` even though the token itself is valid. Run `airlock session start` directly in the shell that will use the session.
+
+### Lifetime
+
+A `run` session ends when its lease — the `Register` connection, held open by the launcher for as long as the harness runs — closes; the kernel closes it however the launcher dies (exit, panic, SIGKILL, OOM), so nothing can leak a session past a dead launcher, and no heartbeat is needed. A `session start` session ends on its TTL (default 12h) or an explicit `session revoke`; without a TTL, a forgotten `session start` would keep a token valid, and an automatic daemon running, indefinitely.
 
 ## Secret lifecycle
 
 ### 1. Collection
 
-At daemon startup, `collect_secrets` resolves every `[secrets.<label>]` entry into a value keyed by its label:
+Secrets are resolved by the **launcher**, in your terminal, at `airlock run` or `session start` — never by the daemon, and never from the daemon's own process environment:
 
-- `source = "env"` reads the daemon env var named by `from` (default: the label). Airlock is agnostic about where that variable came from — 1Password CLI, Hashicorp Vault, `secretspec`, or a plain shell export all work.
-- `source = "command"` spawns the argv list (no shell), waits up to `timeout`, and takes the trimmed stdout as the value. These commands run unsandboxed with the daemon's environment — see [Config safety](#config-safety).
+- `source = "env"` reads the launcher's env var named by `from` (default: the label). Airlock is agnostic about where that variable came from — 1Password CLI, Hashicorp Vault, `secretspec`, or a plain shell export all work.
+- `source = "command"` spawns the argv list (no shell) on the filtered `PATH` (see [Config safety](#config-safety)), waits up to `timeout`, and takes the trimmed stdout as the value. These commands run unsandboxed with the launcher's environment — see [Config safety](#config-safety).
 
-Failures are batched: if any `env` variable is missing or any `command` fails, startup aborts with one error listing **every** problem (not just the first), so the operator can fix them in one pass.
+Failures are batched: if any `env` variable is missing or any `command` fails, nothing is registered, and the error lists **every** problem (not just the first), so the user can fix them in one pass.
 
-### 2. Environment clearing
+### 2. Transfer, not persistence, in the daemon's own environment
 
-Immediately after collection, the daemon **removes** every secret variable from its own process environment via `std::env::remove_var()`. This prevents exposure through `/proc/<pid>/environ` on Linux or `ps eww` on macOS.
-
-This clearing happens before any fork or async runtime creation — while the process is still single-threaded — satisfying Rust 2024 edition's safety requirements for environment mutation.
+Resolved values travel to the daemon exactly once, inside the `Register` (or `Reload`) request body, over the socket. The daemon's own process environment is never read for this and never holds a secret: there is nothing to clear, because nothing was ever set there. A background `refresh` re-runs a `command` secret's source using the *session's* stored environment snapshot and filtered `PATH`, never the daemon's own.
 
 ### 3. In-memory storage
 
@@ -78,33 +98,35 @@ Collected values are wrapped in `Secret<T>`, a newtype that:
 - Requires an explicit `.expose_secret()` call to access the inner value, making all exposure points easy to audit (grep for `expose_secret`).
 - Is intentionally not `Clone` or `Copy`, preventing casual proliferation in memory.
 
-The daemon holds them in a `SecretStore` — `Arc<HashMap<String, RwLock<SecretSlot>>>`, keyed by label and shared across all connection handlers. The map itself is fixed at startup; each slot holds an `Arc<Secret<String>>` plus a health flag, so a background refresh can swap in a new value while in-flight readers keep the previous one until they drop it. A slot whose last refresh failed is marked `Stale`.
+Each session holds its own `SecretStore`, keyed by label. The map itself is fixed at session start (or reload); each slot holds an `Arc<Secret<String>>` plus a health flag, so a background refresh can swap in a new value while in-flight readers keep the previous one until they drop it. A slot whose last refresh failed is marked `Stale`. One session's store is reachable only through that session's handle — see [Session isolation](#session-isolation).
 
 ### 4. Injection at execution time
 
 When the daemon handles an `exec` request, it walks the tool's `[tools.<name>.env]` map:
 
 1. A static string is inserted as-is.
-2. A `{ secret = "label" }` reference takes a read lock on that label's slot. If the slot is healthy, `.expose_secret()` yields the value and it is inserted. If the slot is `Stale`, the exec is **refused** with an error naming the label — never the value.
+2. A `{ secret = "label" }` reference takes a read lock on that label's slot, in the session's own store. If the slot is healthy, `.expose_secret()` yields the value and it is inserted. If the slot is `Stale`, the exec is **refused** with an error naming the label — never the value.
 
 The child process receives a **minimal** environment — not the daemon's full environment:
 
 | Variable | Source |
 |----------|--------|
 | Secret-backed `env` entries | From in-memory `Secret<String>` values |
-| Static `env` entries | Literal strings from `airlock.toml` (`{sandbox_root}` expanded) |
-| `PATH`, `HOME`, `TERM`, `USER` | Passthrough from daemon's environment (process basics) |
+| Static `env` entries | Literal strings from the config (`{sandbox_root}` / `{tool_state}` expanded) |
+| `PATH`, `HOME`, `TERM`, `USER` | The session's filtered `PATH`, plus the other process basics from its environment snapshot |
 | `TZ` | Passthrough (timezone — without it, tools render timestamps in UTC or local default) |
 | `LANG`, `LC_ALL`, `LC_CTYPE`, `LC_NUMERIC`, `LC_TIME`, `LC_COLLATE`, `LC_MONETARY`, `LC_MESSAGES` | Passthrough (locale — controls sort order, number/date formatting, message translations) |
 | Everything else | **Excluded** |
 
 The child's environment is constructed from scratch (`cmd.env_clear()` + explicit insertions). No ambient variables leak through.
 
-Static values in `[tools.<tool>.env]` support exactly one template placeholder — `{sandbox_root}`, resolved at config load to the canonicalized directory containing `airlock.toml`. This is not shell interpolation: no other keys expand, no env vars are read, unknown placeholders are rejected. Templating applies only to static strings, never to `{ secret = "..." }` refs or to argv.
+Static values in `[tools.<tool>.env]` support exactly two template placeholders — `{sandbox_root}`, the canonicalized project directory, and `{tool_state}`, a per-project per-tool directory under `$XDG_CACHE_HOME/airlock` that only the one tool declaring it can read or write. This is not shell interpolation: no other keys expand, no env vars are read, unknown placeholders are rejected. Templating applies only to static strings, never to `{ secret = "..." }` refs or to argv.
 
 ### 5. Output redaction
 
-All stdout and stderr from the child pass through an **Aho-Corasick** streaming automaton before reaching the client. For each secret, **four encoding variants** are registered as search patterns:
+All stdout and stderr from the child pass through an **Aho-Corasick** streaming automaton before reaching the client — first the session's own redactor, built from that session's secrets, then a daemon-wide **last-pass redactor** built from every live session's secrets, including each refreshed secret's previous value (see [Session isolation](#session-isolation)). Both passes are streams, so a secret split across two reads of the child's output is still caught. For each secret, **four encoding variants** are registered as search patterns:
+
+An `Error` message leaving the daemon is not exempt: its text can originate somewhere other than the daemon's own words (a stale secret's refresh-failure reason is the refresh command's captured stderr), so `write_ndjson_message` — the one function every outbound message passes through — redacts an `Error`'s text the same way, through the session's redactor (when a session is in scope) and then the global one, before it is serialized.
 
 | Encoding | Example (secret: `my-key-123`) |
 |----------|-------------------------------|
@@ -123,20 +145,38 @@ The streaming implementation (`aho-corasick`'s `try_stream_replace_all`) correct
 
 ## Filesystem sandboxing
 
-Tools run with **deny-by-default** filesystem access, enforced by OS-level mechanisms.
+Tools, and the agent itself under `airlock run`, run with **deny-by-default** filesystem access, enforced by OS-level mechanisms.
+
+### Tool access levels
+
+Beyond a tool's own grants (project root, `[filesystem]`, `extra_read`/`extra_write`, its own binary, a proxy tool's CA — unaffected by this setting, at every level), the daemon also layers in a *built-in* filesystem baseline, sized by that tool's `access` level (`tools.<name>.access`, or the config's top-level `access`; see [README.md](README.md#access-how-much-of-the-system-a-tools-sandbox-sees)):
+
+- **`none`** — just the dynamic linker, the shared library cache, and `/dev/null`. Nothing else of the system.
+- **`system`** — `none` plus the fixed baseline described below (system libraries, binaries, shared data, configuration).
+- **`default`** — `system` plus read-only `/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, and `/home/linuxbrew/.linuxbrew`. **This is the default when `access` is unset anywhere** — a deliberate widening over the pre-`access` baseline, approved so Nix- and Homebrew-built tools work without per-tool `extra_read` entries.
+
+  `/usr/local/etc` and `/opt/homebrew/etc` are inside those toolchain roots and can hold other installed services' configuration — not secrets Airlock itself manages, but data a tool at `default` can now read that it couldn't before. A project that cares picks `system` or `none` for tools that don't need a toolchain root, instead of relying on the default.
+
+The agent's own sandbox is **not** governed by `access` — it always gets the `none` + `system` baseline, same as every tool did before `access` existed.
 
 ### macOS — Apple Seatbelt (SBPL)
 
-The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execution:
+The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execution, and the launcher generates one for the agent:
 
 - **Base policy**: `(deny default)` — deny everything by default.
-- **Process operations**: `process-exec`, `process-fork`, `signal(target self)`, `process-info(target self)`.
+- **Process operations**: `process-exec`, `process-fork`, `signal(target self)`, `process-info(target self)` and, for the agent profile, `process-info* (target same-sandbox)` only — two Airlock-sandboxed agents cannot inspect each other's processes or environments, which is what makes a copied [session token](#token-binding) need the process-tree binding in the first place rather than being exploitable directly.
 - **System reads**: `sysctl-read` (needed by Go/Rust runtimes before `main()`).
 - **Mach IPC**: `mach-lookup` is an explicit allowlist (no blanket allow). `(deny mach-priv*)` blocks privileged operations.
   - **Keychain is out of the baseline.** `com.apple.SecurityServer`, `com.apple.securityd.xpc`, and every other Mach endpoint that fronts Keychain Services are intentionally absent from the allowlist. A sandboxed process running under the baseline (or under the strict `claude` profile) cannot read or write any keychain item. TLS trust evaluation (`SecTrustEvaluate`, `SecPolicyCreateSSL`) reaches the network through `com.apple.trustd.agent` and does not depend on `securityd` — verified empirically — so dropping the keychain services does not affect HTTPS. Profiles that need keychain access opt back in: see `claude-relaxed` under "Built-in agent profiles" below.
   - **File-change notification is in the baseline.** `com.apple.FSEvents` is on the allowlist because every macOS file watcher goes through it — without it `node --watch`, nodemon, vite, and `cargo watch` fail, and they fail unrecognisably: libuv surfaces a failed `FSEventStreamStart` as `EMFILE: too many open files, watch` even with a 1M descriptor limit, and Bun reports `error: Error starting FSEvents stream`. The capability is notification-only: reading a changed file still goes through the filesystem rules. It does widen metadata disclosure — an event stream rooted outside the sandbox reports the *paths* of files the process cannot open — which is the accepted cost of working dev servers.
-- **Baseline filesystem reads**: `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification).
+- **Baseline filesystem reads** (the `system` access level; `none` drops this to just the dynamic linker (`/usr/lib/dyld`) and the dyld shared cache — verified empirically with `sandbox-exec` that this alone runs `/bin/echo` but not `cat /etc/hosts` or `ls /usr/share`; `default` adds the toolchain roots above): `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification, granted at every level). `/dev/null` is the one exception to "reads": it also gets `file-write*` and `file-ioctl`, since shells open it `O_WRONLY` for `2>/dev/null` redirection, and is granted at every level including `none`.
 - **Config-declared paths**: `(allow file-read* (subpath ...))` for read paths; `(allow file-write* (subpath ...))` for write paths.
+- **The runtime base, `admin.token` and `.git/hooks` are denied last, after every allow.** In SBPL the *last* matching rule wins, so a deny placed before a broader allow (`$TMPDIR`, `agent.filesystem.write`, `--allow-write`, a built-in profile rule) would be silently re-enabled by it. Every agent and tool profile therefore ends with, in this order:
+  1. `(deny file-write* (subpath "<root>/.git/hooks"))` — [F9](#git-hooks-write-denial-f9), defense in depth.
+  2. `(deny file-write* (subpath "<runtime base>"))` — no sandbox can replace the socket, PID file or proxy CA, or write the trust store or `admin.token`.
+  3. `(deny file-read* (literal "<runtime base>/admin.token"))` — no sandbox can read the credential that registers sessions.
+
+  A proxy tool's one exception is a `(allow file-read* (literal "<runtime base>/ca/<session-id>.pem"))` rule, scoped to its own session's certificate, which sits *before* the runtime-base deny above (a narrower allow after a broader deny does not apply — the deny would simply win — so this one is ordered as an exception the deny is written to exclude).
 - **Network**: one of three states, chosen for each execution.
   - *Full* (every ordinary tool): `network-outbound`, `system-socket`, plus DNS via `/private/var/run/mDNSResponder`. `network-bind` is scoped to `(local unix-socket)` only — tools can bind Unix domain sockets for local IPC (argocd SSO, language servers, loopback IPC) but cannot `listen()` on TCP/UDP and therefore cannot become network-reachable services.
   - *Proxy-only* (a [proxy tool](#proxy-tools)): one rule, `(allow network-outbound (remote tcp "localhost:<port>"))`. `<port>` is the ephemeral port the daemon bound for this execution. There is no general `network-outbound`, no `system-socket`, no mDNSResponder socket, and no bind of any kind. So the tool cannot resolve a name, reach a public address, or reach a different loopback port. We tested each case with `sandbox-exec` against a live listener. Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the host (an IP literal does not compile). `localhost` is what this rule needs.
@@ -144,15 +184,20 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
 
 Path traversal rules (`file-read-metadata` for ancestor directories) are generated automatically.
 
-**SBPL injection prevention**: Any path containing ASCII control characters (0x00–0x1F or 0x7F) is rejected. A null byte would truncate the profile string; other control characters could break the S-expression syntax.
+**SBPL injection prevention**: Any path containing ASCII control characters (0x00–0x1F or 0x7F) is rejected. A null byte would truncate the profile string; other control characters could break the S-expression syntax. A path that goes into a `(regex #"...")` rule (the `~/.claude.json` family and `GlobalPreferences` plists, both derived from `HOME`) is also rejected if it contains a double quote: that literal is raw, with no escape for `"`, so a quote would end it early.
 
 The profile is applied via `sandbox_init()` FFI in the `pre_exec` closure, after fork but before exec.
+
+#### `.git/hooks` write denial (F9)
+
+Git hooks run with no review step, on ordinary commands (`commit`, `push`, and `core.fsmonitor` on nearly every `git status`), as the user, unsandboxed. An agent that could write `<root>/.git/hooks/pre-commit` could get code to run outside every sandbox the next time the user commits — including code that reads the trust store or the global config directly. The agent and tool profiles on macOS therefore deny writes under `.git/hooks` as one more rule after every allow, the same way the runtime base is denied. This is **defense in depth, not a guarantee**: Landlock cannot express a deny carved out of an allowed subtree, so Linux has no equivalent; `core.fsmonitor` and other settings in `.git/config` (which the deny does not cover) have the same effect and stay reachable; and a worktree's hooks live in the common git dir, which can sit outside the sandboxed root entirely. See [Agent-written code run outside the sandbox](#agent-written-code-run-outside-the-sandbox) for the class this narrows but does not close.
 
 ### Linux — Landlock LSM
 
 The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** — if Landlock is not available, the daemon refuses to start rather than silently degrading.
 
-- **Baseline filesystem reads** (mirrors the macOS Seatbelt baseline; missing entries are silently skipped): `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`, `/usr/share`, `/usr/bin`, `/bin`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`. These are required by the dynamic linker, libc, TLS trust store, and entropy sources; they contain no user secrets.
+- **Baseline filesystem reads** (the `system` access level, mirroring the macOS Seatbelt baseline; missing entries are silently skipped): `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`, `/usr/share`, `/usr/bin`, `/bin`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`. These are required by the dynamic linker, libc, TLS trust store, and entropy sources; they contain no user secrets. As on macOS, `/dev/null` is also writable, for `2>/dev/null` redirection. `none` drops this to just `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/etc/ld.so.cache`, and `/dev/null`; `default` adds the toolchain roots from the previous section, also skipped when absent.
+- **The tool's own binary gets its own `PathBeneath` rule, granted at every access level.** Landlock ties execute rights to path coverage — unlike Seatbelt's unconditional `process-exec`, a binary outside the baseline and outside `read_paths`/`read_write_paths` simply cannot exec. Without this rule, `none` (which deliberately excludes `/bin`/`/usr/bin`) would be unable to run *any* tool, and a tool installed outside the baseline entirely (`~/.cargo/bin/foo`, `~/.local/bin/foo`) would fail to exec at every level.
 - Read paths → `PathBeneath` with `AccessFs::from_read(abi)`
 - Read-write paths → `PathBeneath` with `AccessFs::from_all(abi)`
 - The Landlock ruleset fd is pre-built, extracted as an `OwnedFd`, and its raw integer is passed into the `pre_exec` closure (inherited across fork).
@@ -161,9 +206,11 @@ The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** —
 
   Landlock itself leaves two gaps. First, the rule is **port-scoped, not host-scoped**: the tool can reach that port number on any host. Second, **UDP is not covered**, so exfiltration over DNS is still possible. Through either gap the tool can leak *data it can read*, but never the credential, because the tool never holds one. The agent's own sandbox already has general network access, so neither gap gives the agent a new capability. A network-namespace backend would close both gaps and is the planned next step.
 
+Landlock is allow-only and cannot carve a deny out of a granted subtree, which is why [F9](#git-hooks-write-denial-f9) is macOS-only, and why the runtime base is protected on Linux simply by never being inside any grant in the first place (see [Protecting the anchors](#protecting-the-anchors)) rather than by an explicit deny.
+
 ### Sandbox root
 
-The directory containing `airlock.toml` is always included as a read-write path in the sandbox policy. This is the tool's working directory and where it reads/writes project files.
+The project directory is always included as a read-write path in the sandbox policy, for both the agent and its tools. This is where project files live and where a tool declares `extra_write` paths relative to.
 
 ### Built-in agent profiles
 
@@ -174,6 +221,8 @@ The directory containing `airlock.toml` is always included as a read-write path 
 - Adds read/write paths: `~/.claude/​`, `~/.claude.json`, `~/.cache/claude/`, `~/.local/share/claude/`, `~/.local/state/claude/`.
 - macOS only: also widens write access to `~/.claude.json`'s sibling lock and per-pid `.tmp.*` files, and `~/.claude.lock`.
 - **Keychain posture**: keychain is unreachable. The baseline Mach allowlist excludes `com.apple.SecurityServer` and `com.apple.securityd.xpc`, and `~/Library/Keychains/` is denied for both read and write. Claude Code's probe (`security show-keychain-info`) fails, the auth subsystem reports "macOS Keychain is not writable", and OAuth tokens are persisted to `~/.claude/.credentials.json` (mode `0600`) instead. This moves secrets-at-rest from the encrypted keychain DB to a plaintext file inside `$HOME` — a deliberate trade for keeping the agent unable to see *any* keychain content from any other app.
+- Installs the `airlock agent hook claude-code` `SessionStart` hook — see [External sandboxes](#external-sandboxes) for what the equivalent hook does when the harness runs its own sandbox instead of this profile.
+- Passes `--settings` with `"sandbox":{"enabled":false}`, so Claude Code does not also try to apply its own `sandbox-exec` wrapper inside Airlock's Seatbelt profile — nesting two Seatbelt profiles is rejected by the OS. `airlock agent hook claude-code --print-settings` prints only the hook block (what to paste into a harness started another way); the `sandbox` key is specific to `--profile claude`'s own invocation and is not part of that printed block.
 
 **`claude-relaxed`** — `claude` plus interactive-ergonomics relaxations.
 
@@ -194,6 +243,65 @@ Pick `claude-relaxed` when you want the convenience and accept those marginal ri
 
 Clipboard reads can return password-manager tokens; `open <url>` reveals OAuth redirect URLs (with codes) to the browser process; dotfiles frequently carry `export AWS_*`, `export GITHUB_TOKEN`, etc. The relaxed bundle widens the **data-leak surface**, not the authority to write to your account-state. The keychain widening adds DoS and metadata disclosure but not decryption capability.
 
+## Kits
+
+Kits (`airlock run --kit <name>` / `agent.kits` / `[kits.<name>]`) add a language toolchain's cache access to the agent sandbox, on top of the harness profile above. They apply only to `airlock run`'s agent sandbox, never to a tool, and never to `session start` — an external harness's own sandbox is what actually runs there.
+
+**Isolated** (the default) points the toolchain's own cache/home env vars (`CARGO_HOME`, `GOPATH`, `npm_config_cache`, ...) at a directory private to this project, under `$XDG_CACHE_HOME/airlock/kits`. The agent can read/write only that directory for the toolchain's purposes; the user's real `~/.cargo`, `~/go`, `~/.npm`, etc. are never granted at all. This is the safe default and should be left in place unless you have a specific reason to change it.
+
+**Shared** grants the agent write access to the real cache locations instead, with no env override. **This is the mode to be careful with: it lets a hostile or compromised agent poison a cache that your *next, unsandboxed* build or `pip install` will trust without re-verifying.** Concretely:
+
+- `cargo` extracts a crate's source into `~/.cargo/registry/src` once, the first time it's fetched, and verifies its checksum against `Cargo.lock`/the registry index at that point. Every subsequent build reads the extracted source directly — there is no re-verification. An agent with write access to that tree can plant a backdoor in a dependency's extracted source; your next unsandboxed `cargo build` compiles it unmodified, outside any sandbox.
+- Go's module cache (`$GOPATH/pkg/mod`) and pip's wheel cache behave the same way: each verifies on first download, then trusts the cached, already-unpacked copy on every later build.
+- Writing `~/.cargo/bin`, or `~/.mix/escripts`/`~/.mix/archives` (Mix archives are themselves code Mix loads), or anywhere Mix/npm/pip put *executables* rather than plain cache data, is strictly worse — not cache poisoning but a direct sandbox escape, the same way a writable `PATH` entry is ([B2](docs/airlock-v2-design.md#blocking)). No kit, in either mode, ever grants write to a toolchain's binaries or to config files that could redirect what runs — `~/.cargo/bin`, `~/.cargo/config.toml`, `~/.npmrc` (`script-shell`, `node-options`), pip and uv config, `~/.hex/hex.config`, Go's env file.
+- Shared mode does grant *read* of each toolchain's user config and registry credentials — `CARGO_HOME/config.toml` and `credentials.toml`, `~/.npmrc` and `~/.yarnrc.yml`, `pip.conf`, `uv.toml`, `~/.pypirc`, `~/.hex/hex.config` — so the user's settings, private registries and publishing work for the agent. **The agent can therefore read package-registry tokens through a shared kit.** That is accepted: registry tokens are not the tool credentials Airlock exists to keep from the agent, and a user who doesn't want the agent holding them leaves the kit isolated, which reads none of these files. Hex does verify a package's checksum against `mix.lock` on fetch, same as cargo/pip; `deps/` and the extracted archives are trusted on every build after that, same caveat.
+
+This is why isolated is the default, and why `[kits.<name>]` (the table that sets a built-in kit's mode, or defines a custom one) is restricted to your global config or `airlock.local.toml` — the same restricted slot as `allow_home_root` — never a project's own `airlock.toml`. A teammate's checked-in config choosing shared mode for you, silently, would be exactly this risk without your consent.
+
+## External sandboxes
+
+A harness started from an `airlock session start` shell — Claude Code's own `--sandbox`, or an IDE extension `airlock run` can't wrap — runs in a sandbox Airlock did not build. Airlock's protections for the agent then depend entirely on that sandbox, and on the harness not inheriting secrets through some other path. Specifically, the harness's own sandbox **must**:
+
+| Must | Why |
+|---|---|
+| Deny reads of the runtime base (`airlock config --paths` prints the exact path) | `admin.token` is protected from Airlock's own sandboxes only. A harness that lets the agent read it lets the agent register sessions for **any** project on the machine, not just this one. The session token itself reaches the agent through its environment regardless, so denying the whole base breaks nothing the agent needs. |
+| Deny writes to the runtime base, the trust store and the global config directory | The agent must not replace the socket or CA, approve its own config by writing the trust store, or edit the unapproved global layer. |
+| Deny reads of the user's credential stores (`~/.config/gh`, `~/.config/gcloud`, `~/.aws`, `~/.kube`, the keychain) | Otherwise the agent reads the credentials Airlock brokers, directly, bypassing the broker entirely. |
+| Deny inspecting other processes | Otherwise the agent can read other processes' environments, including another session's token (see [Token binding](#token-binding), which makes a copied token useless outside its own process tree, but does not cover *other* secrets sitting in another process's environment). |
+
+`airlock session start` also hands the harness the **whole environment of the shell it was started from**, unlike `airlock run`, which passes an explicit allowlist. Start that shell plainly, not from inside `op run` or another command that has secrets in its own environment.
+
+`airlock agent check` tests what it can from inside the harness's own process — whether `admin.token` can be read, whether the runtime base and trust store can be written, whether any tool's secret is already sitting in the environment, whether the well-known credential stores can be read — but a hook may run outside the harness's actual sandbox even when the harness commands it starts are inside one, so a pass from the hook is not the same claim as a pass from `agent check` run through the harness's own shell tool. See `docs/airlock-v2-ux.md#what-airlock-agent-check-verifies` for exactly what each probe is and isn't.
+
+### Claude Code sandbox configuration
+
+Claude Code's own `settings.json` `sandbox` block can meet the table above. The paths below are **examples** — always confirm the exact paths for your machine with `airlock config --paths`, since the runtime base and global config directory vary by platform and by `$XDG_*` overrides:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "network": { "allowUnixSockets": ["/run/user/1000/airlock/airlock.sock"] },
+    "deny": {
+      "read": [
+        "/run/user/1000/airlock",
+        "~/.config/gh",
+        "~/.config/gcloud",
+        "~/.aws",
+        "~/.kube"
+      ],
+      "write": [
+        "/run/user/1000/airlock",
+        "~/.local/state/airlock/trust",
+        "~/.config/airlock"
+      ]
+    }
+  }
+}
+```
+
+The one read exception is the Unix socket itself (`.../airlock/airlock.sock`): the agent must be able to `connect()` to it to reach the daemon at all, even though it must not be able to open `admin.token` sitting next to it. If Claude Code's sandbox schema cannot express "connect to this socket, but deny reading this sibling file" as narrowly as Airlock's own Seatbelt/Landlock profiles do, deny read access to the whole runtime base and rely on the socket connect working at the syscall level regardless of a file-read deny (connecting to a Unix socket is not a file read). Keychain and other platform-specific credential stores need the harness's own equivalent denial; Claude Code's sandbox settings and this example do not cover them exhaustively — check what the harness's current sandbox schema supports and extend the deny list to match the credential-store row of the table above.
+
 ## Process isolation
 
 - Each tool is placed in its own **process group** via `setpgid(0, 0)` in the `pre_exec` closure.
@@ -203,7 +311,7 @@ Clipboard reads can return password-manager tokens; `open <url>` reveals OAuth r
 
 ### Timeout enforcement
 
-- Global default: 300 seconds (configurable via `timeout` in `airlock.toml`).
+- Global default: 300 seconds (configurable via `timeout` in the config).
 - Per-tool override: `timeout` field in `[tools.NAME]`.
 - On timeout: SIGTERM to the process group, 5-second grace period, then SIGKILL escalation.
 
@@ -223,11 +331,11 @@ If no stdin data arrives within 2 seconds of tool start, the daemon closes the c
 
 ### Only credential-requiring tools go through Airlock
 
-Airlock is not a general-purpose command runner. **Only tools that need secrets should be declared in `airlock.toml`.** Everything else — `grep`, `cargo`, `npm`, `make`, `ls`, shell scripts, build tools — should run directly through the agent harness's own sandbox. (`git` spans both worlds: local reads and SSH-based operations don't need Airlock, but signed commits and HTTPS pushes that rely on a GPG key or a credential-helper token are legitimate Airlock-brokered workflows.)
+Airlock is not a general-purpose command runner. **Only tools that need secrets should be declared in the config.** Everything else — `grep`, `cargo`, `npm`, `make`, `ls`, shell scripts, build tools — should run directly through the agent harness's own sandbox. (`git` spans both worlds: local reads and SSH-based operations don't need Airlock, but signed commits and HTTPS pushes that rely on a GPG key or a credential-helper token are legitimate Airlock-brokered workflows.)
 
 This is important for two reasons:
 
-1. **Smaller attack surface.** The fewer tools that receive secrets, the fewer opportunities for leakage. An Airlock config with two tools (`gh`, `tofu`) is far safer than one with twenty.
+1. **Smaller attack surface.** The fewer tools that receive secrets, the fewer opportunities for leakage. A config with two tools (`gh`, `tofu`) is far safer than one with twenty.
 2. **Agent capability.** The agent still needs general-purpose tooling to do its job — reading files, running builds, executing tests. Those don't require credentials and shouldn't be routed through Airlock.
 
 A typical setup:
@@ -324,7 +432,7 @@ Egress restriction is the second layer, not the first. It makes the set of hosts
 ### What the daemon does for each execution
 
 1. Binds a TCP listener on `127.0.0.1:0` and reads back the **actual** port. The listener lives exactly as long as the child. Every exit path (normal exit, timeout, kill, client disconnect) closes it. When no proxy tool is running, nothing is bound.
-2. Generates a random 32-byte token. The tool authenticates with `Proxy-Authorization: Basic base64("airlock:<token>")`. The proxy compares it in constant time and answers `407` on a mismatch. **The token is mandatory.** Airlock's trust boundary is a `0700` Unix socket, but a loopback TCP port has no file mode, so any local user can connect to it. Without the token, another user could connect during an exec and have the daemon attach credentials to *their* requests. The tool can see the token, and so can the agent. This is fine: the token gives nothing that the agent does not already have through `airlock exec`.
+2. Generates a random 32-byte token. The tool authenticates with `Proxy-Authorization: Basic base64("airlock:<token>")`. The proxy compares it in constant time and answers `407` on a mismatch. **The token is mandatory.** A session's trust rests on its token, but a loopback TCP port has no file mode, so any local user can connect to it. Without this token, another user could connect during an exec and have the daemon attach credentials to *their* requests. The tool can see the token, and so can the agent. This is fine: the token gives nothing that the agent does not already have through `airlock exec`.
 3. Sets these environment variables:
    - `HTTPS_PROXY` / `https_proxy` / `HTTP_PROXY` / `http_proxy` / `ALL_PROXY` / `all_proxy` to `http://airlock:<token>@127.0.0.1:<port>`.
    - `NO_PROXY` / `no_proxy` to an empty string.
@@ -365,14 +473,14 @@ The proxy also changes the request so that the redactor can read the response. I
 
 ### Response redaction
 
-The proxy redacts everything the upstream sends back before it reaches the tool. It uses the same automaton and the same secret set as the tool's stdout: raw, base64, URL-encoded and hex variants of *every* declared secret, not only the secret of this route.
+The proxy redacts everything the upstream sends back before it reaches the tool. It uses the same automaton and the same secret set as the tool's stdout: raw, base64, URL-encoded and hex variants of *every* secret in the session, not only the secret of this route.
 
 - **All response header values**, including `Location`, `Set-Cookie` and `WWW-Authenticate`. If a value is not a valid header value after replacement, the proxy drops it. It never forwards the original.
 - **The body**, streamed. The proxy buffers only a possible partial match at the end of a frame. So a multi-gigabyte download costs the same as a small one, and the tool's read rate controls the upstream read rate. A secret split across two upstream writes is still caught.
 - **Trailers** are dropped, not forwarded.
 - **The upstream's reason phrase** is dropped. `HTTP/1.1 200 <anything>` is a legal status line, and the reason phrase is outside the header map. So the tool sees the status code with the standard phrase, never the upstream's text.
 
-The proxy takes the redactor from the daemon's live handle for each response. It does not use a copy taken when the exec started. A tool can run for minutes, and the proxy injects the value the store holds *now*. The redactor keeps the two newest values of a refreshed secret, so a refresh that happens in the middle of a response is still covered.
+The proxy takes the redactor from the session's live handle for each response. It does not use a copy taken when the exec started. A tool can run for minutes, and the proxy injects the value the store holds *now*. The redactor keeps the two newest values of a refreshed secret, so a refresh that happens in the middle of a response is still covered.
 
 A `[REDACTED:name]` placeholder does not have the same length as the secret it replaces. So the upstream `Content-Length` is wrong whenever something matches, and the proxy cannot know this before it has read the body. For this reason the proxy removes `Content-Length` from every response that has a body, and hyper sends the response with chunked encoding (HTTP/1.1 always supports it). A response without a body (HEAD, `1xx`, `204`, `304`) keeps its `Content-Length`. In such a response the length describes the resource, not the bytes on the wire, so `curl -I` still shows it.
 
@@ -388,13 +496,13 @@ If the proxy replaced anything in a response, the audit log records it. When the
 
 The CONNECT authority is the single source of truth. It selects the route. It is the name in the leaf certificate shown to the tool. It is the name the proxy resolves and connects to. It is the name the proxy verifies the upstream certificate against (TLS 1.2 or later, public roots). The proxy ignores the client's SNI completely. So `curl --resolve`, `--connect-to`, a forged `Host` header or a forged SNI cannot make any two of these disagree. The proxy resolves DNS once and connects to the exact `SocketAddr` that passed the address check, so DNS rebinding cannot change the address between the check and the connection.
 
-The proxy logs each request to the ring buffer: tool, method, host, path, decision and upstream status. It never logs a header value or the query string, because the query string can contain data.
+The proxy logs each request to the ring buffer: tool, method, host, path, decision and upstream status, tagged with the session id. It never logs a header value or the query string, because the query string can contain data.
 
 ### The CA
 
-- ECDSA P-256. The daemon generates it once, **after** daemonization, and holds it in memory. The key is **never written to disk**. A restart creates a new CA. Nothing needs to trust the CA across restarts, because only children of the same daemon use it.
+- ECDSA P-256. The daemon generates one CA per **session**, not per daemon, when `Register`/`Reload` finds a proxy tool in the session's config, and holds it in memory. The key is **never written to disk**. Nothing needs to trust a CA across sessions, because only children of the session that minted it use it.
 - `CA:TRUE, pathlen:0`, plus X.509 **Name Constraints** that permit only the DNS names in the routes. So even a leaked key cannot sign certificates for other sites. A permitted subtree also covers the apex and deeper labels (`*.example.com` permits `example.com`). Route matching still decides exactly which certificates the proxy issues.
-- Only the **certificate** is written to disk, to `{sandbox_root}/airlock-ca.pem` (mode `0644`), next to `airlock.sock` and `airlock.pid`. The daemon removes it at graceful shutdown. If it is left behind, the next start removes it as stale state.
+- Only the **certificate** is written to disk, to `<runtime base>/ca/<session-id>.pem` (mode `0644`), in the per-user runtime directory, never in the project, via a temp file and `rename` so a tool mid-`exec` never sees the path momentarily gone. A `Reload` whose routes are unchanged keeps the same CA — same key, same file, no rewrite — and only mints and writes a new one when the DNS names a route can reach actually change. It is readable only by that session's own proxy tools — see the Seatbelt ordering note under [macOS — Apple Seatbelt](#macos--apple-seatbelt-sbpl). The daemon removes the file unconditionally whenever the session ends, and also the moment a `Reload` drops the session's last proxy tool, rather than only when the session's *current* policy happens to have one — a reload can change policy's shape across its own lifetime, and the file's existence does not track it. If one is left behind anyway (a crash), the next daemon start removes it as stale state.
 - The bundle given to the tool contains **only** this CA. The proxy intercepts every connection the tool can make, so the tool does not need public roots. Without them, a direct connection that somehow escaped the sandbox would still fail TLS.
 - Tested: Apple's system `/usr/bin/curl` 8.7.1 (SecureTransport / LibreSSL 3.3.6) reads `CURL_CA_BUNDLE` for a connection through the proxy and accepts a leaf certificate from the name-constrained CA. Homebrew curl is not needed.
 
@@ -410,19 +518,43 @@ The proxy logs each request to the ring buffer: tool, method, host, path, decisi
 
 ## Config safety
 
-- **Discovery**: `airlock.toml` is found by walking up from CWD toward `$HOME`. Only files **owned by the current effective UID** are accepted, preventing privilege escalation via a crafted config in a shared directory.
-- **TOCTOU-safe open**: The config is opened with `O_NOFOLLOW` and the ownership check is run against `fstat` on the resulting fd. Rejects symlinks, non-regular files, and files whose UID changes between discovery and read. An attacker who cannot modify the containing directory cannot swap the file between the walk's ownership check and the read.
-- **Size cap**: The config is truncated at 1 MiB and refused if it would exceed that, bounding allocation if something points the daemon at an oversized file.
-- **`$HOME` sandbox-root refusal**: If `airlock.toml` is discovered directly at `$HOME`, the whole home directory would become the sandbox root — exposing it to all sandboxed tools. Airlock refuses to start in that case unless the config contains `allow_home_root = true` as an explicit opt-in.
+- **Discovery**: config is found by walking up from CWD toward `$HOME`, looking for `airlock.toml` or `airlock.local.toml`. Only files **owned by the current effective UID** are accepted, preventing privilege escalation via a crafted config in a shared directory.
+- **Parent configs are opt-in, approved, and outside the sandbox.** After discovery finds the root, the launcher keeps walking up to just below `$HOME` for directories whose config sets `cascade = true`, under the same ownership check. Each such file is approved byte for byte like a project file, in its own directory's trust-store slot, so `cascade = true` is itself part of what the user approved: a file approved as a project root of its own never starts reaching the projects below it on its own. The sandbox root stays the nearest config, so a parent's files are outside every agent's write reach below them. The tradeoff is reach: a parent's tools and secrets (a `kubectl` with production credentials, say) now serve every project below it, including a freshly cloned repo the user hasn't reviewed. A project sets `inherit = false` to take none of them. Parent secrets follow the global layer's rule: a repo item cannot reference a parent's label, and a repo label reaches a parent binding only through an approved local `from = "parent"` line, so a repo cannot point its own tool at the parent's credentials by naming them. Relative paths in a parent resolve against the parent's directory, so a parent's write grant can cover sibling projects; `airlock config` shows each resolved path and its layer.
+- **TOCTOU-safe open**: Each file is opened with `O_NOFOLLOW` and the ownership check is run against `fstat` on the resulting fd. Rejects symlinks, non-regular files, and files whose UID changes between discovery and read. An attacker who cannot modify the containing directory cannot swap the file between the walk's ownership check and the read.
+- **Size cap**: Each config file is truncated at 1 MiB and refused if it would exceed that, bounding allocation if something points the launcher at an oversized file.
+- **`$HOME` sandbox-root refusal**: If config is discovered directly at `$HOME`, the whole home directory would become the sandbox root — exposing it to all sandboxed tools and the agent. Airlock refuses to start in that case unless the merged config contains `allow_home_root = true` (global or local layer only — a config error in the repo layer, since the repo can't know where each user's home is).
+- **Unknown keys are a config error, in every layer, at every level.** A typo or a stray key from an old schema fails loudly at load time instead of being silently ignored and taking no effect.
 - **Tool name validation**: Names must not contain `/` or `\`. This prevents PATH traversal attacks (e.g., `../../bin/malicious`).
-- **CWD validation**: The client's working directory must be a subdirectory of (or equal to) the sandbox root. This uses proper path-component prefix checking — `"/tmp/project-evil"` does not pass validation for sandbox root `"/tmp/project"`.
-- **Secret-fetcher commands bypass the sandbox.** `[secrets.<label>]` entries with `source = "command"` spawn processes under the daemon itself, inheriting its environment and filesystem permissions — Seatbelt/Landlock enforcement applies only to tool invocations, not to these commands. When `refresh` is set, the command re-runs on every interval for the daemon's lifetime. Review every `command = [...]` as you would a shell script run by the daemon's user.
+- **CWD validation**: The client's working directory must be a subdirectory of (or equal to) the session's root. This uses proper path-component prefix checking — `"/tmp/project-evil"` does not pass validation for sandbox root `"/tmp/project"`.
+- **Secret-fetcher commands bypass the sandbox.** `[secrets.<label>]` entries with `source = "command"` spawn processes under the launcher, inheriting its environment and filesystem permissions — Seatbelt/Landlock enforcement applies only to tool invocations, not to these commands. When `refresh` is set, the daemon re-runs the command on every interval, using the session's stored environment and filtered `PATH`. Review every `command = [...]` as you would a shell script you'd run yourself.
+- **A filtered `PATH` resolves every binary and every command's `argv[0]`.** At session registration, the launcher takes its own `PATH`, drops relative entries and any entry inside the project root or a sandbox write grant, and uses the result both to resolve tool binaries and secret commands' `argv[0]`, and as the `PATH` handed to tools and secret commands themselves. Dropping, rather than refusing, the whole startup keeps a `node_modules/.bin`-on-`PATH` setup from direnv or mise working; a "binary not found" error names which entries were dropped and why. Without the second half — handing tools the *filtered* `PATH`, not the launcher's raw one — a declared `gh` could still end up running a planted `git` from a writable `PATH` entry, which would inherit `GH_TOKEN` through its own declared env.
+- **A session's write grants never shrink.** The agent's sandbox is fixed when `airlock run` launches it, so its write grants — the config's, `--allow-write`, built-in profile paths and kit directories — stay agent-writable for the session's whole life, whatever a later reload's config says. `session reload` passes the session's existing grants back to the launcher, which filters `PATH` and resolves secret commands against them, and the daemon itself keeps every grant a session has ever had and re-filters the reloaded `PATH` against them. Without this, a reload would let `PATH` and the binary check accept a directory the agent can still write, and the next `exec` could run a binary the agent planted there with the tool's secrets.
+- **The resolved binary is checked, not just found.** Both the tool binary and a secret command's resolved `argv[0]` are canonicalized and refused if they land inside the project root or a write grant, even if the `PATH` entry that produced them looked safe (a symlink can point from a safe entry into the project). An `argv[0]` containing `/` goes through the same check, and is refused outright if it doesn't resolve to an executable file (a dangling symlink is never checked in its unresolved form), so `command = ["./scripts/token.sh"]` is a config error — approving `airlock.toml` approves the command, not every file that command might read.
+- **Interpreter arguments are not scanned, and that's a known gap, not an oversight.** `command = ["bash", "scripts/token.sh"]` approves running `bash`, but not the contents of `scripts/token.sh` at the time it runs — an agent that rewrites that script between approval and the next `refresh` changes what the approved command does. Airlock does not scan arguments for file paths (`--flagfile=./x`, `-c @config`, …): doing so would catch some cases and miss others, creating false confidence. Treat any `command` whose arguments name a project file as approving "whatever that file says right now", and prefer commands with no such argument where you can.
 - **Stale secrets fail closed.** A refresh command that exits non-zero, times out, or fails to spawn marks the secret as stale; any subsequent `airlock exec` that references that secret returns an error rather than running the tool with the prior (likely-expired) value. The daemon keeps retrying with exponential backoff so the secret recovers automatically once the upstream is healthy. The error returned to the client names the secret label and the underlying reason — never the secret value.
+
+## Protecting the anchors
+
+Three locations decide what the daemon trusts and how clients reach it: the **runtime base** (socket, PID file, `admin.token`, proxy CAs), the **trust store** (approved copies of project config), and the **global config file** (your own, unapproved, cross-project bindings). None of them may sit where an agent's sandbox — in any project, from any layer, including an unapproved one — can write.
+
+All three are resolved from XDG variables (`$XDG_STATE_HOME`, `$XDG_CONFIG_HOME`; the runtime base ignores the environment entirely, for reasons covered in `docs/airlock-v2-design.md#runtime-directory`) and then validated before use:
+
+1. **Ownership and mode.** The trust store and runtime base must be owned by the effective uid, mode 0700, not a symlink. The global config file and its directory must be owned by the effective uid and not group- or world-writable.
+2. **Outside the project root.**
+3. **Outside every sandbox write grant**, from every config layer, including unapproved ones, and including `--allow-write` and built-in profile write paths. The one exception is macOS `$TMPDIR`, which the runtime base may legitimately sit under, because the Seatbelt deny rule (see [macOS — Apple Seatbelt](#macos--apple-seatbelt-sbpl)) carves it back out as the very last rule in every profile.
+
+The same check runs from the other side at config load: a write grant that covers an anchor is a config error, whether or not the file granting it is approved yet. So an agent that edits `airlock.toml` to grant itself write access to the trust store is refused twice — the edit itself needs approval, and even an approved grant like that is rejected outright.
+
+This closes the one anchor attack that needs no code execution: a committed `mise.toml` or `.envrc` that redirects `XDG_STATE_HOME` or `XDG_CONFIG_HOME` into the project on `cd`, applied automatically by a tool the user already trusts by path. It does **not** close the broader class of agent-written code the user runs outside any sandbox — see the next section.
+
+**Debug-only test overrides never ship.** Development and CI use `AIRLOCK_TEST_RUNTIME_DIR` and `AIRLOCK_TEST_IDLE_EXIT_SECS` to point the runtime base and the idle-exit timer at a throwaway location instead of the real per-user runtime directory. Both are read only in `cfg(debug_assertions)` builds — a release build never consults them, under any environment, so an attacker cannot use either variable to redirect a production daemon's runtime base.
 
 ## Wire-protocol limits
 
-- **NDJSON line cap**: Every line read from a client (initial control frame and per-message stdin frames) is capped at 1 MiB by `tokio-util`'s `LinesCodec`. Without this, a client that opens the socket and never sends a newline would force the daemon to grow its read buffer without bound.
-- **Overflow handling**: An oversized initial frame is answered with a generic `malformed request` / `request exceeds maximum length` error; an oversized stdin line during an active exec triggers SIGTERM → SIGKILL on the child's process group and returns `exit { code: -1 }` to the client.
+- **Two message families.** Session requests (`Exec`, `Stdin`, `StdinEof`, `List`, `Check`) and admin requests (`Register`, `Reload`, session list/revoke/renew, `Logs`, `Stop`) are separate enums on the wire, gated by separate authentication (a session token vs. `admin.token`). A request whose family doesn't match its `auth.kind` is refused before any handler sees it.
+- **NDJSON line cap**: Every line from a session-family connection is capped at 1 MiB by `tokio-util`'s `LinesCodec`, as in v1. Without this, a client that opens the socket and never sends a newline would force the daemon to grow its read buffer without bound.
+- **A separate, larger cap for the admin family.** `Register` carries a whole merged config, resolved secret values, an environment snapshot and a filtered `PATH`, which can exceed 1 MiB on its own. Admin requests come only from a trusted launcher holding `admin.token`, so a larger bound for that family only is sound; it does not weaken the bound that protects the daemon from an arbitrary session-authenticated client.
+- **Overflow handling**: An oversized session-family frame is answered with a generic `malformed request` / `request exceeds maximum length` error; an oversized stdin line during an active exec triggers SIGTERM → SIGKILL on the child's process group and returns `exit { code: -1 }` to the client.
 - **Error messages are generic**: The daemon never echoes raw parser errors or line contents back to the client — parse failures log the underlying error to the ring buffer and return `"malformed request"` so no fragment of the offending input is reflected.
 
 ## Graceful shutdown
@@ -430,9 +562,11 @@ The proxy logs each request to the ring buffer: tool, method, host, path, decisi
 On SIGTERM:
 
 1. The daemon stops accepting new connections.
-2. SIGTERM is sent to all registered child PIDs.
+2. SIGTERM is sent to all registered child PIDs, across every session.
 3. After a 5-second grace period, remaining children receive SIGKILL.
-4. PID file and socket are cleaned up.
+4. Every session ends; their proxy CA files, the PID file and the socket are cleaned up.
+
+`airlock daemon stop` and `daemon restart` ask first on a terminal when sessions exist (naming them), and refuse on a non-terminal unless `--yes` is given, since stopping ends every project's sessions, not just one.
 
 ## What Airlock does NOT protect against
 
@@ -441,6 +575,14 @@ On SIGTERM:
 **This is by design.** Airlock prevents secret *leakage*, not secret *misuse*. If you supply a GitHub token with repo-delete permissions, the agent can invoke `gh repo delete` and the tool will succeed. Airlock ensures the agent can't *extract* the token and exfiltrate it — but the tools themselves run with the full authority of the credentials they receive.
 
 **Mitigation:** Always use the narrowest possible token scope. GitHub fine-grained PATs, least-privilege IAM roles, read-only API keys. This is the single most impactful security measure you can take.
+
+### Agent-written code run outside the sandbox
+
+The agent can write files the user later runs unsandboxed, as themselves: a git hook (`.git/hooks/pre-commit`), `core.fsmonitor` or another `.git/config` setting, a committed `.envrc`, a `mise.toml` `[hooks]` entry, a `Makefile` or `package.json` script, or source code the user builds and runs. Any of that code can read `~/.config/gh`, call `op read` directly, or rewrite the trust store and global config, exactly as the user's own shell could — it runs with the user's full authority, not the agent's sandboxed one.
+
+**This predates Airlock and is not specific to it.** Code the user chooses to run outside a sandbox already defeats credential isolation on its own; the trust store cannot be held to a higher standard than the secrets it guards. Denying a fixed list of paths would not close the class either — ordinary git use (`git push -u`, `git remote add`) writes `.git/config` legitimately, and build scripts and tests run as the user whenever the user builds.
+
+**Mitigation:** [F9](#git-hooks-write-denial-f9) denies one common vector (`.git/hooks` writes) on macOS as defense in depth, which narrows but does not close this class. Review what an agent has changed in files that run outside any sandbox — hooks, `.envrc`, build scripts — the same way you'd review a PR that touches your CI config. This is also why repo and local config changes need [approval](README.md#approving-config) even though the repo file itself is "just config": the review step is the actual control, not a sandbox.
 
 ### Secrets transformed in novel ways
 
@@ -452,7 +594,7 @@ Redaction covers raw UTF-8, base64, URL-encoded, and hexadecimal forms. It does 
 
 A tool could write its secrets to a file in a writable sandbox path. If the agent can read that path on a subsequent invocation (or through another tool), the secret is exposed. This is especially dangerous if the tool is a shell or interpreter where the agent controls the script — see [tool selection guidance](#tool-selection-what-should-and-should-not-be-an-airlock-tool).
 
-**Mitigation:** Keep writable paths narrow. Don't grant tools write access to directories the agent harness can read directly. Don't declare scriptable tools.
+**Mitigation:** Keep writable paths narrow. Don't grant tools write access to directories the agent harness can read directly. Don't declare scriptable tools. `{tool_state}` (see the README's [Configuration](README.md#configuration)) keeps a tool's own config directory out of the agent's reach by construction, rather than relying on the agent not looking.
 
 ### Network exfiltration by tools
 
@@ -462,9 +604,9 @@ An ordinary tool has unrestricted outbound network access. A compromised or mali
 
 ### Memory inspection
 
-Secrets exist in the daemon's address space. An attacker with root access, `ptrace` capabilities, or core dump access can read them.
+Secrets exist in the daemon's address space — now every session's, not just one project's. An attacker with root access, `ptrace` capabilities, or core dump access can read them.
 
-**Mitigation:** Airlock applies best-effort hardening at daemon startup — `RLIMIT_CORE = 0` on both platforms, and on Linux `prctl(PR_SET_DUMPABLE, 0)` (which also blocks same-UID ptrace under `kernel.yama.ptrace_scope`). Secret values held in the daemon are wrapped in a `Secret<T>` newtype that zeroes their backing memory on drop. These are defense-in-depth; a local root user or a distro configured with a permissive `ptrace_scope` can still inspect the process. Run the daemon with appropriate OS-level protections — this remains a general concern for any process holding secrets.
+**Mitigation:** Airlock applies best-effort hardening at daemon startup — `RLIMIT_CORE = 0` on both platforms, and on Linux `prctl(PR_SET_DUMPABLE, 0)` (which also blocks same-UID ptrace under `kernel.yama.ptrace_scope`). Secret values held in the daemon are wrapped in a `Secret<T>` newtype that zeroes their backing memory on drop. These are defense-in-depth; a local root user or a distro configured with a permissive `ptrace_scope` can still inspect the process. Run the daemon with appropriate OS-level protections — this remains a general concern for any process holding secrets, and is a cost of the one-daemon-per-user design: a single compromise now reaches every project's secrets rather than one. [F10](docs/airlock-v2-design.md#follow-ups) (moving the proxy, the largest piece of untrusted parsing, into its own process) is the planned next reduction; it does not change this section.
 
 ### Secrets visible via `/proc/<child_pid>/environ`
 
@@ -476,6 +618,6 @@ Airlock assumes same-UID processes are not adversarial — the enclosing agent s
 
 ### Agent harness escape
 
-If the agent harness is not sandboxed, the agent could read the daemon's PID file, connect to the socket directly, and request tool execution — or attempt to read secrets from `/proc/<daemon_pid>/mem`. Airlock's daemon-client split only provides isolation if the agent actually runs in a restricted environment.
+If the agent harness is not sandboxed — or runs under an external sandbox that doesn't meet the [External sandboxes](#external-sandboxes) requirements — the agent could read the runtime directory, connect to the socket directly, or read another session's secrets from `/proc/<daemon_pid>/mem`. Airlock's daemon-client split only provides isolation if the agent actually runs in a restricted environment that meets those requirements.
 
-**Mitigation:** Always sandbox the agent harness. Use `airlock run` (built-in OS-level sandbox), Claude Code's `--sandbox` mode, Docker, nsjail, bubblewrap, or similar. See the README's ["Where Airlock fits"](README.md#where-airlock-fits) section.
+**Mitigation:** Always sandbox the agent harness. Use `airlock run` (built-in OS-level sandbox), Claude Code's `--sandbox` mode with the [configuration above](#claude-code-sandbox-configuration), Docker, nsjail, bubblewrap, or similar. See the README's ["Where Airlock fits"](README.md#where-airlock-fits) section.

@@ -1,0 +1,15 @@
+# ~/work/oss-fork/airlock.local.toml — a fork of an outside project that
+# happens to live under ~/work. Its code isn't the team's, so it gets none
+# of the work tools or credentials.
+
+inherit = false   # ignore ~/work/airlock.toml and every other parent config
+
+[tools.gh]
+description = "GitHub CLI"
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["gh", "auth", "token"]

@@ -1,0 +1,51 @@
+# ~/work/airlock.toml — shared by every repo under ~/work, as a parent
+# config. Not a project of its own here: each repo below keeps its own
+# directory as its sandbox root, so an agent in ~/work/api cannot write this
+# file or the sibling repos.
+#
+# Approved like any project file, once for every repo below it. See the
+# README in this directory for what each repo ends up with.
+
+cascade = true   # also applies to projects in subdirectories
+
+# Labels bound here serve this file's own tools. A repo below reaches one
+# only through `from = "parent"` in its airlock.local.toml.
+[secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+description = "Short-lived token for the work GCP org"
+source      = "command"
+command     = ["gcloud", "auth", "print-access-token"]
+timeout     = 30
+refresh     = 3000
+
+[secrets.ARGOCD_AUTH_TOKEN]
+description = "Argo CD token for the work cluster"
+source      = "command"
+command     = ["op", "read", "op://Work/ArgoCD/token"]
+
+[tools.gcloud]
+description = "Google Cloud CLI (work org)"
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN    = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG               = "{tool_state}"   # per project, outside it
+CLOUDSDK_CORE_DISABLE_PROMPTS = "1"
+
+[tools.kubectl]
+description = "Kubernetes CLI (work cluster)"
+
+[tools.kubectl.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG            = "{tool_state}"
+KUBECONFIG                 = "{tool_state}/kubeconfig"
+
+[tools.argocd]
+description = "Argo CD CLI"
+
+[tools.argocd.env]
+ARGOCD_AUTH_TOKEN = { secret = "ARGOCD_AUTH_TOKEN" }
+ARGOCD_SERVER     = "argocd.example.com"
+
+# A relative path in a parent resolves against this directory (~/work), not
+# the project's: every repo below gets read access to ~/work/platform/schemas.
+[filesystem]
+read = ["platform/schemas"]

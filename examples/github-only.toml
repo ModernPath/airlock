@@ -1,9 +1,10 @@
 # Minimal setup: GitHub CLI only
 #
-# Start the daemon:
-#   GH_TOKEN="ghp_xxxx" airlock daemon start
-#
 # Use it:
+#   cp examples/github-only.toml airlock.toml
+#   airlock run --profile claude        # asks you to trust the file the first time
+#
+# Inside the agent:
 #   airlock exec -- gh repo list
 #   airlock exec -- gh pr create --title "fix: typo" --body "Fixed a typo"
 #   airlock exec -- gh issue list --label bug
@@ -15,7 +16,8 @@
 write = ["/tmp"]
 
 # `from` is optional — it defaults to the label, so [secrets.GH_TOKEN] reads
-# the GH_TOKEN env var.
+# the GH_TOKEN env var. Supply it with `GH_TOKEN=... airlock run` or, better,
+# `op run -- airlock run` (see examples/secret-sources.toml).
 [secrets.GH_TOKEN]
 source = "env"
 
@@ -23,11 +25,11 @@ source = "env"
 description = "GitHub CLI"
 timeout = 60
 
-# `{sandbox_root}` expands to the canonicalized directory containing this
-# file, so each checkout gets its own gh config under
-# `<project>/.config/gh` instead of sharing `~/.config/gh`. Drop the env
-# line (and add `extra_read = ["~/.config/gh"]`) to use your global gh
-# auth instead.
+# `{tool_state}` expands to a per-project, per-tool directory under
+# $XDG_CACHE_HOME/airlock, outside the project and outside the agent's own
+# sandbox, so each checkout gets its own gh config instead of sharing
+# `~/.config/gh`. Drop the env line (and add `extra_read = ["~/.config/gh"]`)
+# to use your global gh auth instead.
 [tools.gh.env]
 GH_TOKEN = { secret = "GH_TOKEN" }
-GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
+GH_CONFIG_DIR = "{tool_state}"

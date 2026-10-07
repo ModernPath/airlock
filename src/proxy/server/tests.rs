@@ -348,7 +348,7 @@ impl Harness {
         let ring_buffer = RingBuffer::new();
         let redactor = live_redactor(&secrets);
         let shared = Arc::new(ProxyShared {
-            ca,
+            ca: Arc::new(ca),
             ca_path: PathBuf::from("/nonexistent/airlock-ca.pem"),
             secrets: Arc::clone(&secrets),
             redactor: Arc::clone(&redactor),

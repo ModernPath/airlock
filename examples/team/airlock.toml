@@ -1,0 +1,36 @@
+# The team's config for acme/app — checked into the repo, approved by
+# everyone who runs `airlock run` here (`airlock trust` reviews it first).
+#
+# The two secret labels below have no `source`: that's a request to each
+# user, not an oversight. See airlock.local.toml in this directory for how
+# one user binds them, and the README in this directory for the merged
+# result and the first-run transcript.
+
+timeout = 120
+
+[secrets.GH_TOKEN]
+description = "GitHub token with read access to acme/app"
+
+[secrets.CLOUDFLARE_API_TOKEN]
+description = "Cloudflare token, Zone:Read on acme.dev"
+
+[tools.gh]
+description = "GitHub CLI"
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
+
+[tools.tofu]
+description = "OpenTofu — Cloudflare DNS provider"
+
+[tools.tofu.env]
+CLOUDFLARE_API_TOKEN = { secret = "CLOUDFLARE_API_TOKEN" }
+
+[filesystem]
+read = ["/opt/homebrew/share"]
+
+[agent]
+passthrough_env = ["NO_COLOR"]
+
+[agent.env]
+LOG_LEVEL = "info"

@@ -1,36 +1,39 @@
 //! Configuration discovery, parsing, and validation for Airlock.
 //!
 //! This module is responsible for:
-//! - Discovering `airlock.toml` by walking from a starting directory up to `$HOME`
 //! - Verifying config file ownership against the current effective uid
 //! - Parsing the TOML config into strongly-typed structures
 //! - Resolving paths (tilde expansion, relative-to-sandbox-root resolution)
-//! - Deriving socket and PID file paths from the sandbox root
 //! - Validating tool names (no path separators)
-//! - Providing a lightweight socket-path-only discovery for client use
 //!
-//! This module is consumed by nearly every other module: the daemon needs the
-//! full parsed config, the client needs the socket path, and commands like
-//! `status` and `stop` need the PID file path.
+//! Discovery itself — walking from a directory up to `$HOME`, merging the
+//! global/repo/local layers — is [`crate::layers`]; this module resolves the
+//! merged, normalized wire form ([`resolve_wire_config`]) the daemon
+//! actually runs against.
 
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proxy::{HostPattern, Inject, PathRule, ProxyPolicy, ProxyRoute, RouteError};
+use crate::sandbox::ToolAccess;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
-/// The config file name searched for during discovery.
-const CONFIG_FILENAME: &str = "airlock.toml";
+/// The repo config file name searched for during discovery.
+pub(crate) const CONFIG_FILENAME: &str = "airlock.toml";
 
-/// Maximum bytes to read from `airlock.toml`. A real config is well under this;
-/// the cap bounds allocation when something (or someone) points the daemon at
-/// an oversized file.
-const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
+/// The local config file name — the user and agent's own layer, approved
+/// like the repo file but never committed.
+pub(crate) const LOCAL_CONFIG_FILENAME: &str = "airlock.local.toml";
+
+/// Maximum bytes to read from a config file. A real config is well under
+/// this; the cap bounds allocation when something (or someone) points the
+/// daemon at an oversized file.
+pub(crate) const MAX_CONFIG_BYTES: u64 = 1024 * 1024;
 
 /// Default global timeout in seconds (5 minutes).
 const DEFAULT_TIMEOUT_SECS: u64 = 300;
@@ -38,33 +41,11 @@ const DEFAULT_TIMEOUT_SECS: u64 = 300;
 /// Default timeout in seconds for `source = "command"` secret fetching.
 const DEFAULT_COMMAND_SECRET_TIMEOUT_SECS: u64 = 10;
 
-/// Socket filename derived from the sandbox root.
-const SOCKET_FILENAME: &str = "airlock.sock";
-
-/// PID file filename derived from the sandbox root.
-const PID_FILENAME: &str = "airlock.pid";
-
-/// Filename of the proxy CA certificate, derived from the sandbox root.
-///
-/// It lives beside the socket and the PID file so it falls inside the
-/// sandbox root every tool can already read. Only the certificate is written;
-/// the key never leaves the daemon's memory.
-const CA_CERT_FILENAME: &str = "airlock-ca.pem";
-
 // ─── Error type ───────────────────────────────────────────────────────────────
 
 /// Errors that can occur during config discovery, parsing, or validation.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// No valid `airlock.toml` was found between the starting directory and `$HOME`.
-    #[error("no valid airlock.toml found between {start_dir} and $HOME ({home_dir})")]
-    NotFound {
-        /// The directory where the search started.
-        start_dir: PathBuf,
-        /// The `$HOME` directory where the search stopped.
-        home_dir: PathBuf,
-    },
-
     /// The `$HOME` environment variable is not set.
     ///
     /// Required for tilde expansion and as the discovery walk boundary.
@@ -89,12 +70,17 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
-    /// A tool name contains a path separator character.
+    /// A tool name contains a character outside the allowed set.
     ///
-    /// Tool names must be bare identifiers (e.g., `"mytool"`, `"python3"`);
-    /// names containing `/` or `\` are rejected at parse time for safety.
+    /// Tool names must be bare identifiers (e.g., `"mytool"`, `"python3"`):
+    /// ASCII letters, digits, `.`, `_`, `+` and `-` only. This is narrower
+    /// than "not a path separator" because the name is interpolated,
+    /// unescaped, into error messages a user reads before ever approving
+    /// the config that chose it — a control character, bidi override or
+    /// zero-width character in the name could otherwise reorder or hide
+    /// terminal text at that point.
     #[error(
-        "invalid tool name {name:?}: tool names must not contain path separators ('/' or '\\')"
+        "invalid tool name {name:?}: tool names may only contain ASCII letters, digits, '.', '_', '+' and '-'"
     )]
     InvalidToolName {
         /// The offending tool name.
@@ -309,75 +295,459 @@ pub enum ConfigError {
         /// The undeclared label.
         label: String,
     },
+
+    /// A `[secrets.<label>]` entry sets fields that disagree with its own
+    /// `source` (e.g. `source = "env"` with a `command` array), or is
+    /// missing a field its `source` requires.
+    #[error("[secrets.{label}] {reason}")]
+    SecretFieldMismatch {
+        /// The secret label.
+        label: String,
+        /// Which fields disagree and why.
+        reason: String,
+    },
+
+    /// A `[secrets.<label>]` `source` value is not `"env"` or `"command"`.
+    #[error("[secrets.{label}] unknown source {got:?}; expected \"env\" or \"command\"")]
+    UnknownSecretSource {
+        /// The secret label.
+        label: String,
+        /// The offending value.
+        got: String,
+    },
+
+    /// An `access` value (top-level or `[tools.<name>]`) is not one of the
+    /// three recognized levels.
+    #[error(
+        "{context}: unknown access level {got:?}; expected \"none\", \"system\", or \"default\""
+    )]
+    UnknownAccessLevel {
+        /// Where the value appeared: `"access"` or `"tools.<name>.access"`.
+        context: String,
+        /// The offending value.
+        got: String,
+    },
+
+    /// A `[secrets.<label>]` entry has no `source`, parsed in a context
+    /// (the legacy single-file loaders) where nothing can bind it later.
+    #[error(
+        "[secrets.{label}] has no source; a source is required outside the repo/local layering"
+    )]
+    SecretMissingSource {
+        /// The secret label.
+        label: String,
+    },
+
+    /// A path in the global layer is not absolute. The global file applies
+    /// to every project, so a relative path would mean something different
+    /// in each one.
+    #[error("{file}: {path:?} is a relative path, which is not allowed in the global config")]
+    RelativePathInGlobal {
+        /// The global config file.
+        file: PathBuf,
+        /// The offending raw path string.
+        path: String,
+    },
+
+    /// `allow_home_root` was set in the repo layer, which is not allowed —
+    /// only the global and local layers may opt into a `$HOME` sandbox root.
+    #[error("{file}: allow_home_root is not allowed in the repo config")]
+    AllowHomeRootInRepo {
+        /// The repo config file.
+        file: PathBuf,
+    },
+
+    /// `[tools.<name>] override = true` was set outside the local layer.
+    #[error("{file}: tool {tool:?} sets override, which is only allowed in airlock.local.toml")]
+    OverrideOutsideLocal {
+        /// The file that set it.
+        file: PathBuf,
+        /// The offending tool.
+        tool: String,
+    },
+
+    /// `[kits.<name>]` was set in the repo layer, which is not allowed —
+    /// same spirit as [`ConfigError::AllowHomeRootInRepo`]: a teammate's
+    /// checked-in file must not decide what a kit may write in your home.
+    #[error(
+        "{file}: [kits.*] is not allowed in the repo config; set it in airlock.local.toml or your global config"
+    )]
+    KitsInRepo {
+        /// The repo config file.
+        file: PathBuf,
+    },
+    /// A built-in kit's `[kits.<name>]` table set `read`, `write` or `env`,
+    /// which only a user-defined kit may use.
+    #[error(
+        "[kits.{kit}] is a built-in kit; only `mode` is allowed ({field} is not — built-in kits \
+         have their own fixed paths and env)"
+    )]
+    KitBuiltinExtraField {
+        /// The built-in kit name.
+        kit: String,
+        /// The field it illegally set (`"read"`, `"write"`, or `"env"`).
+        field: &'static str,
+    },
+    /// A built-in kit's `[kits.<name>]` table set `mode` to something other
+    /// than `"isolated"` or `"shared"`.
+    #[error("[kits.{kit}] mode {mode:?} is not valid; use \"isolated\" or \"shared\"")]
+    KitUnknownMode {
+        /// The built-in kit name.
+        kit: String,
+        /// The offending mode string.
+        mode: String,
+    },
+    /// A user-defined kit's `[kits.<name>]` table set `mode`, which only a
+    /// built-in kit has.
+    #[error("[kits.{kit}] sets mode, which only a built-in kit (rust, node, python, go) has")]
+    KitUserDefinedHasMode {
+        /// The user-defined kit name.
+        kit: String,
+    },
+    /// A kit's `read`, `write` or `env` references `{tool_state}` — the
+    /// agent must never see a tool's own state.
+    #[error(
+        "[kits.{kit}].{field} references {{tool_state}}, which is reserved for tools; the \
+         agent sandbox has no access to it"
+    )]
+    KitToolStateForbidden {
+        /// The kit name.
+        kit: String,
+        /// Where the placeholder appeared (`"read"`, `"write"`, or `"env"`).
+        field: &'static str,
+    },
+    /// A key in a user-defined kit's `env` table is not a valid POSIX
+    /// environment variable name.
+    #[error("[kits.{kit}.env] invalid environment variable name: {name:?}")]
+    KitInvalidEnvVarName {
+        /// The kit name.
+        kit: String,
+        /// The offending env var name.
+        name: String,
+    },
+    /// A static value in a user-defined kit's `env` table references a
+    /// placeholder other than `{kit_state}`.
+    #[error(
+        "[kits.{kit}.env.{var_name}] references unknown placeholder {{{placeholder}}}; only {{kit_state}} is supported"
+    )]
+    KitUnknownEnvPlaceholder {
+        /// The kit name.
+        kit: String,
+        /// The env var name.
+        var_name: String,
+        /// The unrecognized placeholder key.
+        placeholder: String,
+    },
+    /// A static value in a user-defined kit's `env` table is a malformed
+    /// template.
+    #[error("[kits.{kit}.env.{var_name}] is not a valid template: {message}")]
+    KitEnvTemplateParse {
+        /// The kit name.
+        kit: String,
+        /// The env var name.
+        var_name: String,
+        /// The underlying parser message.
+        message: String,
+    },
+    /// `agent.kits` names a kit that is neither built-in nor declared by any
+    /// `[kits.<name>]` table.
+    #[error(
+        "agent.kits names {kit:?}, which is not a built-in kit and has no [kits.{kit}] table; \
+         known kits: {}",
+        known.join(", ")
+    )]
+    UnknownKit {
+        /// The offending name.
+        kit: String,
+        /// Every kit name known at merge/resolve time (built-ins plus any
+        /// `[kits.<name>]` table), sorted.
+        known: Vec<String>,
+    },
+    /// An `[agent.env.<key>]` entry collides with an env var an active kit
+    /// also sets.
+    #[error("[agent.env.{key}] is also set by kit {kit}; drop one of them")]
+    AgentEnvSetByKit {
+        /// The colliding env var name.
+        key: String,
+        /// The kit that sets it too.
+        kit: String,
+    },
+
+    /// `[secrets.<label>] from = "<value>"` where `<value>` is neither
+    /// `"global"` nor `"parent"` — the only links a layer file may express
+    /// without its own `source`.
+    #[error(
+        "{file}: [secrets.{label}] from = {value:?} is invalid; a label without its own source \
+         can only take \"global\" or \"parent\""
+    )]
+    InvalidFromValue {
+        /// The file that set it.
+        file: PathBuf,
+        /// The secret label.
+        label: String,
+        /// The offending value.
+        value: String,
+    },
+
+    /// `[secrets.<label>] from = "global"` or `"parent"` appeared outside
+    /// the local layer.
+    #[error("{file}: [secrets.{label}] from = {from:?} is only allowed in airlock.local.toml")]
+    FromOutsideLocal {
+        /// The file that set it.
+        file: PathBuf,
+        /// The secret label.
+        label: String,
+        /// `"global"` or `"parent"`.
+        from: String,
+    },
+
+    /// A local `from = "global"` or `from = "parent"` link names a label
+    /// that layer does not bind.
+    #[error("{file}: [secrets.{label}] from = {from:?}, but {}", match from.as_str() {
+        "parent" => "no parent config with cascade = true binds it",
+        _ => "the global config does not bind it",
+    })]
+    UnboundLink {
+        /// The local file that set it.
+        file: PathBuf,
+        /// The secret label.
+        label: String,
+        /// `"global"` or `"parent"`.
+        from: String,
+    },
+
+    /// `cascade` or `inherit` in the global file, which already applies to
+    /// every project.
+    #[error("{file}: {key} has no meaning in the global config, which applies to every project")]
+    InheritanceKeyInGlobal {
+        /// The global config file.
+        file: PathBuf,
+        /// `"cascade"` or `"inherit"`.
+        key: &'static str,
+    },
+
+    /// A local `[secrets.<label>]` has neither its own `source` nor a
+    /// `from` link, so it binds nothing.
+    #[error(
+        "{file}: [secrets.{label}] needs a source, from = \"global\" or from = \"parent\"; a local \
+         secret must bind to something"
+    )]
+    LocalSecretUnbound {
+        /// The local config file.
+        file: PathBuf,
+        /// The secret label.
+        label: String,
+    },
+
+    /// No `airlock.toml` or `airlock.local.toml` was found walking up from
+    /// the working directory to `$HOME`.
+    #[error(
+        "no airlock.toml or airlock.local.toml in {start_dir} or a parent directory up to {home_dir}\n\n\
+         run `airlock init` to create one, or pass --no-project-config to use the global config alone"
+    )]
+    NoProjectConfig {
+        /// The directory the walk started from.
+        start_dir: PathBuf,
+        /// The `$HOME` directory where the walk stopped.
+        home_dir: PathBuf,
+    },
+
+    /// A tool of the same name is defined in both the repo and local layers,
+    /// and the local layer did not set `override = true`.
+    #[error(
+        "tool {tool:?} is defined in both {repo_file} and {local_file};\n       add `override = true` to the tool in airlock.local.toml to replace the repo's"
+    )]
+    DuplicateTool {
+        /// The tool name.
+        tool: String,
+        /// The repo layer's file.
+        repo_file: PathBuf,
+        /// The local layer's file.
+        local_file: PathBuf,
+    },
+
+    /// `[tools.<name>] override = true` in the local layer, but the repo
+    /// layer defines no tool of that name.
+    #[error("{local_file}: tool {tool:?} sets override, but the repo defines no {tool:?}")]
+    OverrideWithoutRepoTool {
+        /// The local layer's file.
+        local_file: PathBuf,
+        /// The tool name.
+        tool: String,
+    },
+
+    /// One or more repo-declared secret labels have no source and no local
+    /// binding.
+    #[error(
+        "{} secret(s) in {repo_file} have no source:\n{}\n\
+         the project leaves these to you. `airlock init --local` creates\n\
+         airlock.local.toml with a stub for each.",
+        labels.len(),
+        labels
+            .iter()
+            .map(|(label, description)| match description {
+                Some(d) => format!("  {label}  {d}"),
+                None => format!("  {label}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    )]
+    UnboundSecretLabels {
+        /// The repo layer's file.
+        repo_file: PathBuf,
+        /// `(label, description)` pairs, in a stable order.
+        labels: Vec<(String, Option<String>)>,
+    },
+
+    /// A global-layer tool or `agent.env` entry references a secret label
+    /// the global layer does not itself declare.
+    #[error(
+        "{file}: tool {item:?} uses secret {label:?}, which your global config does not declare"
+    )]
+    GlobalItemUsesNonGlobalLabel {
+        /// The global config file.
+        file: PathBuf,
+        /// The tool (or `"agent"`) that referenced it.
+        item: String,
+        /// The undeclared label.
+        label: String,
+    },
+
+    /// A repo-layer tool or `agent.env` entry references a secret label the
+    /// repo layer does not itself declare. Crossing into another layer's
+    /// label needs the local layer's explicit opt-in.
+    #[error("{file}: tool {item:?} uses secret {label:?}, which the repo config does not declare")]
+    RepoItemUsesNonRepoLabel {
+        /// The repo config file.
+        file: PathBuf,
+        /// The tool (or `"agent"`) that referenced it.
+        item: String,
+        /// The undeclared label.
+        label: String,
+    },
 }
 
 // ─── Raw TOML structures (serde) ──────────────────────────────────────────────
+//
+// These types are the wire format too (decision #3 in the v2 implementation
+// contract): the launcher sends the merged config to the daemon as a
+// `RawConfig`, normalized so every path is absolute and every secret has a
+// concrete source. `deny_unknown_fields` applies at every level, including
+// the top, so an unknown key is a config error in a file and a protocol
+// error on the wire alike.
 
-/// Raw deserialized representation of `airlock.toml`.
-///
-/// Uses `#[serde(default)]` and `Option` liberally so that missing sections
-/// and fields produce zero/empty defaults rather than parse errors.
-/// Unknown top-level keys are silently accepted via `#[serde(flatten)]` for
-/// forward compatibility. Nested tables are stricter: see
-/// [`RawToolConfig`] and [`RawSecretSpec`].
-#[derive(Debug, Deserialize)]
-struct RawConfig {
+/// Raw deserialized representation of `airlock.toml` (or `airlock.local.toml`,
+/// or a `--config` file). Which fields a given layer may use is validated
+/// after parsing, in [`crate::layers`] — the raw shape here is deliberately
+/// permissive enough to parse any layer unambiguously.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawConfig {
     /// Global timeout in seconds. Defaults to 300 (5 minutes).
-    #[serde(default)]
-    timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+
+    /// Default `access` level for every tool that doesn't set its own.
+    /// `"none"`, `"system"`, or `"default"`; unset means `"default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
 
     /// Global filesystem access paths.
-    #[serde(default)]
-    filesystem: Option<RawFilesystem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<RawFilesystem>,
 
     /// Secret sources. Each entry declares a logical label and the source
     /// used to fetch its value at daemon startup.
-    #[serde(default)]
-    secrets: Option<HashMap<String, RawSecretSpec>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secrets: Option<HashMap<String, RawSecretSpec>>,
 
     /// Per-tool definitions.
-    #[serde(default)]
-    tools: Option<HashMap<String, RawToolConfig>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tools: Option<HashMap<String, RawToolConfig>>,
 
     /// Agent section — typed and validated.
-    #[serde(default)]
-    agent: Option<RawAgentConfig>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent: Option<RawAgentConfig>,
 
     /// Explicit opt-in to using `$HOME` as the sandbox root.
     ///
-    /// When `airlock.toml` is discovered directly at `$HOME`, the sandbox root
-    /// becomes the entire home directory. This is almost always wrong; Airlock
-    /// refuses unless the user has explicitly set this flag to `true`.
-    #[serde(default)]
-    allow_home_root: Option<bool>,
+    /// When the project root is `$HOME`, the sandbox root becomes the entire
+    /// home directory. This is almost always wrong; Airlock refuses unless
+    /// the global or local layer has explicitly set this flag to `true`. A
+    /// config error in the repo layer — see
+    /// [`ConfigError::AllowHomeRootInRepo`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allow_home_root: Option<bool>,
 
-    /// Catch-all for unknown top-level keys (forward compatibility).
-    #[serde(flatten)]
-    _extra: HashMap<String, toml::Value>,
+    /// `[kits.<name>]` tables: options for a built-in kit, or the
+    /// read/write/env lists of a user-defined one. A launcher-only concept
+    /// (see [`crate::kits`]) — never present on the wire sent to the daemon,
+    /// and a config error in the repo layer (see
+    /// [`ConfigError::KitsInRepo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kits: Option<HashMap<String, RawKitConfig>>,
+
+    /// `true` applies this directory's config to projects in its
+    /// subdirectories too, as a parent config. Read only where the file is
+    /// a parent of the project root; a config error in the global file. A
+    /// launcher-only concept, never on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
+
+    /// `false` ignores every parent config, even one with `cascade = true`.
+    /// A config error in the global file. Launcher-only, like `cascade`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<bool>,
+}
+
+/// Raw deserialized `[kits.<name>]` entry.
+///
+/// Which fields are legal depends on whether `name` is one of the built-in
+/// kits (`rust`, `node`, `python`, `go`) — see [`crate::kits`], which also
+/// does all expansion. A flat, fully-optional struct for the same reason as
+/// [`RawSecretSpec`]: parsing has to accept any legal shape unambiguously,
+/// and [`crate::kits::validate_all`] decides which shape applies to which
+/// kit.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawKitConfig {
+    /// Built-in kits only: `"isolated"` (the default) or `"shared"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// User-defined kits only: additional read-only paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
+    /// User-defined kits only: additional read-write paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
+    /// User-defined kits only: environment variables set on the agent.
+    /// Static strings only (no secret refs) — may use `{kit_state}`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
 }
 
 /// Raw deserialized `[filesystem]` section.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawFilesystem {
+pub struct RawFilesystem {
     /// Global read-only paths.
-    #[serde(default)]
-    read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
     /// Global read-write paths.
-    #[serde(default)]
-    write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
 }
 
 /// Raw deserialized `[agent.filesystem]` subsection.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawAgentFilesystem {
+pub struct RawAgentFilesystem {
     /// Additional read-only paths for the agent.
-    #[serde(default)]
-    read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
     /// Additional read-write paths for the agent.
-    #[serde(default)]
-    write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
 }
 
 /// Raw deserialized `[agent]` section.
@@ -385,72 +755,89 @@ struct RawAgentFilesystem {
 /// Uses `#[serde(deny_unknown_fields)]` to surface typos and
 /// `#[serde(default)]` on all fields so a bare `[agent]` header with no
 /// fields is valid.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawAgentConfig {
+pub struct RawAgentConfig {
     /// Agent session timeout in seconds. `None` (absent) means no limit.
-    #[serde(default)]
-    timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
     /// Environment variable names to inherit from the host environment.
-    #[serde(default)]
-    passthrough_env: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub passthrough_env: Vec<String>,
     /// Environment variables set for the agent process.
-    #[serde(default)]
-    env: HashMap<String, RawEnvValue>,
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, RawEnvValue>,
     /// Additional filesystem paths for the agent sandbox.
-    #[serde(default)]
-    filesystem: Option<RawAgentFilesystem>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filesystem: Option<RawAgentFilesystem>,
+    /// Kits (built-in or user-defined) to add to the agent sandbox — see
+    /// [`crate::kits`]. Unioned across layers; rides on the wire unused by
+    /// the daemon, only so it contributes to the agent hash
+    /// ([`crate::launcher::prepare`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kits: Vec<String>,
 }
 
-/// Raw deserialized `[secrets.<label>]` entry. Discriminated on the `source`
-/// field. Unknown fields are rejected to fail-closed on typos.
-#[derive(Debug, Deserialize)]
-#[serde(tag = "source", rename_all = "lowercase", deny_unknown_fields)]
-enum RawSecretSpec {
-    /// Read the value from one of the daemon's own environment variables.
-    Env {
-        /// Name of the env var the daemon should read at startup. Defaults
-        /// to the `[secrets.<label>]` label when omitted — handy when the
-        /// label is already named like the env var (`[secrets.GH_TOKEN]`).
-        #[serde(default)]
-        from: Option<String>,
-    },
-    /// Spawn a command at daemon startup and use its stdout as the value.
-    Command {
-        /// Argv list. The first element is the program, the rest are args.
-        /// No shell interpolation is performed.
-        command: Vec<String>,
-        /// Maximum seconds to wait for the command. Defaults to
-        /// [`DEFAULT_COMMAND_SECRET_TIMEOUT_SECS`].
-        #[serde(default)]
-        timeout: Option<u64>,
-        /// Background refresh interval in seconds. When set, the daemon
-        /// re-runs `command` on this cadence and replaces the in-memory
-        /// value. Omit to fetch only at daemon startup.
-        #[serde(default)]
-        refresh: Option<u64>,
-        /// Cap (seconds) on the exponential-backoff sleep applied when a
-        /// refresh fails. Defaults to `refresh` when omitted; meaningless
-        /// without `refresh`.
-        #[serde(default)]
-        refresh_max_backoff: Option<u64>,
-        /// Env vars set (or overridden) when spawning the command.
-        #[serde(default)]
-        env: Option<HashMap<String, String>>,
-        /// When `true`, spawn the command with an empty environment. `env`
-        /// still applies on top.
-        #[serde(default)]
-        env_clear: bool,
-    },
+/// Raw deserialized `[secrets.<label>]` entry.
+///
+/// A flat, fully-optional struct rather than a tagged enum, because which
+/// fields are legal depends on the *layer* the entry sits in, not just on
+/// `source` — the repo layer may omit `source` entirely (a label the
+/// project needs but leaves to the user), and the local layer may write
+/// `from = "global"` instead of a `source` of its own. [`crate::layers`]
+/// validates the combination per layer; this type only has to parse every
+/// legal shape unambiguously. `deny_unknown_fields` still catches typos.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawSecretSpec {
+    /// What the project needs this secret for. Shown in the "unbound repo
+    /// labels" error and by `airlock init --local`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// `"env"` or `"command"`. Optional only in the repo layer and
+    /// `--config` files (a label with no source yet).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
+    /// Two unrelated meanings depending on `source`: with
+    /// `source = "env"`, the env var name to read (defaults to the label).
+    /// With no `source` at all, `"global"` or `"parent"` — a local-layer
+    /// link to the global or parent binding of the same label.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Argv list for `source = "command"`. The first element is the
+    /// program, the rest are args. No shell interpolation is performed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub command: Option<Vec<String>>,
+    /// Maximum seconds to wait for `source = "command"`. Defaults to
+    /// [`DEFAULT_COMMAND_SECRET_TIMEOUT_SECS`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// Background refresh interval in seconds for `source = "command"`.
+    /// When set, the daemon re-runs `command` on this cadence and replaces
+    /// the in-memory value. Omit to fetch only at daemon startup.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh: Option<u64>,
+    /// Cap (seconds) on the exponential-backoff sleep applied when a
+    /// refresh fails. Defaults to `refresh` when omitted; meaningless
+    /// without `refresh`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub refresh_max_backoff: Option<u64>,
+    /// Env vars set (or overridden) when spawning a `source = "command"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, String>>,
+    /// When `true`, spawn a `source = "command"` with an empty environment.
+    /// `env` still applies on top.
+    #[serde(default)]
+    pub env_clear: bool,
 }
 
 /// Raw deserialized value inside `[tools.<tool>.env]`.
 ///
 /// A bare string is a static value; an inline table `{ secret = "label" }`
 /// references an entry in `[secrets]`.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(untagged)]
-enum RawEnvValue {
+pub enum RawEnvValue {
     /// Inline table: `NAME = { secret = "label" }`. Declared first so serde
     /// tries it before falling back to the scalar string variant.
     SecretRef(RawSecretRef),
@@ -459,67 +846,82 @@ enum RawEnvValue {
 }
 
 /// Inline-table form of an env var value that references a secret by label.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawSecretRef {
+pub struct RawSecretRef {
     /// Label of the entry in `[secrets.<label>]` whose resolved value is
     /// injected as this env var.
-    secret: String,
+    pub secret: String,
 }
 
 /// Raw deserialized `[tools.X]` entry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawToolConfig {
+pub struct RawToolConfig {
     /// Environment variables set when spawning this tool. Optional; a tool
     /// with no `env` table runs with just the base passthrough env.
-    #[serde(default)]
-    env: Option<HashMap<String, RawEnvValue>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub env: Option<HashMap<String, RawEnvValue>>,
     /// Additional read-only paths for this tool.
-    #[serde(default)]
-    extra_read: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_read: Vec<String>,
     /// Additional read-write paths for this tool.
-    #[serde(default)]
-    extra_write: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub extra_write: Vec<String>,
     /// Per-tool timeout override in seconds.
-    #[serde(default)]
-    timeout: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<u64>,
+    /// Per-tool override of the top-level `access` default. `"none"`,
+    /// `"system"`, or `"default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     /// Human-readable description of what this tool does.
-    #[serde(default)]
-    description: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
     /// Marks this tool as a proxy tool: no direct network, all HTTP(S) via
     /// the daemon's proxy, governed by `routes`.
     #[serde(default)]
-    proxy: bool,
+    pub proxy: bool,
     /// Egress routes. Required when `proxy = true`, rejected otherwise.
-    #[serde(default)]
-    routes: Vec<RawProxyRoute>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub routes: Vec<RawProxyRoute>,
+    /// Local-layer-only: replace the repo's whole definition of a tool of
+    /// the same name. A config error on a tool the repo does not define,
+    /// and outside the local layer. Never set on the wire — the launcher
+    /// resolves it away before sending the merged config to the daemon.
+    #[serde(default, rename = "override", skip_serializing_if = "is_false")]
+    pub r#override: bool,
 }
 
 /// Raw deserialized `[[tools.X.routes]]` entry.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawProxyRoute {
+pub struct RawProxyRoute {
     /// DNS name or `*.`-prefixed DNS name.
-    host: String,
+    pub host: String,
     /// Credential header to attach to permitted requests.
-    #[serde(default)]
-    inject: Option<RawInject>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inject: Option<RawInject>,
     /// `METHOD /path` rules; if non-empty a request must match one.
-    #[serde(default)]
-    allow: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allow: Vec<String>,
     /// `METHOD /path` rules; a match refuses the request.
-    #[serde(default)]
-    deny: Vec<String>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deny: Vec<String>,
 }
 
 /// Raw deserialized `inject = { header, value, secret }` inline table.
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
-struct RawInject {
-    header: String,
-    value: String,
-    secret: String,
+pub struct RawInject {
+    pub header: String,
+    pub value: String,
+    pub secret: String,
+}
+
+/// `skip_serializing_if` helper for a plain `bool` field.
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 // ─── Public types ─────────────────────────────────────────────────────────────
@@ -527,24 +929,17 @@ struct RawInject {
 /// A fully parsed and validated Airlock configuration.
 ///
 /// All paths have been resolved (tilde expanded, relative paths resolved
-/// against the sandbox root). Derived paths (socket, PID file) are included.
+/// against the sandbox root).
 #[derive(Debug)]
 pub struct Config {
     /// The canonicalized directory containing the discovered `airlock.toml`.
     pub sandbox_root: PathBuf,
 
-    /// Path to the Unix domain socket: `{sandbox_root}/airlock.sock`.
-    pub socket_path: PathBuf,
-
-    /// Path to the PID file: `{sandbox_root}/airlock.pid`.
-    pub pid_path: PathBuf,
-
-    /// Path to the proxy CA certificate: `{sandbox_root}/airlock-ca.pem`.
-    /// Written only when at least one tool declares `proxy = true`.
-    pub ca_path: PathBuf,
-
     /// Global timeout for tool execution.
     pub timeout: Duration,
+
+    /// Default `access` level for every tool that doesn't set its own.
+    pub access: ToolAccess,
 
     /// Global read-only filesystem paths.
     pub filesystem_read: Vec<PathBuf>,
@@ -560,6 +955,13 @@ pub struct Config {
 
     /// The `[agent]` section, fully resolved.
     pub agent: Option<AgentConfig>,
+
+    /// Directories introduced by a `{tool_state}` placeholder in some tool's
+    /// `env`. Already included in that tool's `extra_write` (so sandbox
+    /// policy sees them); listed again here so the launcher can create them
+    /// with mode 0700 before spawning anything — config.rs never creates
+    /// directories itself.
+    pub tool_state_dirs: Vec<PathBuf>,
 }
 
 /// Fully resolved `[secrets.<label>]` entry.
@@ -642,6 +1044,9 @@ pub struct ToolConfig {
     /// Optional per-tool timeout override.
     pub timeout: Option<Duration>,
 
+    /// Per-tool override of [`Config::access`]. `None` means inherit it.
+    pub access: Option<ToolAccess>,
+
     /// Human-readable description of what this tool does.
     pub description: Option<String>,
 
@@ -672,60 +1077,33 @@ pub struct AgentConfig {
     pub filesystem_write: Vec<PathBuf>,
 }
 
-/// Lightweight discovery result containing only derived paths.
+/// Every path this config grants write access to: `filesystem.write`, every
+/// tool's `extra_write` (which already includes its `{tool_state}` dir, if
+/// any), and `agent.filesystem.write`.
 ///
-/// Used by the client and management commands that need to locate the socket
-/// or PID file without parsing the full config.
-#[derive(Debug)]
-pub struct DiscoveredPaths {
-    /// The canonicalized sandbox root directory.
-    pub sandbox_root: PathBuf,
-
-    /// Path to the Unix domain socket.
-    pub socket_path: PathBuf,
-
-    /// Path to the PID file.
-    pub pid_path: PathBuf,
-
-    /// Path to the proxy CA certificate.
-    pub ca_path: PathBuf,
-}
-
-impl Config {
-    /// Every file the daemon creates, for cleanup at shutdown or after a
-    /// crash. Kept in step with [`DiscoveredPaths::runtime_files`].
-    pub fn runtime_files(&self) -> [&Path; 3] {
-        [&self.pid_path, &self.socket_path, &self.ca_path]
+/// This is the set the anchor checks and the filtered `PATH` (B2, B4 in the
+/// v2 design) treat as "writable from some sandbox" — a superset of any one
+/// sandbox's own grants, since the point is to protect the anchors and the
+/// resolved tool binary from every sandbox the daemon can spawn, not just
+/// the one currently running.
+pub fn write_grants(config: &Config) -> Vec<PathBuf> {
+    let mut grants = config.filesystem_write.clone();
+    for tool in config.tools.values() {
+        grants.extend(tool.extra_write.iter().cloned());
     }
-}
-
-impl DiscoveredPaths {
-    /// Every file a running daemon creates, for cleanup after it has gone.
-    pub fn runtime_files(&self) -> [&Path; 3] {
-        [&self.pid_path, &self.socket_path, &self.ca_path]
+    if let Some(agent) = &config.agent {
+        grants.extend(agent.filesystem_write.iter().cloned());
     }
+    grants
 }
 
 // ─── Discovery ────────────────────────────────────────────────────────────────
 
 /// Get the current effective uid of the process.
-fn current_euid() -> u32 {
+pub(crate) fn current_euid() -> u32 {
     // SAFETY: geteuid(2) is always safe — it reads a process attribute
     // without modifying any state.
     unsafe { libc::geteuid() }
-}
-
-/// Check whether `path` is the user's home directory, comparing canonicalized
-/// forms so symlinked home directories (`/home/foo` → `/mnt/home/foo`) are
-/// still detected.
-///
-/// Returns `Err(HomeNotSet)` if the `HOME` environment variable is unset.
-fn is_home_directory(path: &Path) -> Result<bool, ConfigError> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-    let home_canonical = std::fs::canonicalize(&home).unwrap_or(home);
-    Ok(path == home_canonical)
 }
 
 /// Check whether the file at `path` is a regular file owned by `expected_uid`,
@@ -741,7 +1119,7 @@ fn is_home_directory(path: &Path) -> Result<bool, ConfigError> {
 /// - A symlink (rejected by `O_NOFOLLOW`).
 /// - A non-regular file (directory, socket, device, etc.).
 /// - A file owned by a different UID.
-fn is_owned_by(path: &Path, expected_uid: u32) -> bool {
+pub(crate) fn is_owned_by(path: &Path, expected_uid: u32) -> bool {
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
 
@@ -766,7 +1144,7 @@ fn is_owned_by(path: &Path, expected_uid: u32) -> bool {
 /// The ownership check runs against `fstat` on the open fd, closing the TOCTOU
 /// window between stat-by-path and read: an attacker cannot swap the file
 /// between the check and the read because both operate on the same fd.
-fn read_config_securely(path: &Path, expected_uid: u32) -> Result<String, ConfigError> {
+pub(crate) fn read_config_securely(path: &Path, expected_uid: u32) -> Result<String, ConfigError> {
     use std::io::Read;
     use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::OpenOptionsExt;
@@ -832,117 +1210,58 @@ fn read_config_securely(path: &Path, expected_uid: u32) -> Result<String, Config
     Ok(buf)
 }
 
-/// Walk from `start_dir` upward to `$HOME` (inclusive), looking for a valid
-/// `airlock.toml` owned by the current effective uid.
-///
-/// Returns the path to the discovered config file and its canonicalized
-/// parent directory (the sandbox root).
-///
-/// The starting directory is typically the process's current working directory,
-/// but accepting it as a parameter makes the function testable.
-fn discover_config_file(start_dir: &Path) -> Result<(PathBuf, PathBuf), ConfigError> {
-    let home = std::env::var("HOME")
-        .map(PathBuf::from)
-        .map_err(|_| ConfigError::HomeNotSet)?;
-
-    let euid = current_euid();
-
-    // Canonicalize `start_dir` and `home` for reliable prefix comparison.
-    // If canonicalization fails for the start dir, fall back to the original path.
-    let start_canonical =
-        std::fs::canonicalize(start_dir).unwrap_or_else(|_| start_dir.to_path_buf());
-    let home_canonical = std::fs::canonicalize(&home).unwrap_or_else(|_| home.clone());
-
-    let mut current = start_canonical.clone();
-
-    loop {
-        let candidate = current.join(CONFIG_FILENAME);
-
-        // `is_owned_by` opens with O_NOFOLLOW and fstats the fd, so it
-        // implicitly handles missing files, symlinks, and non-regular files
-        // (returning false for any of them). No separate `is_file()` check is
-        // needed — it would only follow symlinks and widen the attack surface.
-        if is_owned_by(&candidate, euid) {
-            // Canonicalize the parent directory to get the sandbox root.
-            let sandbox_root = std::fs::canonicalize(&current).map_err(|e| {
-                ConfigError::CanonicalizationError {
-                    path: current.clone(),
-                    source: e,
-                }
-            })?;
-            return Ok((candidate, sandbox_root));
-        }
-
-        // Check if we've reached $HOME — stop here (inclusive: we already checked it).
-        if current == home_canonical {
-            break;
-        }
-
-        // Move to the parent directory.
-        match current.parent() {
-            Some(parent) => {
-                // If the parent is the same as current, we've hit the root.
-                if parent == current {
-                    break;
-                }
-                current = parent.to_path_buf();
-            }
-            None => break,
-        }
-    }
-
-    Err(ConfigError::NotFound {
-        start_dir: start_dir.to_path_buf(),
-        home_dir: home,
-    })
-}
-
 // ─── Path resolution ──────────────────────────────────────────────────────────
 
 /// Resolve a path string according to Airlock path resolution rules:
-/// - Tilde (`~`) at the start is expanded to `$HOME`
-/// - Relative paths are resolved relative to the sandbox root
+/// - Tilde (`~`) at the start is expanded to `home`
+/// - Relative paths are resolved relative to `sandbox_root`
 /// - Absolute paths are left unchanged
-fn resolve_path(raw: &str, sandbox_root: &Path) -> Result<PathBuf, ConfigError> {
+///
+/// Takes `home` explicitly rather than reading `$HOME` itself — used by
+/// [`crate::layers`], which must not read the process environment.
+pub(crate) fn resolve_path_with_home(raw: &str, sandbox_root: &Path, home: &Path) -> PathBuf {
     if let Some(rest) = raw.strip_prefix("~/") {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| ConfigError::HomeNotSet)?;
-        Ok(home.join(rest))
+        home.join(rest)
     } else if raw == "~" {
-        let home = std::env::var("HOME")
-            .map(PathBuf::from)
-            .map_err(|_| ConfigError::HomeNotSet)?;
-        Ok(home)
+        home.to_path_buf()
     } else {
         let path = Path::new(raw);
         if path.is_absolute() {
-            Ok(path.to_path_buf())
+            path.to_path_buf()
         } else {
             // Relative path — resolve against sandbox root.
-            Ok(sandbox_root.join(path))
+            sandbox_root.join(path)
         }
     }
 }
 
-/// Resolve a list of path strings.
-fn resolve_paths(raw_paths: &[String], sandbox_root: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+/// Resolve a list of path strings — used by [`crate::layers`].
+pub(crate) fn resolve_paths_with_home(
+    raw_paths: &[String],
+    sandbox_root: &Path,
+    home: &Path,
+) -> Vec<PathBuf> {
     raw_paths
         .iter()
-        .map(|p| resolve_path(p, sandbox_root))
+        .map(|p| resolve_path_with_home(p, sandbox_root, home))
         .collect()
 }
 
-/// Render a static `[tools.<tool>.env]` value as a leon template.
+/// Render a static `[tools.<tool>.env]` (or `[agent.env]`) value as a leon
+/// template.
 ///
-/// The only recognized placeholder is `{sandbox_root}`, which expands to the
-/// canonicalized sandbox root. Literal braces can be included with `\{` /
-/// `\}`. Any other placeholder (`{home}`, typos like `{sandbox-root}`) is a
-/// hard error — failing at config load is preferable to silently shipping a
-/// broken env value to a tool.
-fn render_env_template(
+/// `{sandbox_root}` expands to the canonicalized sandbox root everywhere.
+/// `{tool_state}` expands to `tool_state`'s value when the caller supplies
+/// one (only tool `env`, not `agent.env` — see
+/// [`resolve_tool_state_path`]); otherwise it is just another unknown
+/// placeholder. Literal braces can be included with `\{` / `\}`. Any other
+/// placeholder (`{home}`, typos like `{sandbox-root}`) is a hard error —
+/// failing at config load is preferable to silently shipping a broken env
+/// value to a tool.
+pub(crate) fn render_env_template(
     raw: &str,
     sandbox_root: &Path,
+    tool_state: Option<&Path>,
     tool: &str,
     var_name: &str,
 ) -> Result<String, ConfigError> {
@@ -953,8 +1272,12 @@ fn render_env_template(
     })?;
 
     let root = sandbox_root.display().to_string();
-    let mut values: HashMap<&str, &str> = HashMap::with_capacity(1);
+    let mut values: HashMap<&str, &str> = HashMap::with_capacity(2);
     values.insert("sandbox_root", root.as_str());
+    let tool_state_display = tool_state.map(|p| p.display().to_string());
+    if let Some(ts) = &tool_state_display {
+        values.insert("tool_state", ts.as_str());
+    }
 
     template.render(&values).map_err(|e| match e {
         leon::RenderError::MissingKey(key) => ConfigError::UnknownEnvPlaceholder {
@@ -970,16 +1293,55 @@ fn render_env_template(
     })
 }
 
+/// Whether a static env value uses the `{tool_state}` placeholder.
+///
+/// A plain substring check, not a template parse: `{tool_state}` is never
+/// meaningful escaped (`\{tool_state\}`) in a real config, and treating the
+/// escaped form as "uses tool_state anyway" only means creating a directory
+/// nothing reads, not a security gap.
+pub(crate) fn uses_tool_state_placeholder(raw: &str) -> bool {
+    raw.contains("{tool_state}")
+}
+
+/// Resolve `{tool_state}` for one tool: `<tool_state_base>/<project_id>/<tool>`.
+///
+/// Mode 0700 and creation are the launcher's job (decision in the v2 design,
+/// "Tool state outside the project") — this just computes the path.
+pub fn resolve_tool_state_path(tool_state_base: &Path, project_id: &str, tool: &str) -> PathBuf {
+    tool_state_base.join(project_id).join(tool)
+}
+
+/// Lowercase hex SHA-256 of `bytes`.
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    use ring::digest::{SHA256, digest};
+    let hash = digest(&SHA256, bytes);
+    hash.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// A project's id: the first 16 hex characters of the SHA-256 of its
+/// canonical root path. Used as the trust store's directory name and as the
+/// `<id>` in `{tool_state}`'s resolved path — both need a name that is
+/// stable for a given root but changes when the project moves, so approval
+/// and tool state do not silently follow a path to a new place.
+pub fn project_id(root: &Path) -> String {
+    let hex = sha256_hex(root.as_os_str().as_encoded_bytes());
+    hex[..16].to_string()
+}
+
 // ─── Tool name validation ─────────────────────────────────────────────────────
 
 /// Validate that a tool name does not contain path separators.
 ///
-/// Both forward slash (`/`) and backslash (`\`) are rejected. This mirrors
-/// the same constraint enforced by `exec::resolve_binary` but catches it
-/// earlier at config load time, and additionally rejects `\` for
-/// cross-platform safety.
-fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
-    if name.contains('/') || name.contains('\\') {
+/// Both forward slash (`/`) and backslash (`\`) are rejected, at config load
+/// time rather than request time, so a malformed tool name is a config error
+/// up front and `exec::resolve_binary_in` never has to consider it.
+/// `\` is also rejected for cross-platform safety.
+pub(crate) fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
+    let is_sane = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    if !is_sane {
         return Err(ConfigError::InvalidToolName {
             name: name.to_string(),
         });
@@ -987,11 +1349,28 @@ fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+// ─── Access level parsing ───────────────────────────────────────────────────
+
+/// Parse a raw `access` string (top-level or `[tools.<name>]`) into a
+/// [`ToolAccess`]. `context` names the field for the error message —
+/// `"access"` or `"tools.<name>.access"`.
+fn parse_access_level(context: &str, raw: &str) -> Result<ToolAccess, ConfigError> {
+    match raw {
+        "none" => Ok(ToolAccess::None),
+        "system" => Ok(ToolAccess::System),
+        "default" => Ok(ToolAccess::Default),
+        other => Err(ConfigError::UnknownAccessLevel {
+            context: context.to_string(),
+            got: other.to_string(),
+        }),
+    }
+}
+
 // ─── Env var name validation ──────────────────────────────────────────────────
 
 /// Check whether `name` matches `^[A-Za-z_][A-Za-z0-9_]*$` — the POSIX
 /// environment variable name shape, case-permissive.
-fn is_valid_env_var_name(name: &str) -> bool {
+pub(crate) fn is_valid_env_var_name(name: &str) -> bool {
     let mut chars = name.chars();
     match chars.next() {
         Some(c) if c.is_ascii_alphabetic() || c == '_' => {}
@@ -1008,7 +1387,7 @@ fn is_valid_env_var_name(name: &str) -> bool {
 ///   before the previous command finishes).
 /// - `refresh_max_backoff` is meaningful only when `refresh` is set; defaults
 ///   to `refresh` when omitted; must be `>= timeout`.
-fn resolve_refresh_spec(
+pub(crate) fn resolve_refresh_spec(
     label: &str,
     timeout: Duration,
     refresh: Option<u64>,
@@ -1060,7 +1439,7 @@ fn resolve_refresh_spec(
 
 /// Validate and resolve the `env` / `env_clear` fields from a
 /// `source = "command"` secret into a [`CommandEnv`].
-fn resolve_secret_command_env(
+pub(crate) fn resolve_secret_command_env(
     label: &str,
     env: Option<HashMap<String, String>>,
     env_clear: bool,
@@ -1088,7 +1467,7 @@ fn resolve_secret_command_env(
 
 /// Validate a tool's `proxy` / `routes` pair into a [`ProxyPolicy`], or `None`
 /// for an ordinary tool.
-fn resolve_proxy_policy(
+pub(crate) fn resolve_proxy_policy(
     tool: &str,
     proxy: bool,
     raw_routes: Vec<RawProxyRoute>,
@@ -1159,85 +1538,198 @@ fn resolve_proxy_policy(
     Ok(Some(ProxyPolicy { routes }))
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-/// Parse and resolve a raw TOML config string into a fully validated [`Config`].
+/// Resolve a `[secrets.<label>]` entry's own `source` into a [`SecretSource`].
 ///
-/// This is the shared resolution core called by both [`load_config`] (which
-/// discovers the file) and [`load_config_from_file`] (explicit path). All
-/// validation — home-root guard, tool names, secret refs, env var names,
-/// path resolution — is performed here.
-fn parse_and_resolve_config(
-    contents: &str,
-    config_path: &Path,
-    sandbox_root: PathBuf,
-) -> Result<Config, ConfigError> {
-    let raw: RawConfig = toml::from_str(contents).map_err(|e| ConfigError::ParseError {
-        path: config_path.to_path_buf(),
-        source: e,
-    })?;
+/// Assumes `spec.source` is `Some` — callers that allow an absent source
+/// (the repo layer, awaiting a local binding) classify that case themselves
+/// before reaching here.
+pub(crate) fn resolve_bound_secret_source(
+    label: &str,
+    spec: &RawSecretSpec,
+) -> Result<SecretSource, ConfigError> {
+    let mismatch = |reason: &str| ConfigError::SecretFieldMismatch {
+        label: label.to_string(),
+        reason: reason.to_string(),
+    };
 
-    // Refuse to use $HOME as the sandbox root unless the config explicitly
-    // opts in. A lone `airlock.toml` in the home directory would otherwise
-    // silently expose the whole home directory to sandboxed tools.
-    if is_home_directory(&sandbox_root)? && raw.allow_home_root != Some(true) {
-        return Err(ConfigError::HomeRootNotAllowed { home: sandbox_root });
+    match spec.source.as_deref() {
+        Some("env") => {
+            if spec.command.is_some()
+                || spec.refresh.is_some()
+                || spec.refresh_max_backoff.is_some()
+                || spec.env.is_some()
+                || spec.env_clear
+            {
+                return Err(mismatch(
+                    "source = \"env\" does not accept command, refresh, refresh_max_backoff, env, or env_clear",
+                ));
+            }
+            Ok(SecretSource::Env {
+                from: spec.from.clone().unwrap_or_else(|| label.to_string()),
+            })
+        }
+        Some("command") => {
+            if spec.from.is_some() {
+                return Err(mismatch("source = \"command\" does not accept `from`"));
+            }
+            let command = spec
+                .command
+                .clone()
+                .ok_or_else(|| mismatch("source = \"command\" requires `command`"))?;
+            if command.is_empty() {
+                return Err(ConfigError::EmptyCommandArgv {
+                    label: label.to_string(),
+                });
+            }
+            let timeout =
+                Duration::from_secs(spec.timeout.unwrap_or(DEFAULT_COMMAND_SECRET_TIMEOUT_SECS));
+            let refresh =
+                resolve_refresh_spec(label, timeout, spec.refresh, spec.refresh_max_backoff)?;
+            let env = resolve_secret_command_env(label, spec.env.clone(), spec.env_clear)?;
+            Ok(SecretSource::Command {
+                argv: command,
+                timeout,
+                refresh,
+                env,
+            })
+        }
+        Some(other) => Err(ConfigError::UnknownSecretSource {
+            label: label.to_string(),
+            got: other.to_string(),
+        }),
+        None => Err(mismatch("has no source")),
+    }
+}
+
+/// Which table an env entry lives in: a tool's `[tools.<name>.env]` or
+/// `[agent.env]`. Errors name it the same way whether the launcher's merge
+/// or the daemon's own re-validation finds the problem.
+#[derive(Clone, Copy)]
+pub(crate) enum EnvOwner<'a> {
+    Tool(&'a str),
+    Agent,
+}
+
+impl<'a> EnvOwner<'a> {
+    /// The tool's name, or `"agent"`.
+    pub(crate) fn item(self) -> &'a str {
+        match self {
+            EnvOwner::Tool(name) => name,
+            EnvOwner::Agent => "agent",
+        }
     }
 
-    // Resolve global timeout.
+    /// Its TOML location, without the `.env` suffix.
+    pub(crate) fn location(self) -> String {
+        match self {
+            EnvOwner::Tool(name) => format!("tools.{name}"),
+            EnvOwner::Agent => "agent".to_string(),
+        }
+    }
+}
+
+/// The checks every env entry gets, whoever owns it: a valid variable name
+/// and, for a proxy tool, no shadowing of the proxy's own variables and no
+/// secret (a proxy tool's credentials are injected by the proxy, never
+/// handed to the tool).
+pub(crate) fn check_env_entry(
+    owner: EnvOwner<'_>,
+    var_name: &str,
+    value: &RawEnvValue,
+    is_proxy_tool: bool,
+) -> Result<(), ConfigError> {
+    if !is_valid_env_var_name(var_name) {
+        return Err(ConfigError::InvalidEnvVarName {
+            tool: owner.item().to_string(),
+            name: var_name.to_string(),
+        });
+    }
+    if is_proxy_tool && crate::proxy::is_reserved_env_var(var_name) {
+        return Err(ConfigError::ProxyReservedEnvVar {
+            tool: owner.item().to_string(),
+            var_name: var_name.to_string(),
+        });
+    }
+    if is_proxy_tool && matches!(value, RawEnvValue::SecretRef(_)) {
+        return Err(ConfigError::ProxyToolSecretEnv {
+            tool: owner.item().to_string(),
+            var_name: var_name.to_string(),
+        });
+    }
+    Ok(())
+}
+
+/// Resolve one env table from the wire. Static values arrive already
+/// rendered by the launcher and are copied verbatim, not re-templated.
+fn resolve_env_map(
+    owner: EnvOwner<'_>,
+    raw_env: HashMap<String, RawEnvValue>,
+    is_proxy_tool: bool,
+    secrets: &HashMap<String, SecretSpec>,
+    undeclared_refs: &mut Vec<(String, String, String)>,
+) -> Result<BTreeMap<String, EnvValue>, ConfigError> {
+    let mut env = BTreeMap::new();
+    for (var_name, raw_value) in raw_env {
+        check_env_entry(owner, &var_name, &raw_value, is_proxy_tool)?;
+        let value = match raw_value {
+            RawEnvValue::Static(s) => EnvValue::Static(s),
+            RawEnvValue::SecretRef(RawSecretRef { secret }) => {
+                if !secrets.contains_key(&secret) {
+                    undeclared_refs.push((owner.location(), var_name.clone(), secret.clone()));
+                }
+                EnvValue::SecretRef(secret)
+            }
+        };
+        env.insert(var_name, value);
+    }
+    Ok(env)
+}
+/// Resolve a merged, normalized [`RawConfig`] — the wire form the launcher
+/// sends over the socket (decision #3 in the v2 implementation contract) —
+/// into a [`Config`], against the already-decided project `root`.
+///
+/// Reads no environment and creates nothing on disk: the launcher has
+/// already expanded every path (`~`, `{sandbox_root}`, `{tool_state}`) and
+/// resolved every secret to a concrete `source` (no `from = "global"`,
+/// no `override`), so this is just the daemon's own, independent check that
+/// what it received is well-formed — it does not re-discover or re-approve
+/// anything.
+pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, ConfigError> {
+    let sandbox_root = root.to_path_buf();
+
     let timeout = Duration::from_secs(raw.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
-    // Resolve filesystem paths.
+    let access = match raw.access {
+        Some(ref s) => parse_access_level("access", s)?,
+        None => ToolAccess::default(),
+    };
+
     let (filesystem_read, filesystem_write) = match raw.filesystem {
         Some(fs) => (
-            resolve_paths(&fs.read, &sandbox_root)?,
-            resolve_paths(&fs.write, &sandbox_root)?,
+            fs.read.into_iter().map(PathBuf::from).collect(),
+            fs.write.into_iter().map(PathBuf::from).collect(),
         ),
         None => (Vec::new(), Vec::new()),
     };
 
-    // Resolve [secrets] entries first so tool and agent env entries can be
-    // validated against them in the same pass.
     let raw_secrets = raw.secrets.unwrap_or_default();
     let mut secrets: HashMap<String, SecretSpec> = HashMap::with_capacity(raw_secrets.len());
-    for (label, spec) in raw_secrets {
-        let source = match spec {
-            RawSecretSpec::Env { from } => SecretSource::Env {
-                from: from.unwrap_or_else(|| label.clone()),
+    for (label, spec) in &raw_secrets {
+        if spec.source.is_none() {
+            return Err(ConfigError::SecretMissingSource {
+                label: label.clone(),
+            });
+        }
+        let source = resolve_bound_secret_source(label, spec)?;
+        secrets.insert(
+            label.clone(),
+            SecretSpec {
+                label: label.clone(),
+                source,
             },
-            RawSecretSpec::Command {
-                command,
-                timeout,
-                refresh,
-                refresh_max_backoff,
-                env,
-                env_clear,
-            } => {
-                if command.is_empty() {
-                    return Err(ConfigError::EmptyCommandArgv {
-                        label: label.clone(),
-                    });
-                }
-                let timeout =
-                    Duration::from_secs(timeout.unwrap_or(DEFAULT_COMMAND_SECRET_TIMEOUT_SECS));
-                let refresh = resolve_refresh_spec(&label, timeout, refresh, refresh_max_backoff)?;
-                let env = resolve_secret_command_env(&label, env, env_clear)?;
-                SecretSource::Command {
-                    argv: command,
-                    timeout,
-                    refresh,
-                    env,
-                }
-            }
-        };
-        secrets.insert(label.clone(), SecretSpec { label, source });
+        );
     }
 
-    // Validate and resolve tool definitions. Env var names and secret
-    // references are validated in a batched pass so the operator sees every
-    // problem in one error message. The location key in each undeclared-ref
-    // tuple is `"tools.<name>"` for per-tool entries (see also the agent pass
-    // below, which uses `"agent"`).
     let raw_tools = raw.tools.unwrap_or_default();
     let mut tools = HashMap::with_capacity(raw_tools.len());
     let mut undeclared_refs: Vec<(String, String, String)> = Vec::new();
@@ -1245,55 +1737,31 @@ fn parse_and_resolve_config(
     for (name, raw_tool) in raw_tools {
         validate_tool_name(&name)?;
 
-        let mut env: BTreeMap<String, EnvValue> = BTreeMap::new();
-        if let Some(raw_env) = raw_tool.env {
-            for (var_name, raw_value) in raw_env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: name.clone(),
-                        name: var_name,
-                    });
-                }
-                if raw_tool.proxy && crate::proxy::is_reserved_env_var(&var_name) {
-                    return Err(ConfigError::ProxyReservedEnvVar {
-                        tool: name.clone(),
-                        var_name,
-                    });
-                }
-                let value = match raw_value {
-                    RawEnvValue::Static(s) => {
-                        EnvValue::Static(render_env_template(&s, &sandbox_root, &name, &var_name)?)
-                    }
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if raw_tool.proxy {
-                            return Err(ConfigError::ProxyToolSecretEnv {
-                                tool: name.clone(),
-                                var_name,
-                            });
-                        }
-                        if !secrets.contains_key(&secret) {
-                            // Location key includes the "tools." prefix so the
-                            // error message formats as [tools.<name>.env.<var>].
-                            undeclared_refs.push((
-                                format!("tools.{name}"),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                env.insert(var_name, value);
-            }
-        }
+        let env = resolve_env_map(
+            EnvOwner::Tool(&name),
+            raw_tool.env.unwrap_or_default(),
+            raw_tool.proxy,
+            &secrets,
+            &mut undeclared_refs,
+        )?;
 
         let proxy = resolve_proxy_policy(&name, raw_tool.proxy, raw_tool.routes, &secrets)?;
 
+        let tool_access = match raw_tool.access {
+            Some(ref s) => Some(parse_access_level(&format!("tools.{name}.access"), s)?),
+            None => None,
+        };
+
         let tool_config = ToolConfig {
             env,
-            extra_read: resolve_paths(&raw_tool.extra_read, &sandbox_root)?,
-            extra_write: resolve_paths(&raw_tool.extra_write, &sandbox_root)?,
+            extra_read: raw_tool.extra_read.into_iter().map(PathBuf::from).collect(),
+            extra_write: raw_tool
+                .extra_write
+                .into_iter()
+                .map(PathBuf::from)
+                .collect(),
             timeout: raw_tool.timeout.map(Duration::from_secs),
+            access: tool_access,
             description: raw_tool.description,
             proxy,
         };
@@ -1301,47 +1769,23 @@ fn parse_and_resolve_config(
         tools.insert(name, tool_config);
     }
 
-    // Resolve the [agent] section when present.
     let agent = match raw.agent {
         None => None,
         Some(raw_agent) => {
             let agent_timeout = Duration::from_secs(raw_agent.timeout.unwrap_or(0));
 
-            let mut agent_env: BTreeMap<String, EnvValue> = BTreeMap::new();
-            for (var_name, raw_value) in raw_agent.env {
-                if !is_valid_env_var_name(&var_name) {
-                    return Err(ConfigError::InvalidEnvVarName {
-                        tool: "agent".to_string(),
-                        name: var_name,
-                    });
-                }
-                let value = match raw_value {
-                    RawEnvValue::Static(s) => EnvValue::Static(render_env_template(
-                        &s,
-                        &sandbox_root,
-                        "agent",
-                        &var_name,
-                    )?),
-                    RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                        if !secrets.contains_key(&secret) {
-                            // Location key is "agent" so the error message
-                            // formats as [agent.env.<var>].
-                            undeclared_refs.push((
-                                "agent".to_string(),
-                                var_name.clone(),
-                                secret.clone(),
-                            ));
-                        }
-                        EnvValue::SecretRef(secret)
-                    }
-                };
-                agent_env.insert(var_name, value);
-            }
+            let agent_env = resolve_env_map(
+                EnvOwner::Agent,
+                raw_agent.env,
+                false,
+                &secrets,
+                &mut undeclared_refs,
+            )?;
 
             let (agent_fs_read, agent_fs_write) = match raw_agent.filesystem {
                 Some(fs) => (
-                    resolve_paths(&fs.read, &sandbox_root)?,
-                    resolve_paths(&fs.write, &sandbox_root)?,
+                    fs.read.into_iter().map(PathBuf::from).collect(),
+                    fs.write.into_iter().map(PathBuf::from).collect(),
                 ),
                 None => (Vec::new(), Vec::new()),
             };
@@ -1362,168 +1806,22 @@ fn parse_and_resolve_config(
         });
     }
 
-    // Derive socket, PID and CA certificate paths.
-    let socket_path = sandbox_root.join(SOCKET_FILENAME);
-    let pid_path = sandbox_root.join(PID_FILENAME);
-    let ca_path = sandbox_root.join(CA_CERT_FILENAME);
-
     Ok(Config {
         sandbox_root,
-        socket_path,
-        pid_path,
-        ca_path,
         timeout,
+        access,
         filesystem_read,
         filesystem_write,
         secrets,
         tools,
         agent,
+        // The launcher already created every {tool_state} dir before
+        // normalizing paths into this wire form; nothing left to create.
+        tool_state_dirs: Vec::new(),
     })
 }
 
-/// Discover and parse the Airlock configuration.
-///
-/// Walks from `start_dir` upward to `$HOME` looking for a valid `airlock.toml`
-/// owned by the current effective uid. The first valid file found is parsed
-/// and returned as a fully resolved [`Config`].
-///
-/// # Arguments
-///
-/// * `start_dir` — The directory to start searching from (typically `std::env::current_dir()`).
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if:
-/// - No valid config file is found between `start_dir` and `$HOME`
-/// - `$HOME` is not set
-/// - The config file cannot be read or parsed
-/// - A tool name contains a path separator
-pub fn load_config(start_dir: &Path) -> Result<Config, ConfigError> {
-    let (config_path, sandbox_root) = discover_config_file(start_dir)?;
-
-    // Re-open the config via O_NOFOLLOW + fstat to close the TOCTOU window
-    // between discovery and read. An attacker who cannot modify the containing
-    // directory cannot swap the file between the walk's ownership check and
-    // this read — but if they can, the re-check here will catch a UID change.
-    let contents = read_config_securely(&config_path, current_euid())?;
-
-    parse_and_resolve_config(&contents, &config_path, sandbox_root)
-}
-
-/// Load and fully validate a config from an explicitly supplied path.
-///
-/// Unlike [`load_config`], this function skips the directory walk and uses the
-/// given `path` directly. It applies the same `O_NOFOLLOW` + `fstat` ownership
-/// check as the discovery path. The sandbox root is the canonicalized parent
-/// directory of `path`.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if:
-/// - The file does not exist or cannot be opened
-/// - The file is not owned by the current effective uid
-/// - `$HOME` is not set (needed for tilde expansion and home-root guard)
-/// - The config file cannot be parsed or fails validation
-pub fn load_config_from_file(path: &Path) -> Result<Config, ConfigError> {
-    // Canonicalize the parent directory to derive sandbox_root before reading
-    // the file, so that path resolution in parse_and_resolve_config is correct.
-    let parent = path.parent().ok_or_else(|| ConfigError::ReadError {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no parent directory",
-        ),
-    })?;
-
-    let sandbox_root =
-        std::fs::canonicalize(parent).map_err(|e| ConfigError::CanonicalizationError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-
-    // read_config_securely opens with O_NOFOLLOW and checks the file's uid via
-    // fstat, providing the same TOCTOU-resistant ownership guarantee as the
-    // discovery path. Missing files surface as ReadError(NotFound); files owned
-    // by a different uid surface as ReadError(PermissionDenied).
-    let contents = read_config_securely(path, current_euid())?;
-
-    parse_and_resolve_config(&contents, path, sandbox_root)
-}
-
-/// Discover the socket and PID file paths without parsing the config file.
-///
-/// This is a lightweight alternative to [`load_config`] for use by the client
-/// and management commands that only need the socket location. It performs the
-/// same directory walk and ownership check but does not read or parse the file
-/// contents.
-///
-/// # Arguments
-///
-/// * `start_dir` — The directory to start searching from.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if no valid config file is found or `$HOME` is not set.
-pub fn discover_paths(start_dir: &Path) -> Result<DiscoveredPaths, ConfigError> {
-    let (_config_path, sandbox_root) = discover_config_file(start_dir)?;
-
-    Ok(DiscoveredPaths {
-        socket_path: sandbox_root.join(SOCKET_FILENAME),
-        pid_path: sandbox_root.join(PID_FILENAME),
-        ca_path: sandbox_root.join(CA_CERT_FILENAME),
-        sandbox_root,
-    })
-}
-
-/// Return the socket and PID file paths derived from an explicitly supplied
-/// config file path, without parsing the file contents.
-///
-/// This is the explicit-path counterpart of [`discover_paths`]. It applies the
-/// same `O_NOFOLLOW` + `fstat` ownership check as the discovery path but skips
-/// the directory walk, using `path`'s parent as the sandbox root.
-///
-/// # Errors
-///
-/// Returns [`ConfigError`] if the file does not exist, is not owned by the
-/// current effective uid, or its parent directory cannot be canonicalized.
-pub fn discover_paths_from_file(path: &Path) -> Result<DiscoveredPaths, ConfigError> {
-    let euid = current_euid();
-
-    // Ownership check: opens with O_NOFOLLOW and fstats the fd — the same
-    // TOCTOU-resistant method used during directory-walk discovery.
-    if !is_owned_by(path, euid) {
-        return Err(ConfigError::ReadError {
-            path: path.to_path_buf(),
-            source: std::io::Error::new(
-                std::io::ErrorKind::PermissionDenied,
-                "config file not found or not owned by current user",
-            ),
-        });
-    }
-
-    let parent = path.parent().ok_or_else(|| ConfigError::ReadError {
-        path: path.to_path_buf(),
-        source: std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "config path has no parent directory",
-        ),
-    })?;
-
-    let sandbox_root =
-        std::fs::canonicalize(parent).map_err(|e| ConfigError::CanonicalizationError {
-            path: parent.to_path_buf(),
-            source: e,
-        })?;
-
-    Ok(DiscoveredPaths {
-        socket_path: sandbox_root.join(SOCKET_FILENAME),
-        pid_path: sandbox_root.join(PID_FILENAME),
-        ca_path: sandbox_root.join(CA_CERT_FILENAME),
-        sandbox_root,
-    })
-}
-
-/// Return the config file name (`airlock.toml`).
+/// Return the repo config file name (`airlock.toml`).
 ///
 /// Exposed so that other modules (e.g. the `init` command) can reference the
 /// canonical file name without duplicating the constant.
@@ -1531,16 +1829,30 @@ pub fn config_filename() -> &'static str {
     CONFIG_FILENAME
 }
 
+/// Return the local config file name (`airlock.local.toml`).
+pub fn local_config_filename() -> &'static str {
+    LOCAL_CONFIG_FILENAME
+}
+
 /// Return a default `airlock.toml` template suitable for new projects.
 ///
 /// The template contains commented-out examples of every supported section
 /// so that users can quickly uncomment and customise what they need.
 pub fn default_config_template() -> &'static str {
-    r#"# Airlock configuration
+    r#"# Airlock configuration — the repo layer. Commit this file; it is approved
+# like any other code change (`airlock trust`), and `airlock run --profile
+# claude` checks it before every session.
 # See https://github.com/ModernPath/airlock for documentation.
 
 # Global timeout for tool execution in seconds (default: 300).
 # timeout = 300
+
+# Default filesystem baseline for every tool's sandbox: "none" (just the
+# tool's own binary and the bare minimum to start and exit), "system"
+# (today's baseline: system libraries, binaries, and config), or "default"
+# (system plus read-only Nix/Homebrew/MacPorts toolchain roots). A [tools.*]
+# entry may override this with its own `access`.
+# access = "default"
 
 # Global filesystem access paths. The directory containing this file is always
 # read-write, and a baseline of system paths (/usr/lib, /etc, /dev/{null,
@@ -1561,16 +1873,28 @@ pub fn default_config_template() -> &'static str {
 # command = ["gcloud", "auth", "print-access-token"]
 # timeout = 10
 
+# Or leave the binding to each user: a label with only a description is a
+# request each teammate fills in with `airlock init --local`.
+# [secrets.PERSONAL_TOKEN]
+# description = "..."
+
 # Define tools and the environment they run with. `env` entries are either
-# static strings or references to a [secrets.<label>] entry.
+# static strings or references to a [secrets.<label>] entry. {sandbox_root}
+# expands to the project directory; {tool_state} expands to a writable
+# directory outside the project, private to this tool
+# ($XDG_CACHE_HOME/airlock/<id>/<tool>) — use it for a tool's own config
+# directory (GH_CONFIG_DIR, CLOUDSDK_CONFIG, KUBECONFIG, ...) so the agent
+# cannot read it and git never sees it.
 # [tools.example]
 # extra_read  = []
 # extra_write = []
 # timeout     = 60
+# access      = "default"  # "none" | "system" | "default"; see above
 #
 # [tools.example.env]
-# API_KEY = { secret = "API_KEY" }
-# LOG_LEVEL = "info"
+# API_KEY        = { secret = "API_KEY" }
+# LOG_LEVEL      = "info"
+# EXAMPLE_CONFIG = "{tool_state}"
 
 # Configure the AI agent sandbox launched by `airlock run`.
 # [agent]
@@ -1579,6 +1903,12 @@ pub fn default_config_template() -> &'static str {
 #
 # # Environment variable names inherited from the host process.
 # passthrough_env = ["COLORTERM", "NO_COLOR"]
+#
+# # Kits: language toolchain/package-cache access for `airlock run`'s agent
+# # sandbox — see the global config template for what they are and the
+# # built-in names. [kits.*] tables themselves may only live in your global
+# # config or airlock.local.toml, never here.
+# # kits = ["rust", "node"]
 #
 # [agent.env]
 # # Static value injected into the agent's environment.
@@ -1599,9 +1929,152 @@ pub fn default_config_template() -> &'static str {
 "#
 }
 
+/// Return a default `airlock.toml` template for the global layer
+/// (`$XDG_CONFIG_HOME/airlock/airlock.toml`, default
+/// `~/.config/airlock/airlock.toml`).
+///
+/// Unlike the repo and local layers, the global file is never approved —
+/// it is the user's own file, protected by the anchor checks instead — and
+/// every path in it must be absolute, since it applies to every project.
+pub fn global_config_template() -> &'static str {
+    r#"# Airlock configuration — your global defaults, applied to every project.
+# This file is never approved like airlock.toml or airlock.local.toml: it is
+# your own file, outside any project, protected by Airlock's anchor checks
+# instead. Paths here must be absolute (~, {sandbox_root}, and {tool_state}
+# still work; a bare relative path is a config error, since it would mean
+# something different in each project).
+
+# Bind secrets you use across projects. A project's own airlock.toml binds
+# the label GH_TOKEN itself only through airlock.local.toml's
+# `from = "global"` — see `airlock init --local`.
+# [secrets.GH_TOKEN]
+# source  = "command"
+# command = ["op", "read", "op://Private/GitHub/token"]
+
+# Default filesystem baseline for every tool's sandbox: "none" (bare
+# minimum), "system" (today's baseline), or "default" (system plus
+# read-only Nix/Homebrew/MacPorts toolchain roots).
+# access = "default"
+
+# Tools you want available everywhere, even in projects that don't declare
+# them. A project's own [tools.<name>] of the same name takes precedence.
+# [tools.aws]
+# description = "AWS CLI"
+# access      = "default"  # "none" | "system" | "default"; see above
+# [tools.aws.env]
+# AWS_PROFILE = "personal"
+
+# Kits add a language toolchain's cache access to `airlock run`'s agent
+# sandbox, on top of whatever harness profile you use. Built-in kits: rust,
+# node, python, go, elixir. List the ones you want on [agent] below (any
+# config layer; unioned across them), and optionally set a built-in kit's
+# mode here or in airlock.local.toml (never in a project's own airlock.toml):
+# "isolated" (the default) points the toolchain's cache env vars at a
+# directory private to this project, so the agent never touches your real
+# caches; "shared" instead grants write to the real ones, plus read of your
+# toolchain config and registry credentials (~/.cargo/credentials.toml,
+# ~/.npmrc, ~/.hex/hex.config, ...) so private registries work. Prefer
+# isolated — shared lets the agent poison a cache (e.g.
+# ~/.cargo/registry/src) that an unsandboxed build later trusts.
+# [kits.rust]
+# mode = "isolated"
+
+# A user-defined kit works like a built-in one but you supply its own
+# read/write paths and env (no mode — always the paths/env you give it):
+# [kits.bazel]
+# read  = ["~/.bazelrc"]
+# write = ["~/.cache/bazel"]
+# env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+
+# [agent]
+# passthrough_env = ["COLORTERM"]
+# kits = ["rust"]
+"#
+}
+
+/// Return a standalone `airlock.local.toml` template, written by
+/// `airlock init --local` in a repo with no `airlock.toml` of its own (a
+/// repo whose team has not adopted Airlock). It is the same shape as
+/// [`default_config_template`] but documented as the user's own file.
+pub fn local_config_template_standalone() -> &'static str {
+    r#"# Airlock configuration — a personal, local-only config. This project has
+# no airlock.toml of its own, so this file stands alone: it is approved like
+# any local file (`airlock trust`), but nothing here is shared with anyone
+# else who clones this repo.
+# See https://github.com/ModernPath/airlock for documentation.
+
+# [secrets.API_KEY]
+# source = "env"
+
+# Default filesystem baseline for every tool's sandbox: "none" (bare
+# minimum), "system" (today's baseline), or "default" (system plus
+# read-only Nix/Homebrew/MacPorts toolchain roots).
+# access = "default"
+
+# [tools.example]
+# access = "default"  # "none" | "system" | "default"; see above
+# [tools.example.env]
+# API_KEY = { secret = "API_KEY" }
+
+# [agent]
+# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir
+
+# A built-in kit's mode ("isolated", the default, or "shared") may be set
+# here or in your global config, never in a project's own airlock.toml.
+# [kits.rust]
+# mode = "isolated"
+"#
+}
+
+/// Build the `airlock.local.toml` stub `airlock init --local` writes in a
+/// repo whose `airlock.toml` leaves one or more secret labels unbound.
+///
+/// `parent_bound` are labels a parent config binds — each gets
+/// `from = "parent"`. `global_bound` are labels the global layer binds —
+/// each of the rest gets `from = "global"`. The remaining `repo_labels` get
+/// a commented `command` / `env` example under their description.
+/// `repo_labels` carries `(label, description)` pairs in the order they
+/// should appear.
+pub fn local_stub(
+    repo_labels: &[(String, Option<String>)],
+    parent_bound: &[String],
+    global_bound: &[String],
+) -> String {
+    let mut out = String::from(
+        "# Your bindings for this project. Keep it out of git.\n\
+         # Run `airlock config` to see the merged result.\n",
+    );
+    for (label, description) in repo_labels {
+        out.push('\n');
+        if let Some(d) = description {
+            out.push_str(&format!("# {d}\n"));
+        }
+        if parent_bound.contains(label) {
+            out.push_str(&format!("[secrets.{label}]\nfrom = \"parent\"\n"));
+        } else if global_bound.contains(label) {
+            out.push_str(&format!("[secrets.{label}]\nfrom = \"global\"\n"));
+        } else {
+            out.push_str(&format!(
+                "# Uncomment one:\n\
+                 # [secrets.{label}]\n\
+                 # source  = \"command\"\n\
+                 # command = [\"op\", \"read\", \"op://Private/{label}/token\"]\n\
+                 #\n\
+                 # [secrets.{label}]\n\
+                 # source = \"env\"        # read from the environment of `airlock run`\n"
+            ));
+        }
+    }
+    out
+}
+
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use super::*;
     use std::fs;
@@ -1614,15 +2087,16 @@ mod tests {
         fs::write(dir.join(CONFIG_FILENAME), content).expect("failed to write config");
     }
 
+    /// Create an `airlock.local.toml` — the one layer besides global that
+    /// may set `allow_home_root` (v2: it is a config error in the repo
+    /// layer, see [`ConfigError::AllowHomeRootInRepo`]).
+    fn write_local_config(dir: &Path, content: &str) {
+        fs::write(dir.join(LOCAL_CONFIG_FILENAME), content).expect("failed to write local config");
+    }
+
     /// Minimal valid config with one tool and one secret.
-    ///
-    /// Includes `allow_home_root = true` because many tests set `HOME` to the
-    /// tempdir where the config lives; without the opt-in, `load_config` would
-    /// refuse to use `$HOME` as the sandbox root.
     fn minimal_config() -> &'static str {
         r#"
-allow_home_root = true
-
 [secrets.my_secret]
 source = "env"
 from = "MY_SECRET"
@@ -1636,7 +2110,7 @@ MY_SECRET = { secret = "my_secret" }
     fn full_config() -> &'static str {
         r#"
 timeout = 120
-allow_home_root = true
+access  = "system"
 
 [filesystem]
 read = ["/usr/share", "~/docs"]
@@ -1658,6 +2132,7 @@ from = "API_TOKEN"
 extra_read = ["/etc/config"]
 extra_write = ["/tmp/results"]
 timeout = 60
+access = "none"
 
 [tools.grep.env]
 API_KEY = { secret = "api_key" }
@@ -1677,170 +2152,61 @@ passthrough_env = ["TERM"]
 "#
     }
 
-    // ── Discovery: finds config in starting directory ────────────────────
+    // ── v1→v2 test shim ───────────────────────────────────────────────────
+    //
+    // The rest of this suite was written against the v1 loaders
+    // (`load_config`, `load_config_from_file`), deleted along with the
+    // single-file discovery they drove — the daemon now only ever resolves
+    // the already-merged wire config (`resolve_wire_config`), and discovery
+    // itself lives in `layers::load_layers`/`merge`. Rather than rewrite
+    // every call site, these two functions run the real v2 pipeline
+    // (`load_layers` → `merge` → `to_wire` → `resolve_wire_config`) against
+    // the single file `write_config` wrote, so every existing assertion
+    // below still exercises genuine, current code.
 
-    #[test]
-    fn discovery_finds_config_in_start_dir() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Set HOME to the temp dir so the walk doesn't escape.
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, sandbox_root) = discover_config_file(tmp.path()).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
-        assert_eq!(
-            sandbox_root, canonical_tmp,
-            "sandbox root should be the canonicalized parent of the config file"
-        );
+    fn resolve_through_v2_pipeline(
+        mode: &crate::layers::DiscoveryMode,
+        cwd: &Path,
+        home: &Path,
+    ) -> Result<Config, ConfigError> {
+        let no_global = home.join("no-such-global.toml");
+        let loaded = crate::layers::load_layers(mode, cwd, home, &no_global)?;
+        let ctx = crate::layers::MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: home.join(".cache/airlock"),
+        };
+        let merged = crate::layers::merge(&loaded, &ctx)?;
+        resolve_wire_config(merged.to_wire(), &loaded.root)
     }
 
-    // ── Discovery: finds config in parent directory ──────────────────────
-
-    #[test]
-    fn discovery_finds_config_in_parent() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Create a child directory with no config.
-        let child = tmp.path().join("subdir");
-        fs::create_dir(&child).unwrap();
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&child).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
+    /// A `$HOME` that is never equal to a test's project directory, so the
+    /// home-root guard (`ctx.root == home`) never fires for a test that
+    /// isn't specifically exercising it — none of these tests' configs set
+    /// `allow_home_root`, which v2 refuses in the repo layer anyway.
+    fn decoy_home() -> &'static Path {
+        Path::new("/no/such/home")
     }
 
-    // ── Discovery: walks upward through multiple levels ──────────────────
-
-    #[test]
-    fn discovery_walks_through_multiple_levels() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        // Create nested subdirectories.
-        let deep = tmp.path().join("a").join("b").join("c");
-        fs::create_dir_all(&deep).unwrap();
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_tmp = std::fs::canonicalize(tmp.path()).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&deep).unwrap();
-        assert_eq!(config_path, canonical_tmp.join(CONFIG_FILENAME));
+    /// Replaces v1's `load_config(dir)`.
+    fn load_config(dir: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(&crate::layers::DiscoveryMode::Default, dir, decoy_home())
     }
 
-    // ── Discovery: stops at $HOME ────────────────────────────────────────
-
-    #[test]
-    fn discovery_stops_at_home() {
-        let tmp = tempdir().unwrap();
-
-        // Create structure: tmp/home_dir/subdir
-        // Put config ABOVE home_dir (at tmp level), but set HOME to home_dir.
-        let home_dir = tmp.path().join("home_dir");
-        let subdir = home_dir.join("subdir");
-        fs::create_dir_all(&subdir).unwrap();
-
-        // Put config at tmp level (above HOME).
-        write_config(tmp.path(), minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", home_dir.to_str().unwrap());
-
-        let result = discover_config_file(&subdir);
-        assert!(
-            result.is_err(),
-            "discovery should not find config above $HOME"
-        );
-        assert!(
-            matches!(result.unwrap_err(), ConfigError::NotFound { .. }),
-            "should return NotFound error"
-        );
+    /// Like [`load_config`], but `$HOME` is given explicitly — for the
+    /// home-root guard's own tests, which need `cwd`/`home` to actually
+    /// match (or not) on request.
+    fn load_config_at(cwd: &Path, home: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(&crate::layers::DiscoveryMode::Default, cwd, home)
     }
 
-    // ── Discovery: error when no config found ────────────────────────────
-
-    #[test]
-    fn discovery_error_when_no_config() {
-        let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let result = discover_config_file(tmp.path());
-        assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), ConfigError::NotFound { .. }));
-    }
-
-    // ── Discovery: skips file owned by different uid ─────────────────────
-
-    #[test]
-    fn discovery_skips_file_with_different_owner() {
-        // We can't easily change file ownership without root privileges.
-        // Instead, we test that the `is_owned_by` function works correctly
-        // with our own uid, and that the discovery logic flows correctly.
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-
-        let euid = current_euid();
-        let config_path = tmp.path().join(CONFIG_FILENAME);
-
-        // Our file should be owned by us.
-        assert!(
-            is_owned_by(&config_path, euid),
-            "file should be owned by current euid"
-        );
-
-        // A non-existent uid should not match.
-        assert!(
-            !is_owned_by(&config_path, euid.wrapping_add(1)),
-            "file should not be owned by a different uid"
-        );
-    }
-
-    // ── Discovery: accepts file owned by current euid ────────────────────
-
-    #[test]
-    fn discovery_accepts_file_owned_by_current_euid() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        // The file we just created should be owned by us.
-        let result = discover_config_file(tmp.path());
-        assert!(result.is_ok(), "should accept config owned by current euid");
-    }
-
-    // ── Discovery: closest config wins ───────────────────────────────────
-
-    #[test]
-    fn discovery_closest_config_wins() {
-        let tmp = tempdir().unwrap();
-
-        // Config in parent.
-        write_config(
-            tmp.path(),
-            r#"
-timeout = 999
-
-[tools.parent_tool]
-"#,
-        );
-
-        // Config in child (closer to start).
-        let child = tmp.path().join("project");
-        fs::create_dir(&child).unwrap();
-        write_config(&child, minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let canonical_child = std::fs::canonicalize(&child).unwrap();
-        let (config_path, _sandbox_root) = discover_config_file(&child).unwrap();
-        assert_eq!(
-            config_path,
-            canonical_child.join(CONFIG_FILENAME),
-            "closest config file should win"
-        );
+    /// Replaces v1's `load_config_from_file(path)`.
+    fn load_config_from_file(path: &Path) -> Result<Config, ConfigError> {
+        resolve_through_v2_pipeline(
+            &crate::layers::DiscoveryMode::ConfigFile(path.to_path_buf()),
+            decoy_home(),
+            decoy_home(),
+        )
     }
 
     // ── Parsing: minimal valid config ────────────────────────────────────
@@ -1849,7 +2215,6 @@ timeout = 999
     fn parse_minimal_config() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
 
@@ -1881,13 +2246,14 @@ timeout = 999
     #[test]
     fn parse_full_config() {
         let tmp = tempdir().unwrap();
+        let home = tempdir().unwrap();
         write_config(tmp.path(), full_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let config = load_config(tmp.path()).unwrap();
+        let config = load_config_at(tmp.path(), home.path()).unwrap();
 
         // Global timeout.
         assert_eq!(config.timeout, Duration::from_secs(120));
+        assert_eq!(config.access, crate::sandbox::ToolAccess::System);
 
         // Filesystem section.
         assert_eq!(config.filesystem_read.len(), 2);
@@ -1896,10 +2262,8 @@ timeout = 999
                 .filesystem_read
                 .contains(&PathBuf::from("/usr/share"))
         );
-        // ~/docs should be expanded to {tmp_path}/docs (HOME was set to tmp_path).
-        // Use tmp.path() directly rather than re-reading HOME to avoid races
-        // with concurrent tests that also modify the HOME env var.
-        let expected_home_docs = tmp.path().join("docs");
+        // ~/docs should be expanded to {home}/docs.
+        let expected_home_docs = home.path().join("docs");
         assert!(
             config.filesystem_read.contains(&expected_home_docs),
             "filesystem_read should contain expanded ~/docs = {:?}, got {:?}",
@@ -1929,6 +2293,7 @@ timeout = 999
         assert_eq!(grep.extra_read, vec![PathBuf::from("/etc/config")]);
         assert_eq!(grep.extra_write, vec![PathBuf::from("/tmp/results")]);
         assert_eq!(grep.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(grep.access, Some(crate::sandbox::ToolAccess::None));
 
         let python = config.tools.get("python3").expect("python3 should exist");
         assert!(matches!(
@@ -1944,6 +2309,7 @@ timeout = 999
         assert_eq!(python.extra_read, vec![sandbox_root.join("data")]);
         assert_eq!(python.extra_write, vec![sandbox_root.join("output")]);
         assert!(python.timeout.is_none());
+        assert!(python.access.is_none());
 
         // Secrets.
         assert_eq!(config.secrets.len(), 3);
@@ -1963,7 +2329,6 @@ timeout = 999
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.mytool]
 
@@ -1972,7 +2337,6 @@ timeout = 60
 passthrough_env = ["TERM", "COLORTERM"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config
@@ -1992,7 +2356,6 @@ passthrough_env = ["TERM", "COLORTERM"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.mytool]
 
@@ -2000,7 +2363,6 @@ allow_home_root = true
 relaxed = true
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(
@@ -2017,7 +2379,6 @@ relaxed = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.one]
 source = "env"
@@ -2027,7 +2388,6 @@ from = "ONE"
 ONE = { secret = "one" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
 
@@ -2052,12 +2412,10 @@ ONE = { secret = "one" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(
@@ -2072,7 +2430,6 @@ allow_home_root = true
     fn parse_invalid_toml_includes_path() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), "this is not valid toml [[[");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2089,20 +2446,18 @@ allow_home_root = true
         );
     }
 
-    // ── Parsing: unknown top-level keys are accepted ─────────────────────
+    // ── Parsing: unknown top-level keys are rejected (v2: no catch-all) ──
 
     #[test]
-    fn parse_unknown_top_level_keys() {
+    fn parse_unknown_top_level_keys_rejected() {
+        // v2 drops the top-level `#[serde(flatten)] _extra` catch-all: an
+        // unknown top-level key is now a config error, matching every
+        // nested table's deny_unknown_fields.
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 future_field = "hello"
-another_unknown = 42
-
-[unknown_section]
-key = "value"
 
 [secrets.s]
 source = "env"
@@ -2112,13 +2467,11 @@ from = "S"
 S = { secret = "s" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let config = load_config(tmp.path());
+        let err = load_config(tmp.path()).unwrap_err();
         assert!(
-            config.is_ok(),
-            "unknown top-level keys should not cause parse errors: {:?}",
-            config.err()
+            matches!(err, ConfigError::ParseError { .. }),
+            "unknown top-level key should be a ParseError, got: {err:?}"
         );
     }
 
@@ -2127,9 +2480,8 @@ S = { secret = "s" }
     #[test]
     fn path_tilde_expansion() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let resolved = resolve_path("~/documents", tmp.path()).unwrap();
+        let resolved = resolve_path_with_home("~/documents", tmp.path(), tmp.path());
         let expected = PathBuf::from(format!("{}/documents", tmp.path().display()));
         assert_eq!(resolved, expected);
     }
@@ -2137,9 +2489,8 @@ S = { secret = "s" }
     #[test]
     fn path_tilde_only() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let resolved = resolve_path("~", tmp.path()).unwrap();
+        let resolved = resolve_path_with_home("~", tmp.path(), tmp.path());
         assert_eq!(resolved, tmp.path().to_path_buf());
     }
 
@@ -2148,8 +2499,8 @@ S = { secret = "s" }
     #[test]
     fn path_relative_resolved_against_sandbox_root() {
         let sandbox = PathBuf::from("/fake/sandbox/root");
-        // HOME isn't needed for relative path resolution.
-        let resolved = resolve_path("data/input", &sandbox).unwrap();
+        let home = PathBuf::from("/fake/home");
+        let resolved = resolve_path_with_home("data/input", &sandbox, &home);
         assert_eq!(resolved, PathBuf::from("/fake/sandbox/root/data/input"));
     }
 
@@ -2158,7 +2509,8 @@ S = { secret = "s" }
     #[test]
     fn path_absolute_unchanged() {
         let sandbox = PathBuf::from("/fake/sandbox/root");
-        let resolved = resolve_path("/usr/bin/tool", &sandbox).unwrap();
+        let home = PathBuf::from("/fake/home");
+        let resolved = resolve_path_with_home("/usr/bin/tool", &sandbox, &home);
         assert_eq!(resolved, PathBuf::from("/usr/bin/tool"));
     }
 
@@ -2168,45 +2520,12 @@ S = { secret = "s" }
     fn sandbox_root_is_canonicalized_parent() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let canonical = std::fs::canonicalize(tmp.path()).unwrap();
         assert_eq!(
             config.sandbox_root, canonical,
             "sandbox root should be the canonicalized directory containing airlock.toml"
-        );
-    }
-
-    // ── Derived paths: socket path ───────────────────────────────────────
-
-    #[test]
-    fn socket_path_derived_correctly() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config = load_config(tmp.path()).unwrap();
-        assert_eq!(
-            config.socket_path,
-            config.sandbox_root.join("airlock.sock"),
-            "socket path should be {{sandbox_root}}/airlock.sock"
-        );
-    }
-
-    // ── Derived paths: PID file path ─────────────────────────────────────
-
-    #[test]
-    fn pid_path_derived_correctly() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config = load_config(tmp.path()).unwrap();
-        assert_eq!(
-            config.pid_path,
-            config.sandbox_root.join("airlock.pid"),
-            "PID file path should be {{sandbox_root}}/airlock.pid"
         );
     }
 
@@ -2219,6 +2538,8 @@ S = { secret = "s" }
         assert!(validate_tool_name("my-tool").is_ok());
         assert!(validate_tool_name("my_tool").is_ok());
         assert!(validate_tool_name("TOOL").is_ok());
+        assert!(validate_tool_name("my.tool").is_ok());
+        assert!(validate_tool_name("my+tool").is_ok());
     }
 
     // ── Tool name validation: forward slash rejected ─────────────────────
@@ -2243,6 +2564,59 @@ S = { secret = "s" }
         );
     }
 
+    // ── Tool name validation: terminal-hostile characters rejected ───────
+    //
+    // A tool name is interpolated unescaped into error messages printed
+    // before the config that chose it has been trusted (`report_launcher_error`
+    // and friends in src/main.rs). These would otherwise let an untrusted
+    // config manipulate that terminal output.
+
+    #[test]
+    fn tool_name_control_character_rejected() {
+        assert!(matches!(
+            validate_tool_name("tool\x1b[31mred"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+        assert!(matches!(
+            validate_tool_name("tool\nname"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_bidi_override_rejected() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE.
+        assert!(matches!(
+            validate_tool_name("tool\u{202e}loot"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_zero_width_character_rejected() {
+        // U+200B ZERO WIDTH SPACE.
+        assert!(matches!(
+            validate_tool_name("too\u{200b}l"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_space_rejected() {
+        assert!(matches!(
+            validate_tool_name("my tool"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_empty_rejected() {
+        assert!(matches!(
+            validate_tool_name(""),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
     // ── Tool name validation in parsing context ──────────────────────────
 
     #[test]
@@ -2251,12 +2625,10 @@ S = { secret = "s" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools."bad/name"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2272,12 +2644,10 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools."bad\\name"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2292,16 +2662,15 @@ allow_home_root = true
     #[test]
     fn load_refuses_home_root_without_opt_in() {
         let tmp = tempdir().unwrap();
-        // Config without allow_home_root.
+        // Config without allow_home_root anywhere.
         write_config(
             tmp.path(),
             r#"
 [tools.mytool]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        let result = load_config(tmp.path());
+        let result = load_config_at(tmp.path(), tmp.path());
         match result {
             Err(ConfigError::HomeRootNotAllowed { .. }) => {}
             other => panic!("expected HomeRootNotAllowed, got: {other:?}"),
@@ -2311,11 +2680,13 @@ allow_home_root = true
     #[test]
     fn load_accepts_home_root_with_opt_in() {
         let tmp = tempdir().unwrap();
-        // minimal_config() already includes allow_home_root = true.
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        // v2: allow_home_root is a config error in the repo layer — only
+        // the local (or global) layer may opt in.
+        write_local_config(tmp.path(), "allow_home_root = true\n");
 
-        load_config(tmp.path()).expect("allow_home_root=true should permit $HOME as sandbox root");
+        load_config_at(tmp.path(), tmp.path())
+            .expect("allow_home_root=true in the local layer should permit $HOME as sandbox root");
     }
 
     #[test]
@@ -2330,40 +2701,9 @@ allow_home_root = true
 [tools.mytool]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
-        load_config(&project).expect("non-home sandbox root should load without opt-in");
-    }
-
-    // ── Lightweight discovery: socket path only ──────────────────────────
-
-    #[test]
-    fn discover_paths_finds_socket_path() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let paths = discover_paths(tmp.path()).unwrap();
-        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-
-        assert_eq!(paths.sandbox_root, canonical);
-        assert_eq!(paths.socket_path, canonical.join("airlock.sock"));
-        assert_eq!(paths.pid_path, canonical.join("airlock.pid"));
-    }
-
-    #[test]
-    fn discover_paths_does_not_parse_contents() {
-        let tmp = tempdir().unwrap();
-        // Write invalid TOML — should still succeed since we don't parse.
-        write_config(tmp.path(), "this is not valid toml at all [[[");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let result = discover_paths(tmp.path());
-        assert!(
-            result.is_ok(),
-            "discover_paths should succeed even with invalid TOML contents: {:?}",
-            result.err()
-        );
+        load_config_at(&project, tmp.path())
+            .expect("non-home sandbox root should load without opt-in");
     }
 
     // ── [secrets] + tools.env schema ─────────────────────────────────────
@@ -2375,7 +2715,6 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.GH_TOKEN]
 source = "env"
@@ -2384,7 +2723,6 @@ source = "env"
 GH_TOKEN = { secret = "GH_TOKEN" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["GH_TOKEN"].source {
@@ -2399,7 +2737,6 @@ GH_TOKEN = { secret = "GH_TOKEN" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.cmd_token]
 source = "command"
@@ -2409,7 +2746,6 @@ command = ["echo", "hello"]
 TOKEN = { secret = "cmd_token" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["cmd_token"].source {
@@ -2438,7 +2774,6 @@ TOKEN = { secret = "cmd_token" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.gcp_token]
 source = "command"
@@ -2451,7 +2786,6 @@ refresh_max_backoff = 600
 TOKEN = { secret = "gcp_token" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["gcp_token"].source {
             SecretSource::Command {
@@ -2471,7 +2805,6 @@ TOKEN = { secret = "gcp_token" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2483,7 +2816,6 @@ refresh = 60
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["tok"].source {
             SecretSource::Command {
@@ -2503,7 +2835,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2515,7 +2846,6 @@ refresh = 0
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshInterval { ref label, .. } if label == "tok"),
@@ -2529,7 +2859,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2541,7 +2870,6 @@ refresh = 5
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshInterval { .. }),
@@ -2555,7 +2883,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2566,7 +2893,6 @@ refresh_max_backoff = 30
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshConfig { .. }),
@@ -2580,7 +2906,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2593,7 +2918,6 @@ refresh_max_backoff = 5
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshConfig { .. }),
@@ -2607,7 +2931,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2619,7 +2942,6 @@ env_clear = true
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["tok"].source {
             SecretSource::Command { env, .. } => {
@@ -2639,7 +2961,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "command"
@@ -2652,7 +2973,6 @@ command = ["echo", "hi"]
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidSecretEnvVarName { ref label, ref name } if label == "tok" && name == "1BAD"),
@@ -2661,12 +2981,16 @@ TOKEN = { secret = "tok" }
     }
 
     #[test]
-    fn parse_env_secret_with_refresh_field_rejected_by_serde() {
+    fn parse_env_secret_with_refresh_field_rejected() {
+        // The v1 tagged enum made this a serde-level deny_unknown_fields
+        // rejection (ParseError). v2's flat RawSecretSpec parses `refresh`
+        // unconditionally (it's a legal field of the struct, just not of
+        // `source = "env"`), so the mismatch is now caught by
+        // resolve_bound_secret_source instead.
         let tmp = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "env"
@@ -2676,10 +3000,9 @@ refresh = 60
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
-            matches!(err, ConfigError::ParseError { .. }),
+            matches!(err, ConfigError::SecretFieldMismatch { ref label, .. } if label == "tok"),
             "got: {err:?}"
         );
     }
@@ -2690,7 +3013,6 @@ TOKEN = { secret = "tok" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.api_key]
 source = "env"
@@ -2702,7 +3024,6 @@ LOG_LEVEL = "debug"
 REGION = "eu-north-1"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let tool = &config.tools["app"];
@@ -2723,12 +3044,10 @@ REGION = "eu-north-1"
 
     #[test]
     fn reject_undeclared_secret_ref_lists_all() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [secrets.known]
 source = "env"
 from = "KNOWN"
@@ -2740,10 +3059,10 @@ A = { secret = "ghost_a" }
 B = { secret = "ghost_b" }
 KNOWN = { secret = "known" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { refs } => {
                 assert_eq!(refs.len(), 2);
@@ -2763,7 +3082,6 @@ KNOWN = { secret = "known" }
             tmp.path(),
             &format!(
                 r#"
-allow_home_root = true
 
 [secrets.gcp_token]
 source = "env"
@@ -2771,7 +3089,6 @@ from = "GCP_TOKEN"
 {body}"#
             ),
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         load_config(tmp.path())
     }
 
@@ -3067,13 +3384,11 @@ alow = ["GET /**"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.bad.env]
 "1LEADING_DIGIT" = "nope"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnvVarName { .. }));
@@ -3087,13 +3402,11 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.gh.env]
 GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let expected = format!("{}/.config/gh", config.sandbox_root.display());
@@ -3109,13 +3422,11 @@ GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 BOTH = "{sandbox_root}:{sandbox_root}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let root = config.sandbox_root.display().to_string();
@@ -3132,13 +3443,11 @@ BOTH = "{sandbox_root}:{sandbox_root}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 LIT = "\\{sandbox_root\\}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3153,13 +3462,11 @@ LIT = "\\{sandbox_root\\}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 X = "{home}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         match err {
@@ -3182,13 +3489,11 @@ X = "{home}"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 X = "{sandbox_root"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -3206,7 +3511,6 @@ X = "{sandbox_root"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets."weird{label}"]
 source = "env"
@@ -3216,7 +3520,6 @@ from = "WEIRD"
 WEIRD = { secret = "weird{label}" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3231,13 +3534,11 @@ WEIRD = { secret = "weird{label}" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [tools.t.env]
 HOST = "github.com"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3252,14 +3553,12 @@ HOST = "github.com"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.bad]
 source = "command"
 command = []
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::EmptyCommandArgv { .. }));
@@ -3271,17 +3570,83 @@ command = []
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.x]
 source = "vault"
 address = "https://vault"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::ParseError { .. }));
+    }
+
+    // ── access level ──────────────────────────────────────────────────────
+
+    #[test]
+    fn access_defaults_to_default_when_unset_anywhere() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), minimal_config());
+
+        let config = load_config(tmp.path()).unwrap();
+        assert_eq!(config.access, crate::sandbox::ToolAccess::Default);
+        let tool = config.tools.get("mytool").unwrap();
+        assert!(tool.access.is_none());
+    }
+
+    #[test]
+    fn tool_access_overrides_top_level_access() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+access = "system"
+
+[tools.mytool]
+access = "none"
+"#,
+        );
+
+        let config = load_config(tmp.path()).unwrap();
+        assert_eq!(config.access, crate::sandbox::ToolAccess::System);
+        let tool = config.tools.get("mytool").unwrap();
+        assert_eq!(tool.access, Some(crate::sandbox::ToolAccess::None));
+    }
+
+    #[test]
+    fn reject_unknown_top_level_access_level() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "access = \"bogus\"\n");
+
+        let err = load_config(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::UnknownAccessLevel { context, got } => {
+                assert_eq!(context, "access");
+                assert_eq!(got, "bogus");
+            }
+            other => panic!("expected UnknownAccessLevel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_unknown_tool_access_level() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+[tools.mytool]
+access = "bogus"
+"#,
+        );
+
+        let err = load_config(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::UnknownAccessLevel { context, got } => {
+                assert_eq!(context, "tools.mytool.access");
+                assert_eq!(got, "bogus");
+            }
+            other => panic!("expected UnknownAccessLevel, got {other:?}"),
+        }
     }
 
     #[test]
@@ -3290,7 +3655,6 @@ address = "https://vault"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.x]
 source = "env"
@@ -3300,7 +3664,6 @@ from = "X"
 X = { secret = "x", type = "string" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         // The untagged enum in RawEnvValue means this falls through to
         // Static(String), then fails as a non-string. Either way it must
@@ -3333,14 +3696,6 @@ X = { secret = "x", type = "string" }
 
     #[test]
     fn config_error_display_messages() {
-        let err = ConfigError::NotFound {
-            start_dir: PathBuf::from("/some/dir"),
-            home_dir: PathBuf::from("/home/user"),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("/some/dir"));
-        assert!(msg.contains("/home/user"));
-
         let err = ConfigError::HomeNotSet;
         assert!(err.to_string().contains("HOME"));
 
@@ -3348,53 +3703,6 @@ X = { secret = "x", type = "string" }
             name: "bad/tool".to_string(),
         };
         assert!(err.to_string().contains("bad/tool"));
-    }
-
-    // ── Helper: temporary environment variable override ──────────────────
-
-    use std::sync::MutexGuard;
-
-    /// RAII guard that sets an environment variable for the duration of a test
-    /// and restores it when dropped. Holds [`crate::test_support::ENV_MUTEX`]
-    /// — the crate-wide lock — to serialize against every other test that
-    /// touches the process environment, in any module. Using a single mutex
-    /// across the test suite is what keeps `HOME`-mutating tests in
-    /// `config`, `run`, and `sandbox` from racing each other.
-    struct TempEnvVar {
-        key: String,
-        prev: Option<String>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl TempEnvVar {
-        fn new(key: &str, value: &str) -> Self {
-            // Acquire the crate-wide env mutex first to ensure exclusive
-            // access. Poisoned-lock recovery is fine here: a panicked test
-            // already restored its own var via the Drop below.
-            let lock = crate::test_support::ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            // SAFETY: we hold the crate-wide ENV_MUTEX, so no other test
-            // thread anywhere in the suite is reading or writing env vars
-            // concurrently.
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key: key.to_string(),
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for TempEnvVar {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: We still hold ENV_MUTEX (dropped after this).
-                Some(v) => unsafe { std::env::set_var(&self.key, v) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
     }
 
     // ── Default config template ──────────────────────────────────────────
@@ -3412,6 +3720,51 @@ X = { secret = "x", type = "string" }
     }
 
     #[test]
+    fn global_config_template_is_valid_toml() {
+        let parsed: Result<RawConfig, _> = toml::from_str(global_config_template());
+        assert!(
+            parsed.is_ok(),
+            "global config template should be valid TOML: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn local_config_template_standalone_is_valid_toml() {
+        let parsed: Result<RawConfig, _> = toml::from_str(local_config_template_standalone());
+        assert!(
+            parsed.is_ok(),
+            "local standalone template should be valid TOML: {:?}",
+            parsed.err()
+        );
+    }
+
+    /// Uncommenting the global template's kits section (`[agent] kits =
+    /// [...]`, `[kits.rust] mode = "..."`, the `[kits.bazel]` example) must
+    /// still parse — a quick guard against the example drifting from the
+    /// real schema.
+    #[test]
+    fn global_config_template_kits_section_still_parses_uncommented() {
+        let uncommented = r#"
+[kits.rust]
+mode = "isolated"
+
+[kits.bazel]
+read  = ["~/.bazelrc"]
+write = ["~/.cache/bazel"]
+env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+
+[agent]
+passthrough_env = ["COLORTERM"]
+kits = ["rust"]
+"#;
+        let parsed: RawConfig =
+            toml::from_str(uncommented).expect("uncommented kits section parses");
+        assert_eq!(parsed.agent.unwrap().kits, vec!["rust".to_string()]);
+        assert_eq!(parsed.kits.unwrap().len(), 2);
+    }
+
+    #[test]
     fn config_filename_returns_expected_name() {
         assert_eq!(config_filename(), "airlock.toml");
     }
@@ -3422,7 +3775,6 @@ X = { secret = "x", type = "string" }
     fn agent_absent_is_none() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(
@@ -3439,12 +3791,10 @@ X = { secret = "x", type = "string" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config
@@ -3478,13 +3828,11 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 timeout = 0
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(
@@ -3500,13 +3848,11 @@ timeout = 0
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 timeout = 120
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(
@@ -3524,13 +3870,11 @@ timeout = 120
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 passthrough_env = ["COLORTERM", "NO_COLOR"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3548,13 +3892,11 @@ passthrough_env = ["COLORTERM", "NO_COLOR"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 LOG_LEVEL = "info"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3572,7 +3914,6 @@ LOG_LEVEL = "info"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.API_KEY]
 source = "env"
@@ -3582,7 +3923,6 @@ from = "API_KEY"
 API_KEY = { secret = "API_KEY" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3596,19 +3936,19 @@ API_KEY = { secret = "API_KEY" }
 
     #[test]
     fn agent_env_undeclared_secret_ref_error() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // v2's layers::merge additionally scope-checks a repo-layer item's
+        // secret refs before resolve_wire_config ever runs — bypass it and
+        // call resolve_wire_config directly, which is what actually owns
+        // the UndeclaredSecretRefs accumulation this test is about.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [agent.env]
 MISSING = { secret = "nonexistent_label" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { ref refs } => {
                 assert_eq!(refs.len(), 1);
@@ -3635,22 +3975,20 @@ MISSING = { secret = "nonexistent_label" }
 
     #[test]
     fn undeclared_refs_accumulates_tool_and_agent() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [tools.mytool.env]
 A = { secret = "tool_ghost" }
 
 [agent.env]
 B = { secret = "agent_ghost" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         match err {
             ConfigError::UndeclaredSecretRefs { refs } => {
                 assert_eq!(refs.len(), 2, "both tool and agent refs should be reported");
@@ -3674,11 +4012,10 @@ B = { secret = "agent_ghost" }
     #[test]
     fn agent_filesystem_paths_resolved() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        let home = tempdir().unwrap();
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.filesystem]
 read = ["~/projects", "relative/path"]
@@ -3686,11 +4023,11 @@ write = ["/tmp/agent"]
 "#,
         );
 
-        let config = load_config(tmp.path()).unwrap();
+        let config = load_config_at(tmp.path(), home.path()).unwrap();
         let agent = config.agent.unwrap();
 
         // Tilde expansion.
-        let expected_projects = tmp.path().join("projects");
+        let expected_projects = home.path().join("projects");
         assert!(
             agent.filesystem_read.contains(&expected_projects),
             "~/projects should expand to {{HOME}}/projects, got: {:?}",
@@ -3721,7 +4058,6 @@ write = ["/tmp/agent"]
     fn load_config_from_file_success() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = tmp.path().join(CONFIG_FILENAME);
         let config = load_config_from_file(&config_path).unwrap();
@@ -3738,7 +4074,6 @@ write = ["/tmp/agent"]
     #[test]
     fn load_config_from_file_missing_path_returns_error() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         // Parent directory exists; file does not. This surfaces as ReadError
         // (not CanonicalizationError) — the spec's recommended variant.
@@ -3757,7 +4092,6 @@ write = ["/tmp/agent"]
         // verify the check runs by testing with a uid that is not ours.
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = tmp.path().join(CONFIG_FILENAME);
         let euid = current_euid();
@@ -3772,36 +4106,6 @@ write = ["/tmp/agent"]
         assert!(
             !is_owned_by(&config_path, euid.wrapping_add(1)),
             "file should not appear owned by a different uid"
-        );
-    }
-
-    // ── discover_paths_from_file: derives paths from explicit file ───────
-
-    #[test]
-    fn discover_paths_from_file_returns_correct_paths() {
-        let tmp = tempdir().unwrap();
-        write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
-
-        let config_path = tmp.path().join(CONFIG_FILENAME);
-        let paths = discover_paths_from_file(&config_path).unwrap();
-
-        let canonical = std::fs::canonicalize(tmp.path()).unwrap();
-        assert_eq!(paths.sandbox_root, canonical);
-        assert_eq!(paths.socket_path, canonical.join("airlock.sock"));
-        assert_eq!(paths.pid_path, canonical.join("airlock.pid"));
-    }
-
-    #[test]
-    fn discover_paths_from_file_missing_file_returns_error() {
-        let tmp = tempdir().unwrap();
-        let missing = tmp.path().join("nonexistent.toml");
-
-        let result = discover_paths_from_file(&missing);
-        assert!(result.is_err(), "missing file should return an error");
-        assert!(
-            matches!(result.unwrap_err(), ConfigError::ReadError { .. }),
-            "should return ReadError for missing file"
         );
     }
 
@@ -3855,7 +4159,6 @@ write = ["/tmp/agent"]
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [secrets.tok]
 source = "env"
@@ -3872,7 +4175,6 @@ TOK = { secret = "tok" }
 LOG_LEVEL = "debug"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(config.agent.is_none());
@@ -3895,19 +4197,17 @@ LOG_LEVEL = "debug"
 
     #[test]
     fn undeclared_secret_ref_error_message_format() {
-        let tmp = tempdir().unwrap();
-        write_config(
-            tmp.path(),
+        // See the comment in agent_env_undeclared_secret_ref_error: this
+        // goes straight through resolve_wire_config for the same reason.
+        let raw: RawConfig = toml::from_str(
             r#"
-allow_home_root = true
-
 [tools.mytool.env]
 A = { secret = "ghost" }
 "#,
-        );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+        )
+        .unwrap();
 
-        let err = load_config(tmp.path()).unwrap_err();
+        let err = resolve_wire_config(raw, Path::new("/project")).unwrap_err();
         let msg = err.to_string();
         // Error message should show [tools.mytool.env.A] -> "ghost"
         assert!(
@@ -3924,7 +4224,6 @@ A = { secret = "ghost" }
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 ZEBRA = "z"
@@ -3932,7 +4231,6 @@ ALPHA = "a"
 MANGO = "m"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3948,13 +4246,11 @@ MANGO = "m"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 "1INVALID" = "value"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -3971,13 +4267,11 @@ allow_home_root = true
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent]
 unknown_field = "should fail"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -3995,8 +4289,6 @@ unknown_field = "should fail"
         let project = tmp.path().join("project");
         fs::create_dir(&project).unwrap();
         write_config(&project, minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = project.join(CONFIG_FILENAME);
         let config = load_config_from_file(&config_path).unwrap();
@@ -4016,13 +4308,11 @@ unknown_field = "should fail"
         write_config(
             tmp.path(),
             r#"
-allow_home_root = true
 
 [agent.env]
 WORK_DIR = "{sandbox_root}/work"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let expected = format!("{}/work", config.sandbox_root.display());
@@ -4034,5 +4324,103 @@ WORK_DIR = "{sandbox_root}/work"
             ),
             "agent env {{sandbox_root}} template should be rendered"
         );
+    }
+
+    // ── write_grants ──────────────────────────────────────────────────
+
+    #[test]
+    fn write_grants_unions_filesystem_tools_and_agent() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+
+[filesystem]
+write = ["/tmp/global-write"]
+
+[tools.a]
+extra_write = ["/tmp/a-write"]
+
+[tools.b]
+extra_write = ["/tmp/b-write"]
+
+[agent.filesystem]
+write = ["/tmp/agent-write"]
+"#,
+        );
+
+        let config = load_config(tmp.path()).unwrap();
+        let grants = write_grants(&config);
+        for expected in [
+            "/tmp/global-write",
+            "/tmp/a-write",
+            "/tmp/b-write",
+            "/tmp/agent-write",
+        ] {
+            assert!(
+                grants.contains(&PathBuf::from(expected)),
+                "write_grants missing {expected}: {grants:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn write_grants_empty_config_is_empty() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "");
+        let config = load_config(tmp.path()).unwrap();
+        assert!(write_grants(&config).is_empty());
+    }
+
+    // ── resolve_wire_config ───────────────────────────────────────────
+
+    #[test]
+    fn resolve_wire_config_accepts_already_rendered_static_env() {
+        // The wire form never re-renders {sandbox_root}/{tool_state} — the
+        // launcher already expanded them — so a literal value containing a
+        // brace-shaped string that is *not* a placeholder must still pass
+        // through untouched.
+        let mut tools = HashMap::new();
+        tools.insert(
+            "t".to_string(),
+            RawToolConfig {
+                env: Some(HashMap::from([(
+                    "LITERAL".to_string(),
+                    RawEnvValue::Static("{not a known placeholder}".to_string()),
+                )])),
+                ..Default::default()
+            },
+        );
+        let raw = RawConfig {
+            tools: Some(tools),
+            ..Default::default()
+        };
+        let resolved = resolve_wire_config(raw, Path::new("/project")).unwrap();
+        let tool = &resolved.tools["t"];
+        match tool.env.get("LITERAL").unwrap() {
+            EnvValue::Static(s) => assert_eq!(s, "{not a known placeholder}"),
+            other => panic!("expected Static, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn resolve_wire_config_reads_no_home_env_var() {
+        // Removing HOME must not break resolve_wire_config: unlike the
+        // legacy loaders, it takes the root directly and never expands `~`.
+        let _guard = crate::test_support::ENV_MUTEX
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("HOME").ok();
+        // SAFETY: holding the crate-wide ENV_MUTEX (see TempEnvVar above).
+        unsafe { std::env::remove_var("HOME") };
+        let result = resolve_wire_config(RawConfig::default(), Path::new("/project"));
+        // SAFETY: still holding ENV_MUTEX.
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        assert!(result.is_ok(), "got: {result:?}");
     }
 }

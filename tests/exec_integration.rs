@@ -8,14 +8,23 @@
 
 // Only compile on macOS or Linux — the sandbox backends are not available elsewhere.
 #![cfg(any(target_os = "macos", target_os = "linux"))]
+// This test binary builds `ExecRequest`s by hand from the real process
+// environment and `PATH` — there is no session here to supply a snapshot —
+// so it is exempt from the session-isolation lint that binds daemon-side code.
+#![allow(
+    clippy::disallowed_methods,
+    reason = "integration test harness reads the real process env/PATH to build test fixtures, not request-path code"
+)]
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 use airlock::exec::{
-    ExecRequest, SpawnedChild, build_env, kill_process_group, resolve_binary, spawn,
+    ExecRequest, FilteredPath, SpawnedChild, build_env_from, kill_process_group, resolve_binary_in,
+    spawn,
 };
 use airlock::sandbox::{NetworkAccess, SandboxBackend, ToolPolicy};
 
@@ -80,6 +89,7 @@ fn permissive_policy(tmp_dir: &Path) -> ToolPolicy {
         read_write_paths: vec![PathBuf::from("/tmp"), tmp_dir.to_path_buf()],
         network: NetworkAccess::None,
         binary_path: None,
+        ..Default::default()
     }
 }
 
@@ -102,13 +112,47 @@ fn build_permissive_profile(tmp_dir: &Path) -> airlock::sandbox::SandboxProfile 
     }
 }
 
+/// Build a `FilteredPath` from the real process `PATH`, for tests that need
+/// a real binary and don't exercise the filtering/resolution logic itself.
+fn real_path() -> FilteredPath {
+    let path_var = std::env::var("PATH").unwrap_or_default();
+    FilteredPath {
+        entries: path_var.split(':').map(PathBuf::from).collect(),
+        dropped: Vec::new(),
+    }
+}
+
+/// Resolve `sh` against the real process `PATH`, for tests that build an
+/// `ExecRequest` by hand and don't exercise resolution/location-check
+/// behavior themselves.
+fn resolve_sh() -> PathBuf {
+    resolve_binary_in(
+        "sh",
+        &real_path(),
+        Path::new("/airlock-test-root-never-exists"),
+        &[],
+    )
+    .expect("sh should be in PATH")
+}
+
+/// Build a clean env map from the real process environment and `PATH`, for
+/// tests that don't exercise `build_env_from`'s snapshot/`PATH` plumbing
+/// itself.
+fn plain_env() -> std::collections::HashMap<String, String> {
+    let snapshot: BTreeMap<String, String> = std::env::vars().collect();
+    build_env_from(&snapshot, &real_path(), &[])
+}
+
 /// Build an `ExecRequest` for running a shell command with the permissive policy.
 fn shell_request(sh_cmd: &str, tmp_dir: &Path) -> ExecRequest {
+    let path = real_path();
+    let snapshot: BTreeMap<String, String> = std::env::vars().collect();
     ExecRequest {
-        binary: resolve_binary("sh").expect("sh should be in PATH"),
+        binary: resolve_binary_in("sh", &path, tmp_dir, &[]).expect("sh should be in PATH"),
+        arg0: "sh".to_string(),
         args: vec!["-c".to_string(), sh_cmd.to_string()],
         work_dir: tmp_dir.to_path_buf(),
-        env: build_env(&[]),
+        env: build_env_from(&snapshot, &path, &[]),
         sandbox_profile: build_permissive_profile(tmp_dir),
         timeout: Duration::from_secs(30),
     }
@@ -118,6 +162,7 @@ fn shell_request(sh_cmd: &str, tmp_dir: &Path) -> ExecRequest {
 
 /// After spawn, the child's process group ID equals its own PID,
 /// confirming that `setpgid(0, 0)` ran in the `pre_exec` closure.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_pgid_equals_child_pid() {
     let tmp = tempfile::tempdir().unwrap();
@@ -144,6 +189,7 @@ async fn child_pgid_equals_child_pid() {
 /// The daemon (test runner) process's own process group ID differs from
 /// the child's process group ID — confirming the child is not in the
 /// daemon's group.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_pgid_differs_from_daemon_pgid() {
     let tmp = tempfile::tempdir().unwrap();
@@ -170,6 +216,7 @@ async fn child_pgid_differs_from_daemon_pgid() {
 // ─── Kill-tree tests ──────────────────────────────────────────────────────────
 
 /// Sending SIGTERM to the process group kills both the child and its grandchild.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_tree_terminates_child_and_grandchild() {
     let tmp = tempfile::tempdir().unwrap();
@@ -231,6 +278,7 @@ async fn kill_tree_terminates_child_and_grandchild() {
 }
 
 /// Killing one process group does not affect a second independent process group.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_tree_does_not_affect_other_groups() {
     let tmp = tempfile::tempdir().unwrap();
@@ -266,6 +314,7 @@ async fn kill_tree_does_not_affect_other_groups() {
 // ─── Standard output streaming tests ──────────────────────────────────────────
 
 /// Stdout receives the exact bytes written by the child.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdout_receives_known_string() {
     let tmp = tempfile::tempdir().unwrap();
@@ -285,7 +334,26 @@ async fn stdout_receives_known_string() {
     assert!(status.success());
 }
 
+/// The child sees `arg0`, not the canonical binary path, as its `argv[0]`:
+/// a multicall binary (coreutils, busybox) dispatches on it. With no
+/// arguments after the `-c` string, `$0` is the shell's own `argv[0]`.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+#[tokio::test]
+async fn child_argv0_is_arg0_not_the_canonical_binary() {
+    let tmp = tempfile::tempdir().unwrap();
+    let mut request = shell_request("echo $0", tmp.path());
+    request.arg0 = "tool-name".to_string();
+    let mut spawned = spawn(request).expect("spawn should succeed");
+
+    let mut buf = Vec::new();
+    spawned.stdout.read_to_end(&mut buf).await.unwrap();
+
+    assert_eq!(String::from_utf8_lossy(&buf), "tool-name\n");
+    assert!(spawned.child.wait().await.unwrap().success());
+}
+
 /// Stderr receives the exact bytes written by the child.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stderr_receives_known_string() {
     let tmp = tempfile::tempdir().unwrap();
@@ -306,6 +374,7 @@ async fn stderr_receives_known_string() {
 
 /// When the child writes distinct content to stdout and stderr concurrently,
 /// each stream is received correctly without interleaving.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdout_and_stderr_distinct_content() {
     let tmp = tempfile::tempdir().unwrap();
@@ -331,6 +400,7 @@ async fn stdout_and_stderr_distinct_content() {
 
 /// Output larger than a typical pipe buffer (>= 128 KB) is fully received
 /// without truncation.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn large_output_not_truncated() {
     let tmp = tempfile::tempdir().unwrap();
@@ -356,6 +426,7 @@ async fn large_output_not_truncated() {
 
 /// `cat` reads from stdin and echoes to stdout; verify the echo matches
 /// the input exactly.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdin_cat_echoes_input() {
     let tmp = tempfile::tempdir().unwrap();
@@ -387,6 +458,7 @@ async fn stdin_cat_echoes_input() {
 
 /// When stdin is closed immediately (nothing written), the child sees EOF
 /// and exits normally.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn stdin_closed_immediately_child_exits_normally() {
     let tmp = tempfile::tempdir().unwrap();
@@ -420,6 +492,7 @@ async fn stdin_closed_immediately_child_exits_normally() {
 // ─── Exit code tests ─────────────────────────────────────────────────────────
 
 /// A command that exits with code 0 reports exit status 0.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn exit_code_zero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -432,6 +505,7 @@ async fn exit_code_zero() {
 }
 
 /// A command that exits with a non-zero code reports the exact code.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn exit_code_nonzero() {
     let tmp = tempfile::tempdir().unwrap();
@@ -446,6 +520,7 @@ async fn exit_code_nonzero() {
 // ─── Timeout enforcement tests ────────────────────────────────────────────────
 
 /// A long-running child can be killed promptly with SIGTERM via the kill helper.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_long_running_child_promptly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -474,6 +549,7 @@ async fn kill_long_running_child_promptly() {
 
 /// A child that ignores SIGTERM can be terminated with SIGKILL via a second
 /// kill helper call.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn sigkill_after_sigterm_ignored() {
     let tmp = tempfile::tempdir().unwrap();
@@ -515,6 +591,7 @@ async fn sigkill_after_sigterm_ignored() {
 // ─── Concurrent execution tests ──────────────────────────────────────────────
 
 /// Two simultaneously spawned children have distinct PIDs and process group IDs.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn concurrent_children_distinct_pgids() {
     let tmp = tempfile::tempdir().unwrap();
@@ -551,6 +628,7 @@ async fn concurrent_children_distinct_pgids() {
 
 /// Killing one concurrent child's process group does not affect the other.
 /// The surviving child's stdout can still be read.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn kill_one_concurrent_child_other_unaffected() {
     let tmp = tempfile::tempdir().unwrap();
@@ -596,6 +674,7 @@ async fn kill_one_concurrent_child_other_unaffected() {
 
 /// Both children's output is received by their respective callers without
 /// cross-contamination.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn concurrent_output_no_cross_contamination() {
     let tmp = tempfile::tempdir().unwrap();
@@ -629,6 +708,7 @@ async fn concurrent_output_no_cross_contamination() {
 /// (daemon) beyond stdin/stdout/stderr — confirming CLOEXEC is applied to
 /// inherited descriptors.
 #[cfg(target_os = "linux")]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[tokio::test]
 async fn child_does_not_inherit_parent_fds() {
     use std::os::unix::io::AsRawFd;
@@ -699,6 +779,7 @@ mod macos_sandbox {
     ///
     /// The denied path is a fresh temp directory that does not appear anywhere
     /// in the policy's allow lists.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_denies_read_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -717,6 +798,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -725,10 +807,11 @@ mod macos_sandbox {
 
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -758,6 +841,7 @@ mod macos_sandbox {
     }
 
     /// A file read from a path IN the policy succeeds.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_allows_read_inside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -774,6 +858,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -782,10 +867,11 @@ mod macos_sandbox {
 
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -805,6 +891,7 @@ mod macos_sandbox {
     }
 
     /// A file write to a path NOT in the policy's write list fails.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn sandbox_denies_write_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -821,6 +908,7 @@ mod macos_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = MacOSSeatbelt
@@ -830,10 +918,11 @@ mod macos_sandbox {
         let denied_file = denied_dir.path().join("prohibited.txt");
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -876,6 +965,7 @@ mod linux_sandbox {
     }
 
     /// A file read from a path NOT in the policy fails with permission denied.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_denies_read_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -893,6 +983,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -901,10 +992,11 @@ mod linux_sandbox {
 
         let cmd = format!("cat '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -924,6 +1016,7 @@ mod linux_sandbox {
     }
 
     /// A file read from a path IN the policy succeeds.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_allows_read_inside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -939,6 +1032,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -947,10 +1041,11 @@ mod linux_sandbox {
 
         let cmd = format!("cat '{}'", allowed_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -966,6 +1061,7 @@ mod linux_sandbox {
     }
 
     /// A file write to a path NOT in the policy's write list fails.
+    #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
     #[tokio::test]
     async fn landlock_denies_write_outside_policy() {
         let allowed_dir = tempfile::tempdir().unwrap();
@@ -980,6 +1076,7 @@ mod linux_sandbox {
             read_write_paths: vec![allowed_dir.path().to_path_buf()],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -989,10 +1086,11 @@ mod linux_sandbox {
         let denied_file = denied_dir.path().join("prohibited.txt");
         let cmd = format!("echo test > '{}'", denied_file.display());
         let request = ExecRequest {
-            binary: resolve_binary("sh").unwrap(),
+            binary: resolve_sh(),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), cmd],
             work_dir: allowed_dir.path().to_path_buf(),
-            env: build_env(&[]),
+            env: plain_env(),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };

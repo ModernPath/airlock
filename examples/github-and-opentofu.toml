@@ -1,12 +1,13 @@
 # GitHub CLI + OpenTofu with Cloudflare DNS provider
 #
-# Start the daemon:
-#   GH_TOKEN="ghp_xxxx" CLOUDFLARE_API_TOKEN="cf-xxxx" airlock daemon start
-#
-# Or pull CLOUDFLARE_API_TOKEN from 1Password via the `command` source
-# (see the commented-out block below).
-#
 # Use it:
+#   cp examples/github-and-opentofu.toml airlock.toml
+#   GH_TOKEN="ghp_xxxx" CLOUDFLARE_API_TOKEN="cf-xxxx" airlock run --profile claude
+#   # or, to avoid typing secrets into a shell history, see
+#   # examples/secret-sources.toml for `op run -- airlock run` and
+#   # `command` sources (1Password, Vault, gh auth token, gcloud).
+#
+# Inside the agent:
 #   airlock exec -- gh pr list
 #   airlock exec -- tofu plan
 #   airlock exec -- tofu apply -auto-approve
@@ -37,6 +38,11 @@ source = "env"
 description = "GitHub CLI"
 extra_read = ["~/.config/gh"]
 timeout = 60
+# `gh` is statically linked, so it never needs the toolchain roots
+# `access = "default"` (the project-wide default) adds — `"system"` or even
+# `"none"` works just as well here. A tool built by Nix or Homebrew usually
+# needs the default; see README.md's `access` section.
+access = "system"
 
 [tools.gh.env]
 GH_TOKEN = { secret = "GH_TOKEN" }
