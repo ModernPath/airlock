@@ -133,16 +133,6 @@ pub struct ToolPolicy {
     /// baseline grants the base, and the anchor check refuses any config
     /// grant that would.
     pub runtime_base: Option<PathBuf>,
-    /// The per-session scratch directory (`$TMPDIR` on macOS), when known.
-    ///
-    /// Read from the process environment by the caller (`daemon.rs`/`run.rs`
-    /// today; the per-session snapshot once sessions exist), never by this
-    /// module — see [Session isolation](../docs/airlock-v2-design.md).
-    /// Present for parity with [`AgentPolicy::tmpdir`]; the tool builder does
-    /// not grant it automatically (a tool only gets `$TMPDIR` scratch access
-    /// if its config explicitly lists it in `extra_write`), so this field is
-    /// currently unused by `generate_profile`.
-    pub tmpdir: Option<PathBuf>,
     /// `<root>/.git/hooks`, when the sandbox root is a git worktree (F9).
     ///
     /// On macOS, appended as `(deny file-write* (subpath <git_hooks_deny>))`
@@ -189,8 +179,8 @@ pub struct AgentPolicy {
     pub runtime_base: Option<PathBuf>,
     /// The per-session scratch directory (`$TMPDIR` on macOS), when known.
     ///
-    /// Read from the process environment by the caller, not by this module
-    /// (see [`ToolPolicy::tmpdir`]). When set, the macOS builder grants
+    /// Read from the session's environment snapshot by the caller, never
+    /// by this module. When set, the macOS builder grants
     /// `file-read* file-write*` on its canonical form, exactly as the
     /// previous `std::env::var("TMPDIR")` lookup did; silently skipped when
     /// `None` or when canonicalization fails.
@@ -2849,26 +2839,6 @@ pub mod macos {
                 !sbpl.contains("file-read* file-write* (subpath"),
                 "agent SBPL must not grant TMPDIR-style scratch access when `tmpdir` is \
                  None, got:\n{sbpl}"
-            );
-        }
-
-        #[test]
-        fn tool_profile_tmpdir_field_grants_nothing_automatically() {
-            // Unlike AgentPolicy, ToolPolicy::tmpdir is not consulted by
-            // generate_profile: a tool only gets `$TMPDIR` scratch access if
-            // its config explicitly lists it in `extra_write`
-            // (`read_write_paths`), never automatically.
-            let tmp = tempfile::tempdir().unwrap();
-            let dir = std::fs::canonicalize(tmp.path()).unwrap();
-            let policy = ToolPolicy {
-                tmpdir: Some(dir.clone()),
-                ..Default::default()
-            };
-            let sbpl = sbpl_from_profile(&policy);
-            assert!(
-                !sbpl.contains(&dir.display().to_string()),
-                "tool SBPL must not reference `tmpdir` when it is not also in \
-                 read_write_paths, got:\n{sbpl}"
             );
         }
 

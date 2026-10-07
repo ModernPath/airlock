@@ -46,15 +46,6 @@ const DEFAULT_COMMAND_SECRET_TIMEOUT_SECS: u64 = 10;
 /// Errors that can occur during config discovery, parsing, or validation.
 #[derive(Debug, Error)]
 pub enum ConfigError {
-    /// No valid `airlock.toml` was found between the starting directory and `$HOME`.
-    #[error("no valid airlock.toml found between {start_dir} and $HOME ({home_dir})")]
-    NotFound {
-        /// The directory where the search started.
-        start_dir: PathBuf,
-        /// The `$HOME` directory where the search stopped.
-        home_dir: PathBuf,
-    },
-
     /// The `$HOME` environment variable is not set.
     ///
     /// Required for tilde expansion and as the discovery walk boundary.
@@ -3695,14 +3686,6 @@ X = { secret = "x", type = "string" }
 
     #[test]
     fn config_error_display_messages() {
-        let err = ConfigError::NotFound {
-            start_dir: PathBuf::from("/some/dir"),
-            home_dir: PathBuf::from("/home/user"),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("/some/dir"));
-        assert!(msg.contains("/home/user"));
-
         let err = ConfigError::HomeNotSet;
         assert!(err.to_string().contains("HOME"));
 

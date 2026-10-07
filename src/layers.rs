@@ -338,6 +338,7 @@ impl MergedConfig {
 /// A `[secrets.<label>]` entry, classified against the layer it sits in.
 /// The raw shape ([`RawSecretSpec`]) parses every legal combination the
 /// same way; this is where "legal for *this* layer" is decided.
+#[derive(Clone)]
 enum ClassifiedSecret {
     /// The repo (or `--config`) layer declared this label with no source —
     /// a request each user binds with `airlock init --local`.
@@ -808,7 +809,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 ),
             }
         } else {
-            repo_effective.insert(label.clone(), clone_classified(classified));
+            repo_effective.insert(label.clone(), classified.clone());
         }
     }
     let repo_pool = resolve_pool(
@@ -820,7 +821,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     let local_only: HashMap<String, ClassifiedSecret> = local_secrets
         .iter()
         .filter(|(label, _)| !repo_secrets.contains_key(*label))
-        .map(|(label, c)| (label.clone(), clone_classified(c)))
+        .map(|(label, c)| (label.clone(), c.clone()))
         .collect();
     let local_only_pool = resolve_pool(
         local_file.unwrap_or(&ctx.root),
@@ -1290,42 +1291,6 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         },
         kits,
     })
-}
-
-/// `ClassifiedSecret` has no `Clone` derive (its `Bound` variant embeds a
-/// `SecretSource`, which embeds a `CommandEnv`/`RefreshSpec` — cloneable,
-/// but deriving `Clone` on the whole enum just to use it twice isn't worth
-/// the derive). This is the one helper that needs it.
-fn clone_classified(c: &ClassifiedSecret) -> ClassifiedSecret {
-    match c {
-        ClassifiedSecret::Unbound { description } => ClassifiedSecret::Unbound {
-            description: description.clone(),
-        },
-        ClassifiedSecret::GlobalLink { description } => ClassifiedSecret::GlobalLink {
-            description: description.clone(),
-        },
-        ClassifiedSecret::Bound {
-            description,
-            source,
-        } => ClassifiedSecret::Bound {
-            description: description.clone(),
-            source: source.clone(),
-        },
-    }
-}
-
-// ─── `airlock init` templates ───────────────────────────────────────────────
-
-/// Build the `airlock.local.toml` stub `airlock init --local` writes when
-/// a repo's `airlock.toml` leaves one or more secret labels unbound. Thin
-/// wrapper over [`config::local_stub`] that reads the unbound list out of a
-/// failed [`merge`] (`ConfigError::UnboundSecretLabels`), since that is the
-/// one place the label + description pairs are already assembled.
-pub fn local_stub_for_unbound(
-    unbound: &[(String, Option<String>)],
-    global_bound: &[String],
-) -> String {
-    config::local_stub(unbound, global_bound)
 }
 
 #[cfg(test)]

@@ -1879,7 +1879,6 @@ fn start_tool(
         })?;
     tool_policy.binary_path = Some(binary.clone());
     tool_policy.runtime_base = Some(state.runtime.base().to_path_buf());
-    tool_policy.tmpdir = policy.snapshot.get("TMPDIR").map(PathBuf::from);
     if tool_config.proxy.is_some() {
         tool_policy
             .read_paths
