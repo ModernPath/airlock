@@ -151,10 +151,10 @@ pub fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> Result<(), PolicyError> 
 ///
 /// `git_hooks_deny` is always set to `<sandbox_root>/.git/hooks` (F9); it is
 /// harmless when the root has no `.git` directory. `runtime_base` and
-/// `tmpdir` are left `None` here — the former has no caller-known value yet
-/// (the daemon's runtime directory is not wired in until sessions exist),
-/// and the latter is a process-environment read the caller performs, not
-/// this pure function (see [`AgentPolicy::tmpdir`](crate::sandbox::AgentPolicy::tmpdir)).
+/// `tmpdir` are left `None` for the caller to fill in: the runtime directory
+/// belongs to the daemon, and `tmpdir` comes from the session's environment
+/// snapshot, neither of which this pure function sees (see
+/// [`AgentPolicy::tmpdir`](crate::sandbox::AgentPolicy::tmpdir)).
 ///
 /// # Errors
 ///
@@ -226,11 +226,9 @@ pub fn build_tool_policy(
 /// - **`git_hooks_deny`**: always `<sandbox_root>/.git/hooks` (F9). `runtime_base`
 ///   and `tmpdir` are left `None`; see [`build_tool_policy`] for why.
 ///
-/// The daemon socket lives at `{sandbox_root}/airlock.sock` and is therefore
-/// already covered by the `sandbox_root` rule; it does not need a separate
-/// entry. On Linux (Landlock), adding a path that does not exist yet causes
-/// profile construction to fail, so the socket — which is created after the
-/// sandbox profile is built — must not appear in the path lists.
+/// The daemon socket is not in the path lists: it lives in the runtime
+/// directory, which the caller grants by setting
+/// [`AgentPolicy::runtime_base`](crate::sandbox::AgentPolicy::runtime_base).
 ///
 /// All paths in `config` are already fully resolved (tilde-expanded and
 /// relative paths resolved against the sandbox root) by the config module.
@@ -244,9 +242,6 @@ pub fn build_agent_policy(config: &Config, toolchain_paths: &[PathBuf]) -> Agent
     }
 
     // Build read_write_paths: sandbox_root + global write + agent write.
-    // The socket ({sandbox_root}/airlock.sock) is omitted here: the
-    // sandbox_root rule already covers it, and the socket file does not exist
-    // at profile-build time on Linux (Landlock requires all paths to be open-able).
     let mut read_write_paths: Vec<PathBuf> = Vec::new();
     read_write_paths.push(config.sandbox_root.clone());
     read_write_paths.extend(config.filesystem_write.iter().cloned());
@@ -860,30 +855,6 @@ mod tests {
         assert!(
             policy.read_write_paths.contains(&sandbox_root),
             "sandbox_root should always be in read_write_paths"
-        );
-    }
-
-    #[test]
-    fn build_agent_policy_socket_covered_by_sandbox_root() {
-        // The socket lives at {sandbox_root}/airlock.sock, which is covered by
-        // the sandbox_root PathBeneath rule; it must NOT appear as a separate
-        // entry (doing so would cause Landlock profile construction to fail on
-        // Linux because the socket file does not exist at profile-build time).
-        let tmp = tempdir().unwrap();
-        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
-        let config =
-            make_config_for_agent_tests(sandbox_root.clone(), Vec::new(), Vec::new(), None);
-        let socket_path = sandbox_root.join("airlock.sock");
-
-        let policy = build_agent_policy(&config, &[]);
-
-        assert!(
-            !policy.read_write_paths.contains(&socket_path),
-            "socket_path must not be a separate entry; sandbox_root covers it"
-        );
-        assert!(
-            policy.read_write_paths.contains(&sandbox_root),
-            "sandbox_root must be present to cover the socket"
         );
     }
 

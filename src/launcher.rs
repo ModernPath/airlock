@@ -161,10 +161,10 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     let home = home_dir()?;
     let runtime = RuntimeDir::locate()?;
     let anchors = anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
-    // Collected early (rather than where v1 read it, just before secret
-    // resolution) so kit expansion below — which needs it for shared-mode
-    // override lookups (`CARGO_HOME`, `GOPATH`, ...) — can run before
-    // `write_grants` is finalized and validated.
+    // Collected up front, not just before secret resolution, so kit
+    // expansion below — which needs it for shared-mode override lookups
+    // (`CARGO_HOME`, `GOPATH`, ...) — can run before `write_grants` is
+    // finalized and validated.
     let full_snapshot: BTreeMap<String, String> = std::env::vars().collect();
 
     let mode = opts.discover.mode();

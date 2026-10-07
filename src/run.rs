@@ -213,12 +213,24 @@ pub(crate) fn detect_toolchain_paths(home: Option<&str>) -> Vec<PathBuf> {
 /// Build the clean environment map for the agent child process from the
 /// launcher's resolved state — never the live process environment.
 ///
-/// Layers (applied in order): essential variables from `snapshot`, the
-/// `AIRLOCK_SANDBOX` marker, `passthrough_env` from `[agent]`, `[agent.env]`
-/// entries (secrets resolved from `secret_values`), then CLI
-/// `--passthrough-env` names. See the v1 docstring this replaces for the
-/// rationale behind each layer; unchanged here except that every lookup
-/// goes through `snapshot` instead of `std::env`.
+/// Only explicitly approved variables are included. Layers, applied in
+/// order:
+///
+/// 1. **Essential variables** from `snapshot`: `PATH`, `HOME`, `USER`,
+///    `SHELL`, `TERM`, `TERMINFO`, `TERMINFO_DIRS`, `LANG`, all `LC_*`, and
+///    `TZ`, when present. `SHELL` is here even though `exec.rs`'s
+///    `ESSENTIAL_VARS` lacks it — the two lists are independent. Locale and
+///    timezone variables affect tool behaviour without leaking credentials.
+///    `TERMINFO`/`TERMINFO_DIRS` let ncurses find the terminfo database:
+///    iTerm.app ships its own outside `/usr/share/terminfo`, and without them
+///    nano/vim/less fall back to a stub entry and arrow keys misbehave.
+/// 2. **Sandbox marker**: `AIRLOCK_SANDBOX=1`, always.
+/// 3. **`passthrough_env`** from `[agent]`: included if set in `snapshot`;
+///    absent names are skipped, never inserted empty.
+/// 4. **`[agent.env]` entries**: static values as-is, secret references
+///    resolved from `secret_values`.
+/// 5. **CLI `--passthrough-env` names**: same lookup as layer 3, applied
+///    last so they only add to what the config forwards.
 pub(crate) fn build_agent_env(
     agent_config: Option<&AgentConfig>,
     secret_values: &HashMap<String, Secret<String>>,
