@@ -241,6 +241,11 @@ async fn forward_stdin<W: tokio::io::AsyncWriteExt + Unpin>(mut writer: W) {
             break;
         }
     }
+    // Returning would drop `writer`, and dropping an `OwnedWriteHalf` shuts
+    // down the socket's write side. The daemon reads that EOF as "the client
+    // went away" and kills the tool, so hold the writer until `exec` aborts
+    // this task.
+    std::future::pending::<()>().await;
 }
 
 /// Reads daemon responses until `Exit` or `Error`, printing `Stdout`/

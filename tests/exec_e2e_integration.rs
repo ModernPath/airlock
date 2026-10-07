@@ -195,3 +195,40 @@ fn exec_missing_binary_produces_error() {
 
     daemon.shutdown();
 }
+
+// ─── The real client with no stdin keeps the connection open ────────────────
+
+// An agent's tool calls usually have stdin at EOF (`/dev/null`, an empty
+// pipe). The client must still keep its write half open until the tool
+// exits: the daemon reads EOF on the connection as "the client went away"
+// and kills the tool. The tool sleeps so it is still running when the
+// client's stdin EOF arrives; the raw-protocol tests above never close
+// their write half, so only the real binary exercises this.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+#[test]
+fn real_client_with_stdin_at_eof_waits_for_the_tool() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &config_with_sh_no_secrets());
+
+    let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
+    let daemon = start_daemon(tmp.path());
+
+    let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_airlock"))
+        .env_remove("AIRLOCK_SANDBOX")
+        .env(
+            "AIRLOCK_ADDR",
+            format!("unix://{}", daemon.socket_path.display()),
+        )
+        .env("AIRLOCK_SESSION", daemon.token.expose_secret())
+        .current_dir(&cwd)
+        .args(["exec", "--", "sh", "-c", "sleep 1; echo done"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
+
+    daemon.shutdown();
+}

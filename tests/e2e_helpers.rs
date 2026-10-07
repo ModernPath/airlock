@@ -203,6 +203,18 @@ pub struct DaemonHandle {
     _runtime_tmp: tempfile::TempDir,
 }
 
+// A test that panics before `shutdown` would otherwise leave its daemon
+// running, holding the test's inherited stdout open, so `cargo test | tail`
+// hangs long after the failure is reported.
+impl Drop for DaemonHandle {
+    fn drop(&mut self) {
+        if let Ok(None) = self.process.try_wait() {
+            let _ = self.process.kill();
+            let _ = self.process.wait();
+        }
+    }
+}
+
 impl DaemonHandle {
     /// Non-blocking check of whether the daemon process has exited, for
     /// tests that signal it directly (SIGTERM) rather than through
