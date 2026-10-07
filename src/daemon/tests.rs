@@ -893,6 +893,40 @@ async fn lease_eof_revokes_the_session() {
     );
 }
 
+#[tokio::test]
+async fn lease_stays_open_from_the_daemon_side_while_the_session_lives() {
+    use tokio::io::AsyncReadExt;
+
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let payload = test_payload(tmp.path(), "[tools.sh]\n");
+    let mut lease_conn = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "run".to_string(),
+            sandbox: SandboxKind::Airlock,
+            ends: SessionEnds::Lease,
+        })),
+    );
+    let DaemonMessage::Registered { id, .. } = lease_conn.request(req).await else {
+        panic!("expected Registered")
+    };
+
+    // The launcher reads EOF on the lease as "the session ended", so the
+    // daemon must not half-close it after the reply.
+    let mut buf = [0u8; 1];
+    let read =
+        tokio::time::timeout(Duration::from_millis(300), lease_conn.reader.read(&mut buf)).await;
+    assert!(
+        read.is_err(),
+        "lease connection got {read:?} instead of staying quiet"
+    );
+    assert!(daemon.state.sessions.get(&id).is_some());
+}
+
 // ─── Logs ────────────────────────────────────────────────────────────────────
 
 #[tokio::test]
