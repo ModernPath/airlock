@@ -289,7 +289,7 @@ fn is_executable(path: &Path) -> bool {
 /// treated as usable. There is no safe fallback to the unresolved path: a
 /// symlink's own location can look fine while its (unresolved) target does
 /// not.
-fn probe_executable(candidate: &Path) -> Option<PathBuf> {
+pub(crate) fn probe_executable(candidate: &Path) -> Option<PathBuf> {
     let canon = std::fs::canonicalize(candidate).ok()?;
     let meta = std::fs::metadata(&canon).ok()?;
     if !meta.is_file() || !is_executable(&canon) {
