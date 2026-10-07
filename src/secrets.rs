@@ -621,6 +621,7 @@ mod tests {
         Config {
             sandbox_root: PathBuf::from("/tmp/test-sandbox"),
             timeout: Duration::from_secs(300),
+            access: crate::sandbox::ToolAccess::default(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
             secrets: secret_map,
@@ -651,6 +652,7 @@ mod tests {
         Config {
             sandbox_root: PathBuf::from("/tmp/test-sandbox"),
             timeout: Duration::from_secs(300),
+            access: crate::sandbox::ToolAccess::default(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
             secrets: secret_map,

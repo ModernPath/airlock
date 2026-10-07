@@ -658,6 +658,7 @@ pub(crate) fn empty_policy() -> SessionPolicy {
         config: Config {
             sandbox_root: PathBuf::from("/tmp"),
             timeout: Duration::from_secs(300),
+            access: crate::sandbox::ToolAccess::default(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
             secrets: HashMap::new(),
@@ -853,6 +854,7 @@ mod tests {
             extra_read: Vec::new(),
             extra_write: Vec::new(),
             timeout: None,
+            access: None,
             description: None,
             proxy: None,
         }

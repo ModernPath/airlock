@@ -271,6 +271,7 @@ pub struct AgentEnvProvenance {
 #[derive(Debug, Default)]
 pub struct SettingsProvenance {
     pub timeout: Option<LayerKind>,
+    pub access: Option<LayerKind>,
     pub filesystem_read: Vec<(String, LayerKind)>,
     pub filesystem_write: Vec<(String, LayerKind)>,
     pub agent_passthrough_env: Vec<(String, LayerKind)>,
@@ -990,6 +991,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 extra_read: resolve_path_list(&winning.extra_read, ctx),
                 extra_write,
                 timeout: winning.timeout,
+                access: winning.access.clone(),
                 description: winning.description.clone(),
                 proxy: winning.proxy,
                 routes: winning.routes.clone(),
@@ -1212,6 +1214,25 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         None
     };
 
+    let access = local_raw
+        .as_ref()
+        .and_then(|c| c.access.clone())
+        .or_else(|| repo_raw.as_ref().and_then(|c| c.access.clone()))
+        .or_else(|| global_raw.as_ref().and_then(|c| c.access.clone()));
+    let access_layer = if local_raw.as_ref().and_then(|c| c.access.as_ref()).is_some() {
+        Some(LayerKind::Local)
+    } else if repo_raw.as_ref().and_then(|c| c.access.as_ref()).is_some() {
+        Some(repo_kind)
+    } else if global_raw
+        .as_ref()
+        .and_then(|c| c.access.as_ref())
+        .is_some()
+    {
+        Some(LayerKind::Global)
+    } else {
+        None
+    };
+
     let mut fs_read: Vec<String> = Vec::new();
     let mut fs_write: Vec<String> = Vec::new();
     let mut fs_read_prov: Vec<(String, LayerKind)> = Vec::new();
@@ -1240,6 +1261,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
     let raw = RawConfig {
         timeout,
+        access,
         filesystem: if fs_read.is_empty() && fs_write.is_empty() {
             None
         } else {
@@ -1273,6 +1295,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             secrets: secret_provenance,
             settings: SettingsProvenance {
                 timeout: timeout_layer,
+                access: access_layer,
                 filesystem_read: fs_read_prov,
                 filesystem_write: fs_write_prov,
                 agent_passthrough_env: passthrough_env_prov,
@@ -1811,6 +1834,39 @@ LOG_LEVEL = "debug"
             RawEnvValue::Static(s) => assert_eq!(s, "debug"),
             other => panic!("expected Static, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn merge_access_top_level_highest_layer_wins_and_tool_access_travels_with_tool() {
+        // Top-level `access` merges like `timeout`: the highest layer that
+        // sets it wins. A tool's own `access` travels with its definition
+        // under the existing tool-replacement rules, independent of the
+        // top-level value.
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "access = \"none\"\n").unwrap();
+        write(
+            tmp.path(),
+            "airlock.toml",
+            r#"
+access = "system"
+
+[tools.gh]
+description = "GitHub CLI"
+access = "default"
+"#,
+        );
+
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let wire = merged.to_wire();
+
+        // The repo layer's `access` beats the global layer's.
+        assert_eq!(wire.access.as_deref(), Some("system"));
+        assert_eq!(merged.provenance().settings.access, Some(LayerKind::Repo));
+
+        let tools = wire.tools.unwrap();
+        assert_eq!(tools["gh"].access.as_deref(), Some("default"));
     }
 
     #[test]
