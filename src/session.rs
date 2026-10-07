@@ -81,6 +81,9 @@ pub struct SessionPolicy {
     pub layers: Vec<WireLayer>,
     /// How the session's root was discovered.
     pub mode: WireMode,
+    /// The value each refreshed secret held before its latest refresh; the
+    /// session's own redactor covers these, and so must the global one.
+    pub previous_secrets: refresh::PreviousValues,
     pub(crate) refresh_tasks: tokio::sync::Mutex<JoinSet<()>>,
     pub(crate) refresh_shutdown: watch::Sender<bool>,
 }
@@ -237,7 +240,7 @@ pub fn build_session_policy(
         write_grants: write_grants.clone(),
     });
 
-    let (refresh_tasks, refresh_shutdown) = refresh::spawn_all_ctx(
+    let (refresh_tasks, refresh_shutdown, previous_secrets) = refresh::spawn_all_ctx(
         &config,
         Arc::clone(&secrets),
         Arc::clone(&redactor),
@@ -259,6 +262,7 @@ pub fn build_session_policy(
         agent_hash: payload.agent_hash.clone(),
         layers: payload.layers.clone(),
         mode: payload.mode.clone(),
+        previous_secrets,
         refresh_tasks: tokio::sync::Mutex::new(refresh_tasks),
         refresh_shutdown,
     })
@@ -702,6 +706,7 @@ pub(crate) fn empty_policy() -> SessionPolicy {
         agent_hash: String::new(),
         layers: Vec::new(),
         mode: WireMode::NoProjectConfig,
+        previous_secrets: Default::default(),
         refresh_tasks: tokio::sync::Mutex::new(JoinSet::new()),
         refresh_shutdown: tx,
     }

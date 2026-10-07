@@ -48,6 +48,10 @@ use crate::secrets::{CommandContext, Health, Secret, SecretStore};
 /// Initial sleep before the first retry after a refresh failure.
 const INITIAL_BACKOFF: Duration = Duration::from_secs(5);
 
+/// The value each refreshed secret held before its latest refresh, keyed by
+/// label. Shared with the daemon so its global redactor covers these too.
+pub type PreviousValues = Arc<Mutex<HashMap<String, Arc<Secret<String>>>>>;
+
 /// What all of one session's refresh tasks share.
 pub(crate) struct RefreshShared {
     store: SecretStore,
@@ -55,7 +59,7 @@ pub(crate) struct RefreshShared {
     /// The value each refreshed secret held before its latest refresh, keyed
     /// by label. Every redactor rebuild includes these, and the mutex
     /// serializes refreshes (see the module docs).
-    previous: Mutex<HashMap<String, Arc<Secret<String>>>>,
+    previous: PreviousValues,
     ring: RingBuffer,
     on_refresh: Arc<dyn Fn() + Send + Sync>,
 }
@@ -70,7 +74,7 @@ impl RefreshShared {
         RefreshShared {
             store,
             redactor_swap,
-            previous: Mutex::default(),
+            previous: PreviousValues::default(),
             ring,
             on_refresh,
         }
@@ -79,9 +83,9 @@ impl RefreshShared {
 
 /// Spawn one refresh task per `[secrets.<label>]` entry that declares
 /// `refresh = N`, running each command under `ctx` — the session's own
-/// environment snapshot and filtered `PATH`. Returns the task set and a
+/// environment snapshot and filtered `PATH`. Returns the task set, a
 /// shutdown sender — set the channel to `true` to ask all tasks to stop,
-/// then `await` the [`JoinSet`].
+/// then `await` the [`JoinSet`] — and the session's previous values.
 pub fn spawn_all_ctx(
     config: &Config,
     store: SecretStore,
@@ -89,10 +93,11 @@ pub fn spawn_all_ctx(
     ring: RingBuffer,
     ctx: Arc<CommandContext>,
     on_refresh: Arc<dyn Fn() + Send + Sync>,
-) -> (JoinSet<()>, watch::Sender<bool>) {
+) -> (JoinSet<()>, watch::Sender<bool>, PreviousValues) {
     let (tx, rx) = watch::channel(false);
     let mut set = JoinSet::new();
     let shared = Arc::new(RefreshShared::new(store, redactor_swap, ring, on_refresh));
+    let previous = Arc::clone(&shared.previous);
 
     for (label, spec) in &config.secrets {
         let SecretSource::Command {
@@ -117,7 +122,7 @@ pub fn spawn_all_ctx(
         set.spawn(task.run());
     }
 
-    (set, tx)
+    (set, tx, previous)
 }
 
 /// Compute the next sleep after `consecutive_failures` consecutive refresh
@@ -265,6 +270,9 @@ fn apply_refresh_result(
             } else {
                 ring.log(format!("secret refresh succeeded for {label}"));
             }
+            // Released first: `on_refresh` rebuilds the global redactor,
+            // which reads `previous` too.
+            drop(previous);
             on_refresh();
             Ok(())
         }
@@ -657,7 +665,7 @@ mod tests {
         let store = store_with("TOK", "old");
         let ctx = Arc::new(test_ctx(tmp.path(), std::collections::BTreeMap::new()));
 
-        let (mut tasks, tx) = spawn_all_ctx(
+        let (mut tasks, tx, _previous) = spawn_all_ctx(
             &config,
             store,
             empty_redactor_swap(),

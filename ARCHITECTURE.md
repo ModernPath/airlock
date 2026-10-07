@@ -118,7 +118,7 @@ One daemon serves every project a user has. A **session** binds a client to one 
 | Sessions | `DashMap<SessionId, Arc<Session>>` or equivalent | Every registered session; the token resolves to exactly one `Arc<Session>` |
 | `Session` | struct | id, token, root, `RwLock<Arc<SessionPolicy>>` (compiled tools/secrets/proxy routes, swapped whole by `Reload`), process-tree binding, lease-or-TTL, exec counter |
 | Admin credential | `admin.token`, mode 0600 in the runtime dir | Required by `Register`, `Reload`, `session list/revoke/renew`, `tools list --session`, `status`, `daemon logs/stop/restart`. No sandbox can read it. |
-| Global redactor | `Arc<RwLock<Arc<Redactor>>>` built from every live session's secrets | A last-pass safety net: after a session's own redactor, output also passes this one, so a bug that put another session's secret in the wrong place still gets masked |
+| Global redactor | `Arc<RwLock<Arc<Redactor>>>` built from every live session's secrets, current and pre-refresh values | A last-pass safety net: after a session's own redactor, output also passes this one, so a bug that put another session's secret in the wrong place still gets masked |
 
 **Request handling.** A connection first exchanges a version `Hello`, then sends one `Request { auth, body }`. `auth` is `{"kind": "session", "token": ...}` or `{"kind": "admin", "token": ...}`; the listener resolves it to a `Principal` (peer uid check, and for a session token the [token-binding](#token-binding) check) before any handler runs, and refuses a request whose family doesn't match its auth kind. `body` is one of two enums:
 
@@ -258,20 +258,16 @@ Running each session's proxy in its own process, rather than in the shared daemo
 
 ### Redaction pipeline
 
-The redaction pipeline bridges async I/O (tokio) with the synchronous Aho-Corasick streaming API:
+Both a tool's output and the proxy's responses go through `StreamRedactor`, an incremental redactor that keeps between chunks only the bytes a pattern could still be starting in, and whose output for any chunking is what `redact_bytes` makes of the whole input.
 
 ```
-tokio async reader task
-    │
-    │ reads child stdout/stderr in chunks
+tokio task per stream (stdout, stderr)
+    │ reads child output in chunks
     ▼
-std::sync::mpsc::Sender
-    │
+StreamRedactor (session's redactor)
     ▼
-spawn_blocking(redact_stream)
-    │ ChannelReader (impl Read over mpsc::Receiver)
-    │   → Aho-Corasick try_stream_replace_all
-    │   → ChannelWriter (impl Write over tokio mpsc::Sender)
+StreamRedactor (daemon-wide global redactor)
+    │ both flushed with finish() at EOF
     ▼
 tokio::sync::mpsc::Receiver
     │
@@ -279,15 +275,9 @@ tokio::sync::mpsc::Receiver
 select! loop → NDJSON → Unix socket → client
 ```
 
-This design keeps the automaton's streaming state machine on a dedicated blocking thread (via `spawn_blocking`) while the daemon's main loop remains fully async.
+Chaining two streams matters for the global pass. The session pass emits its output in chunks of its own choosing, so a global pass that redacted each chunk on its own would miss another session's secret split across two of them.
 
-The proxy's response path does not use this bridge. It already holds the bytes
-as owned frames handed to it by hyper, so it drives a `StreamRedactor` — an
-incremental redactor that keeps between chunks only the bytes a pattern could
-still be starting in, and whose output for any chunking is what `redact_bytes`
-makes of the whole input — directly from `poll_frame`. No thread and no channel
-per response: hyper's polling is the backpressure, and dropping the response
-stops the upstream read.
+The proxy's response path holds the bytes as owned frames handed to it by hyper, so it drives its `StreamRedactor` directly from `poll_frame`. No task and no channel per response: hyper's polling is the backpressure, and dropping the response stops the upstream read.
 
 Both paths take their redactor from the session's own `Arc<RwLock<Arc<Redactor>>>`, then from the daemon-wide last-pass redactor described under [Sessions](#sessions). An exec snapshots its session's redactor once, right after it reads the secrets the child is spawned with; a refresh swaps the redactor before it publishes a new value, so that snapshot knows every value in the child's environment. A proxy response snapshots per response, because the proxy injects whatever the store holds at that moment and a token refreshed mid-exec must be redacted on the way back.
 
