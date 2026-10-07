@@ -2943,7 +2943,8 @@ pub mod macos {
             std::fs::create_dir(&base).unwrap();
             std::fs::write(base.join("admin.token"), b"secret").unwrap();
             let socket_path = base.join("airlock.sock");
-            let _listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+            let listener = UnixListener::bind(&socket_path).expect("bind should succeed");
+            std::thread::spawn(move || for _ in listener.incoming() {});
 
             let policy = super::super::AgentPolicy {
                 read_paths: vec![],
@@ -2969,13 +2970,15 @@ pub mod macos {
             // A correctly isolated sandbox exits 0.
             // The write probe runs in a subshell: a failed redirection on the
             // `:` special builtin ends a POSIX shell, which would read as a
-            // probe result.
+            // probe result. macOS's BSD `nc` always exits 1 for `-z` with
+            // `-U`, so the connect probe is a plain `nc -U` that exits as
+            // soon as its stdin is at EOF.
             let probe_script = format!(
                 r#"
                 code=0
                 if ( : > "{base}/probe" ) 2>/dev/null; then code=1; fi
                 if cat "{base}/admin.token" >/dev/null 2>&1; then code=$((code | 2)); fi
-                if ! nc -zU "{base}/airlock.sock" 2>/dev/null; then code=$((code | 4)); fi
+                if ! nc -U "{base}/airlock.sock" </dev/null >/dev/null 2>&1; then code=$((code | 4)); fi
                 exit "$code"
                 "#,
                 base = base.display(),
