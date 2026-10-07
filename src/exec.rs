@@ -255,16 +255,22 @@ fn is_executable(path: &Path) -> bool {
 /// canonicalized path. `metadata()` follows symlinks and returns `Err` when
 /// the path does not exist or is not accessible, so a missing directory or
 /// binary simply yields `None`.
+///
+/// Canonicalizes first and checks the resolved path, not the candidate: the
+/// caller's location check ([`classify_location`]) runs against this
+/// returned path, so a candidate that can't be resolved to a concrete
+/// location — a dangling symlink, or one that stops resolving to anything
+/// between this call and a caller's use of the result — must never be
+/// treated as usable. There is no safe fallback to the unresolved path: a
+/// symlink's own location can look fine while its (unresolved) target does
+/// not.
 fn probe_executable(candidate: &Path) -> Option<PathBuf> {
-    let meta = std::fs::metadata(candidate).ok()?;
-    if !meta.is_file() || !is_executable(candidate) {
+    let canon = std::fs::canonicalize(candidate).ok()?;
+    let meta = std::fs::metadata(&canon).ok()?;
+    if !meta.is_file() || !is_executable(&canon) {
         return None;
     }
-    // Canonicalize to resolve symlinks and produce a clean absolute path.
-    // If canonicalization fails (e.g., a race where the file was removed
-    // between the metadata check and the canonicalize call), fall back to
-    // the already-absolute candidate path.
-    Some(std::fs::canonicalize(candidate).unwrap_or_else(|_| candidate.to_path_buf()))
+    Some(canon)
 }
 
 /// Walk a [`FilteredPath`]'s surviving entries to find an executable binary,
@@ -1056,6 +1062,40 @@ mod tests {
             }
             other => panic!("expected BinaryInsideRoot, got: {other:?}"),
         }
+    }
+
+    /// `probe_executable` must never hand back a dangling symlink's own
+    /// (unresolved) path — there is no safe fallback when canonicalization
+    /// fails.
+    #[test]
+    fn probe_executable_skips_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let dangling = dir.path().join("mytool");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+
+        assert_eq!(probe_executable(&dangling), None);
+    }
+
+    /// A `PATH` entry containing a dangling symlink for the tool name is
+    /// skipped, not treated as a match on its own unresolved path — the
+    /// search continues (and here finds nothing), rather than resolving to
+    /// a binary that doesn't actually exist.
+    #[test]
+    fn resolve_binary_in_skips_dangling_symlink() {
+        let root = tempdir().unwrap();
+        let bin_dir = tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            bin_dir.path().join("does-not-exist"),
+            bin_dir.path().join("mytool"),
+        )
+        .unwrap();
+
+        let path_var = bin_dir.path().display().to_string();
+        let path = filter_path(&path_var, root.path(), &[]);
+
+        let err = resolve_binary_in("mytool", &path, root.path(), &[])
+            .expect_err("a dangling symlink must never resolve to a usable binary");
+        assert!(matches!(err, ExecError::ToolNotOnPath(_)), "{err:?}");
     }
 
     /// A tool resolved to a location inside a write grant (but outside the
