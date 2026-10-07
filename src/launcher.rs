@@ -87,6 +87,10 @@ pub struct PrepareOptions {
     pub quiet: bool,
     /// `--allow-write` (run only); resolved to absolute paths by the caller.
     pub extra_write_grants: Vec<PathBuf>,
+    /// `--kit` (run only; repeatable), additive to `agent.kits`. Empty for
+    /// `session start`/`session reload`, which never apply kits — see
+    /// "Kits" in `docs/airlock-v2-design.md`.
+    pub cli_kits: Vec<String>,
 }
 
 // ─── Prepared state ───────────────────────────────────────────────────────────
@@ -106,6 +110,9 @@ pub struct Prepared {
     pub anchors: Anchors,
     pub agent_hash: String,
     pub runtime: RuntimeDir,
+    /// Expanded agent kits (run only; always computed, unused by `session
+    /// start`/`reload` — see "Kits" in `docs/airlock-v2-design.md`).
+    pub kits: crate::kits::Expanded,
 }
 
 impl Prepared {
@@ -154,6 +161,11 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     let home = home_dir()?;
     let runtime = RuntimeDir::locate()?;
     let anchors = anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
+    // Collected early (rather than where v1 read it, just before secret
+    // resolution) so kit expansion below — which needs it for shared-mode
+    // override lookups (`CARGO_HOME`, `GOPATH`, ...) — can run before
+    // `write_grants` is finalized and validated.
+    let full_snapshot: BTreeMap<String, String> = std::env::vars().collect();
 
     let mode = opts.discover.mode();
     let loaded = layers::load_layers(&mode, cwd, &home, &anchors.global_config)?;
@@ -169,8 +181,27 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     let raw_config = merged.to_wire();
     let config = config::resolve_wire_config(raw_config.clone(), &root)?;
 
+    crate::kits::validate_all(merged.kits())?;
+    let active_kits = crate::kits::resolve_active(&raw_config, &opts.cli_kits, merged.kits())?;
+    crate::kits::check_env_collision(raw_config.agent.as_ref(), &active_kits, merged.kits())?;
+    let project_id = config::project_id(&root);
+    let kits_expanded = crate::kits::expand_all(
+        &active_kits,
+        merged.kits(),
+        &crate::kits::Inputs {
+            home: &home,
+            env: &full_snapshot,
+            platform: crate::kits::Platform::current(),
+            project_id: &project_id,
+            tool_state_base: &anchors.tool_state_base,
+            root: &root,
+        },
+    )?;
+
     let mut write_grants = config::write_grants(&config);
     write_grants.extend(opts.extra_write_grants.iter().cloned());
+    write_grants.extend(kits_expanded.write.iter().cloned());
+    write_grants.extend(kits_expanded.write_files.iter().cloned());
 
     anchors::validate(&anchors, Some(&root), &write_grants)?;
 
@@ -185,6 +216,21 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
         create_dir_0700(dir)?;
     }
 
+    // Kit dirs, created after trust like the tool_state dirs above. Each
+    // active kit's own `{kit_state}` (isolated built-ins and every
+    // user-defined kit) gets the same project-root/anchor check
+    // {tool_state} gets; a shared built-in's dirs are real user cache
+    // locations, already covered by the write_grants anchor check above.
+    for dir in &kits_expanded.state_dirs {
+        anchors::validate_tool_state_dir(&anchors, &root, dir)?;
+    }
+    for dir in &kits_expanded.write {
+        create_dir_0700(dir)?;
+    }
+    for file in &kits_expanded.write_files {
+        create_file_if_missing(file)?;
+    }
+
     let host_path = std::env::var("PATH").unwrap_or_default();
     let path = exec::filter_path(&host_path, &root, &write_grants);
     let dropped_path = path
@@ -196,7 +242,6 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
         })
         .collect();
 
-    let full_snapshot: BTreeMap<String, String> = std::env::vars().collect();
     let cmd_ctx = CommandContext {
         snapshot: full_snapshot.clone(),
         path: path.clone(),
@@ -213,8 +258,13 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     }
 
     let layer_wire = wire_layers(&loaded);
-    let agent_bytes =
-        serde_json::to_vec(&raw_config.agent).expect("RawAgentConfig always serializes");
+    // Hashes the agent settings together with the resolved `[kits.*]`
+    // option tables, so a kit's `mode` changing (not just the active list,
+    // already part of `raw_config.agent.kits`) also changes the hash —
+    // `session reload` uses it to decide whether to print "restart the
+    // agent to apply them".
+    let agent_bytes = serde_json::to_vec(&(&raw_config.agent, merged.kits()))
+        .expect("RawAgentConfig and the kits map always serialize");
     let agent_hash = config::sha256_hex(&agent_bytes);
 
     Ok(Prepared {
@@ -231,6 +281,7 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
         anchors,
         agent_hash,
         runtime,
+        kits: kits_expanded,
     })
 }
 
@@ -256,6 +307,25 @@ fn create_dir_0700(dir: &Path) -> Result<(), LauncherError> {
     {
         Ok(()) => Ok(()),
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => Ok(()),
+        Err(e) => Err(LauncherError::Io(e)),
+    }
+}
+
+/// Creates `path`'s parent (mode 0700 if missing) and then `path` itself as
+/// an empty file if it does not already exist — for a shared-mode kit's
+/// individual cache lock files (e.g. cargo's `.package-cache`), which
+/// Landlock needs to exist to grant. Leaves an existing file untouched.
+fn create_file_if_missing(path: &Path) -> Result<(), LauncherError> {
+    if let Some(parent) = path.parent() {
+        create_dir_0700(parent)?;
+    }
+    match std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(path)
+    {
+        Ok(_) => Ok(()),
         Err(e) => Err(LauncherError::Io(e)),
     }
 }
@@ -951,5 +1021,92 @@ mod tests {
     #[test]
     fn default_session_start_name_is_shell() {
         assert_eq!(default_session_start_name(), "shell");
+    }
+
+    // ── Kits: write_grants composition and the B2 refusal ────────────────
+    //
+    // `prepare` itself needs a full fixture (home dir, runtime dir, trust
+    // store...) that these pure-helper tests deliberately avoid; the real
+    // end-to-end path (an active kit's write dirs ending up refusable as a
+    // tool `PATH` entry through a real `airlock run`) is exercised by the
+    // sandboxed integration test in tests/run_integration.rs. This proves
+    // the composition `prepare` relies on: a kit's expanded write dir, once
+    // folded into `write_grants`, makes `exec::filter_path` drop a `PATH`
+    // entry that resolves into it — exactly the B2 binary-location check.
+
+    #[test]
+    fn kit_write_dir_in_write_grants_triggers_b2_path_filtering() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path().join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let kit_write = tmp.path().join("cache/airlock/kits/proj/rust/cargo/bin");
+        std::fs::create_dir_all(&kit_write).unwrap();
+
+        let write_grants = vec![kit_write.clone()];
+        let path_var = kit_write.display().to_string();
+        let filtered = exec::filter_path(&path_var, &root, &write_grants);
+
+        assert!(
+            filtered.entries.is_empty(),
+            "a PATH entry inside a kit write grant must be dropped"
+        );
+        assert_eq!(filtered.dropped.len(), 1);
+    }
+
+    #[test]
+    fn agent_hash_changes_when_a_kit_option_changes_even_with_the_same_active_kits() {
+        use crate::config::{RawAgentConfig, RawKitConfig};
+        use std::collections::BTreeMap;
+
+        let agent = Some(RawAgentConfig {
+            kits: vec!["rust".to_string()],
+            ..Default::default()
+        });
+
+        let mut isolated = BTreeMap::new();
+        isolated.insert(
+            "rust".to_string(),
+            RawKitConfig {
+                mode: Some("isolated".to_string()),
+                ..Default::default()
+            },
+        );
+        let mut shared = BTreeMap::new();
+        shared.insert(
+            "rust".to_string(),
+            RawKitConfig {
+                mode: Some("shared".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let hash = |kits: &BTreeMap<String, RawKitConfig>| {
+            let bytes = serde_json::to_vec(&(&agent, kits)).unwrap();
+            config::sha256_hex(&bytes)
+        };
+
+        assert_ne!(
+            hash(&isolated),
+            hash(&shared),
+            "the same active kit list with a different mode must still change the hash"
+        );
+    }
+
+    #[test]
+    fn agent_hash_changes_when_the_active_kit_list_changes() {
+        use crate::config::RawAgentConfig;
+        use std::collections::BTreeMap;
+
+        let empty_kits: BTreeMap<String, config::RawKitConfig> = BTreeMap::new();
+        let hash = |kits: &[&str]| {
+            let agent = Some(RawAgentConfig {
+                kits: kits.iter().map(|s| s.to_string()).collect(),
+                ..Default::default()
+            });
+            let bytes = serde_json::to_vec(&(&agent, &empty_kits)).unwrap();
+            config::sha256_hex(&bytes)
+        };
+
+        assert_ne!(hash(&[]), hash(&["rust"]));
     }
 }

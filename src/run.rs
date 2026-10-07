@@ -278,6 +278,20 @@ pub(crate) fn build_agent_env(
     env
 }
 
+/// Applies a kit's resolved env on top of an already-built agent env
+/// (passthrough + `[agent.env]`), overriding any colliding key — the
+/// isolation guarantee an isolated kit depends on: a `CARGO_HOME` the user
+/// passes through must not defeat it.
+pub(crate) fn apply_kit_env(
+    mut env: HashMap<String, String>,
+    kit_env: &std::collections::BTreeMap<String, String>,
+) -> HashMap<String, String> {
+    for (k, v) in kit_env {
+        env.insert(k.clone(), v.clone());
+    }
+    env
+}
+
 // ─── RunOptions ───────────────────────────────────────────────────────────────
 
 /// CLI options forwarded from `Commands::Run` to [`run_agent`].
@@ -291,6 +305,9 @@ pub struct RunOptions {
     pub discover: DiscoverOpts,
     pub verbose: bool,
     pub quiet: bool,
+    /// `--kit` (repeatable), additive to `agent.kits` — see "Kits" in
+    /// `docs/airlock-v2-design.md`.
+    pub kits: Vec<String>,
 }
 
 // ─── run_agent ────────────────────────────────────────────────────────────────
@@ -316,6 +333,7 @@ pub fn run_agent(
             verbose: opts.verbose,
             quiet: opts.quiet,
             extra_write_grants,
+            cli_kits: opts.kits.clone(),
         },
     )?;
 
@@ -352,6 +370,20 @@ pub fn run_agent(
     policy
         .read_write_paths
         .extend(resolve_paths(&opts.allow_write, cwd));
+    // Kit read paths may not exist (e.g. no ~/.rustup on this machine) —
+    // filtered here, same as detect_toolchain_paths/profile_read_write_paths.
+    // Kit write dirs/files were already created by launcher::prepare, so no
+    // filter is needed (and none would be correct: a missing shared dir
+    // the launcher just created for a kit must still be granted).
+    policy
+        .read_paths
+        .extend(prepared.kits.read.iter().filter(|p| p.exists()).cloned());
+    policy
+        .read_write_paths
+        .extend(prepared.kits.write.iter().cloned());
+    policy
+        .read_write_paths
+        .extend(prepared.kits.write_files.iter().cloned());
 
     let sandbox_profile_kind = opts.profile.map(Profile::sandbox_kind);
     let mut sandbox_profile =
@@ -363,6 +395,10 @@ pub fn run_agent(
         &opts.passthrough_env,
         &prepared.env_snapshot,
     );
+    // Applied after the env snapshot and the passthrough env above, so a
+    // CARGO_HOME (etc.) the user passes through cannot defeat an isolated
+    // kit's whole point.
+    env = apply_kit_env(env, &prepared.kits.env);
     if let Some(session) = &session {
         env.insert("AIRLOCK_ADDR".to_string(), prepared.runtime.addr());
         env.insert("AIRLOCK_SESSION".to_string(), session.token.expose_secret());
@@ -377,6 +413,18 @@ pub fn run_agent(
             "airlock: sandbox: {profile_desc}root {}",
             prepared.root.display()
         );
+        if !prepared.kits.active.is_empty() {
+            let desc: Vec<String> = prepared
+                .kits
+                .active
+                .iter()
+                .map(|(name, mode)| match mode {
+                    Some(m) => format!("{name} ({})", m.as_str()),
+                    None => name.clone(),
+                })
+                .collect();
+            eprintln!("airlock: kits: {}", desc.join(", "));
+        }
     }
 
     let timeout = prepared
@@ -746,6 +794,56 @@ mod tests {
         );
         assert_eq!(env.get("CONFIG_VAR").map(String::as_str), Some("a"));
         assert_eq!(env.get("CLI_VAR").map(String::as_str), Some("b"));
+    }
+
+    #[test]
+    fn apply_kit_env_overrides_passthrough_cargo_home() {
+        // A user passing through their own CARGO_HOME must not defeat an
+        // isolated rust kit — kit env wins.
+        let snap = snapshot(&[("CARGO_HOME", "/home/u/.cargo")]);
+        let env = build_agent_env(None, &HashMap::new(), &["CARGO_HOME".to_string()], &snap);
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/home/u/.cargo")
+        );
+
+        let mut kit_env = BTreeMap::new();
+        kit_env.insert(
+            "CARGO_HOME".to_string(),
+            "/kit-state/rust/cargo".to_string(),
+        );
+        let env = apply_kit_env(env, &kit_env);
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/kit-state/rust/cargo")
+        );
+    }
+
+    #[test]
+    fn apply_kit_env_overrides_agent_env_too() {
+        let agent = agent_config_with_env(vec![(
+            "CARGO_HOME",
+            EnvValue::Static("/wrong/cargo".to_string()),
+        )]);
+        let env = build_agent_env(Some(&agent), &HashMap::new(), &[], &BTreeMap::new());
+        let mut kit_env = BTreeMap::new();
+        kit_env.insert(
+            "CARGO_HOME".to_string(),
+            "/kit-state/rust/cargo".to_string(),
+        );
+        let env = apply_kit_env(env, &kit_env);
+        assert_eq!(
+            env.get("CARGO_HOME").map(String::as_str),
+            Some("/kit-state/rust/cargo")
+        );
+    }
+
+    #[test]
+    fn apply_kit_env_leaves_unrelated_vars_alone() {
+        let snap = snapshot(&[("SHELL", "/bin/zsh")]);
+        let env = build_agent_env(None, &HashMap::new(), &[], &snap);
+        let env = apply_kit_env(env, &BTreeMap::new());
+        assert_eq!(env.get("SHELL").map(String::as_str), Some("/bin/zsh"));
     }
 
     #[test]
