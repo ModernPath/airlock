@@ -15,6 +15,7 @@ pub mod protocol;
 pub mod proxy;
 pub mod redact;
 pub mod refresh;
+pub mod relay;
 pub mod run;
 pub mod runtime_dir;
 pub mod sandbox;

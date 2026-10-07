@@ -177,7 +177,7 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
   3. `(deny file-read* (literal "<runtime base>/admin.token"))` — no sandbox can read the credential that registers sessions.
 
   A proxy tool's one exception is a `(allow file-read* (literal "<runtime base>/ca/<session-id>.pem"))` rule, scoped to its own session's certificate, which sits *before* the runtime-base deny above (a narrower allow after a broader deny does not apply — the deny would simply win — so this one is ordered as an exception the deny is written to exclude).
-- **The agent's terminal** (agent profile only): `/dev/tty` and the device behind the launcher's own stdin/stdout/stderr, which `airlock run` looks up with `ttyname` before spawning — see [The agent's terminal](#the-agents-terminal).
+- **The agent's terminal** (agent profile only): `/dev/tty` and the pty `airlock run` relays the user's terminal through, nothing else under `/dev/ttys*` or `/dev/ptmx` — see [The agent's terminal](#the-agents-terminal).
 - **Network**: one of three states, chosen for each execution.
   - *Full* (every ordinary tool): `network-outbound`, `system-socket`, plus DNS via `/private/var/run/mDNSResponder`. `network-bind` is scoped to `(local unix-socket)` only — tools can bind Unix domain sockets for local IPC (argocd SSO, language servers, loopback IPC) but cannot `listen()` on TCP/UDP and therefore cannot become network-reachable services.
   - *Proxy-only* (a [proxy tool](#proxy-tools)): one rule, `(allow network-outbound (remote tcp "localhost:<port>"))`. `<port>` is the ephemeral port the daemon bound for this execution. There is no general `network-outbound`, no `system-socket`, no mDNSResponder socket, and no bind of any kind. So the tool cannot resolve a name, reach a public address, or reach a different loopback port. We tested each case with `sandbox-exec` against a live listener. Seatbelt's `remote tcp` filter accepts only `localhost` or `*` as the host (an IP literal does not compile). `localhost` is what this rule needs.
@@ -188,16 +188,6 @@ Path traversal rules (`file-read-metadata` for ancestor directories) are generat
 **SBPL injection prevention**: Any path containing ASCII control characters (0x00–0x1F or 0x7F) is rejected. A null byte would truncate the profile string; other control characters could break the S-expression syntax. A path that goes into a `(regex #"...")` rule (the `~/.claude.json` family and `GlobalPreferences` plists, both derived from `HOME`) is also rejected if it contains a double quote: that literal is raw, with no escape for `"`, so a quote would end it early.
 
 The profile is applied via `sandbox_init()` FFI in the `pre_exec` closure, after fork but before exec.
-
-#### The agent's terminal
-
-The agent needs a terminal to draw on, but only its own. Every terminal tab is a `/dev/ttysNNN` device owned by the same uid, so a `/dev/ttys*` rule would let the agent open any other tab for writing: fake its output, or send it escape sequences, some of which make the terminal emulator write a reply into that tab's input as if typed (iTerm2 has had security bugs of exactly this kind). The agent profile therefore grants read-write and ioctl on `/dev/tty` and on exactly the devices `airlock run` itself was started on, looked up with `ttyname` on its stdin/stdout/stderr, and nothing else under `/dev/ttys*` or `/dev/ptmx`. Writes to the inherited stdio fds need no rule at all; reopening the terminal by name, raw mode (`tcsetattr`) and `TIOCGWINSZ` work through these grants. We tested each case with `sandbox-exec`, and `run_agent_reaches_its_own_terminal_and_others_only_with_pty` checks it end to end.
-
-- **`[agent] pty = true` brings back the patterns.** Allocating a pty means opening `/dev/ptmx` and then whichever `/dev/ttysNNN` the kernel hands out, which no literal can name in advance, and Seatbelt can't tell a pty the agent allocated from another tab's. So turning `pty` on reopens every other tab to the agent. Leave it off unless the agent needs `tmux`, `script`, `expect` or a harness that runs commands in a pty.
-- **`TIOCSTI` is denied by name**, `(deny file-ioctl (ioctl-command TIOCSTI))`, after every `file-ioctl` allow. It pushes bytes into a terminal's input queue as if typed; into the agent's own terminal, the user's shell would read them once the agent exits, outside every sandbox. Something else in the profile already refused it before this rule existed (we tested it), but not by name.
-- **Input left queued at exit is discarded.** When the agent exits, `airlock run` flushes its terminal's input queue (`tcflush(TCIFLUSH)`, only while it is the foreground process group), so a reply the agent elicited from the terminal emulator and never read isn't handed to the user's shell as typed input. This is cleanup, not a boundary: a process the agent leaves running still holds the terminal and can write escape sequences to it later.
-- **What remains:** the agent can still send escape sequences to its own terminal, since that's where it draws. How the terminal emulator handles them is its own attack surface; keep it up to date.
-- **Linux**: the Landlock rules grant nothing under `/dev/pts` or `/dev/ptmx`, so no lookup is needed there. The inherited stdio fds keep working (Landlock checks a path when it's opened, and these were opened before the sandbox applied), and neither another terminal nor pty allocation is granted. `pty` has no effect on Linux yet.
 
 #### `.git/hooks` write denial (F9)
 
@@ -218,6 +208,37 @@ The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** —
   Landlock itself leaves two gaps. First, the rule is **port-scoped, not host-scoped**: the tool can reach that port number on any host. Second, **UDP is not covered**, so exfiltration over DNS is still possible. Through either gap the tool can leak *data it can read*, but never the credential, because the tool never holds one. The agent's own sandbox already has general network access, so neither gap gives the agent a new capability. A network-namespace backend would close both gaps and is the planned next step.
 
 Landlock is allow-only and cannot carve a deny out of a granted subtree, which is why [F9](#git-hooks-write-denial-f9) is macOS-only, and why the runtime base is protected on Linux simply by never being inside any grant in the first place (see [Protecting the anchors](#protecting-the-anchors)) rather than by an explicit deny.
+
+### The agent's terminal
+
+`airlock run` never gives the agent the user's terminal. If the agent shared it, it could do things to the terminal that outlast its own run or reach past it:
+
+- **A process it leaves running keeps the terminal** after the agent exits. It can write into the terminal while the user's shell is in charge again, and read what the user types next — a `sudo` password included — racing the shell for input. Seatbelt can't stop this: the descriptor was inherited before the sandbox applied, and some processes will always outlive the agent (a `setsid` takes them out of its process group, and macOS has no way to keep orphans attached to `airlock run`).
+- **Replies become typed input.** Some escape sequences make the terminal emulator answer — with the cursor position, or the window title — by writing into the terminal's input. A reply the agent provokes just before it exits, or times to arrive just after, is read by the user's shell as if typed. When the reply carries text the agent chose (a window title it set, a `DECRQSS` request), it can become a command: xterm, rxvt and iTerm2 have all had CVEs of exactly this shape.
+- **`TIOCSTI`** pushes bytes into the terminal's input directly.
+- **Other tabs.** Every terminal tab is a `/dev/ttysNNN` device owned by the same uid; a `/dev/ttys*` grant would reach them all.
+
+**The relay.** `airlock run` allocates a pty ([src/relay.rs](src/relay.rs)), gives the agent its slave as stdin/stdout/stderr (each one that is a terminal for `airlock run` itself) and as the controlling terminal of a session of its own, and relays bytes between the master and the real terminal — the way `ssh -t` and `script` do. The real terminal is in raw mode while the agent runs, so Ctrl-C and Ctrl-Z reach the agent as keystrokes its own pty turns into signals; window resizes are passed on. On exit:
+
+1. `airlock run` stops relaying and forwards what the agent wrote just before exiting (at most 64 KiB: what was in flight, not whatever a leftover process keeps writing).
+2. It sends a status query (`ESC [5n`) and discards terminal input up to the answer (`ESC [0n`). Terminals answer in the order they were asked, so every reply the agent provoked has arrived and been discarded by then. It waits at most one second for a terminal that never answers, then flushes the input queue anyway. Keys typed in that moment are discarded too.
+3. It restores the terminal's modes and closes the master. A process the agent left running now holds a pty nothing reads or writes: nothing it writes reaches the user's terminal, and nothing the user types reaches it.
+
+Keyboard input is relayed only when stdin is the terminal and `airlock run` is in its foreground; a background `airlock run` relays output only and leaves the terminal's modes alone. With no terminal on stdin, stdout or stderr (a pipe, a CI job) there's nothing to protect and no relay: the agent inherits the fds. `run_relays_the_terminal_and_leaves_the_shell_nothing` checks the whole sequence end to end; with the drain removed the provoked reply is left for the shell, and with the relay removed the leftover process's write reaches the terminal too.
+
+**The sandbox on top.** The agent profile (macOS) grants read-write and ioctl on `/dev/tty` and the relay's pty only, nothing else under `/dev/ttys*` or `/dev/ptmx`, so the agent can't open another tab either; `run_agent_reaches_its_own_terminal_and_others_only_with_pty` checks this.
+
+- **`[agent] pty = true` brings back the patterns.** Allocating a pty means opening `/dev/ptmx` and then whichever `/dev/ttysNNN` the kernel hands out, which no literal can name in advance, and Seatbelt can't tell a pty the agent allocated from one of the user's tabs. So turning `pty` on lets the agent open every tab again. Leave it off unless the agent needs `tmux`, `script`, `expect` or a harness that runs commands in a pty.
+- **`TIOCSTI` is denied by name**, `(deny file-ioctl (ioctl-command TIOCSTI))`, after every `file-ioctl` allow. With the relay it could only reach the agent's own pty anyway; something else in the profile already refused it (we tested it), but not by name.
+- **Linux**: the Landlock rules grant nothing under `/dev/pts` or `/dev/ptmx`. The agent's stdio keeps working (Landlock checks a path when it's opened, and these were opened before the sandbox applied), and neither another terminal nor pty allocation is granted. `pty` has no effect on Linux yet.
+
+**What remains: escape sequences while the agent runs.** The agent draws its UI on the user's terminal, so its output reaches the terminal emulator, which acts on it. Replies are no longer the risk — while the agent runs they go to the agent's own pty, and after it exits they're discarded — but some sequences act on the terminal itself. Airlock doesn't filter them today:
+
+- **Clipboard (`OSC 52`).** Writing lets the agent put text in the user's clipboard to be pasted later (a command, say). Reading, where the terminal allows it, hands the clipboard's contents to the agent.
+- **Terminal-specific file and integration features**: iTerm2's `OSC 1337` (`File=` downloads, `RequestUpload`, clipboard copy) and its tmux integration mode (`DCS 1000p`), whose parser has had remote-code-execution bugs; kitty's file transfer protocol.
+- **Spoofing**: window titles (`OSC 0/2`), desktop notifications (`OSC 9`, `OSC 777`), hyperlinks whose text and target differ (`OSC 8`).
+
+Most terminals turn the dangerous ones off by default or ask first. Keep the terminal emulator up to date, and check its settings for clipboard access and file transfer.
 
 ### Sandbox root
 

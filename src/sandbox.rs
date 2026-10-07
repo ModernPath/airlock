@@ -167,10 +167,10 @@ pub struct AgentPolicy {
     /// Always `true` for agents, but included as an explicit field so the
     /// profile generator can be read without assuming.
     pub requires_terminal: bool,
-    /// The terminal the agent was started on: the devices behind the
-    /// launcher's stdin/stdout/stderr (`/dev/ttys003`), found by the caller.
-    /// Only these and `/dev/tty` are opened read-write — never every
-    /// `/dev/ttys*`, which is every other terminal tab the user has open.
+    /// The agent's terminal: the slave of the pty `airlock run` relays the
+    /// user's terminal through ([`crate::relay`]), empty when there is no
+    /// terminal. Only these and `/dev/tty` are opened read-write — never
+    /// every `/dev/ttys*`, which is every terminal tab the user has open.
     pub terminals: Vec<PathBuf>,
     /// `[agent] pty = true`: the agent may allocate pseudo-terminals.
     /// Seatbelt can't tell a pty the agent just allocated from another

@@ -61,7 +61,12 @@ impl Fixture {
     }
 
     fn cmd(&self) -> Command {
-        let mut cmd = Command::new(airlock_bin());
+        self.command(airlock_bin())
+    }
+
+    /// `program` with this fixture's environment and working directory.
+    fn command(&self, program: &str) -> Command {
+        let mut cmd = Command::new(program);
         cmd.env_clear();
         if let Ok(path) = std::env::var("PATH") {
             cmd.env("PATH", path);
@@ -237,33 +242,20 @@ fn run_shims_a_tool_so_its_plain_name_goes_through_the_session() {
 // ─── Terminal ─────────────────────────────────────────────────────────────────
 
 /// A fresh pseudo-terminal: its master, its slave, and the slave's path.
-#[cfg(target_os = "macos")]
 fn openpty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd, String) {
-    use std::os::fd::FromRawFd;
+    use rustix::fs::{Mode, OFlags};
+    use rustix::pty::OpenptFlags;
 
-    let (mut master, mut slave) = (0, 0);
-    // SAFETY: `openpty` writes two fds it just opened into `master` and
-    // `slave`; the null name/termios/winsize arguments are documented as
-    // optional.
-    let rc = unsafe {
-        libc::openpty(
-            &mut master,
-            &mut slave,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-        )
-    };
-    assert_eq!(rc, 0, "openpty: {}", std::io::Error::last_os_error());
-    // SAFETY: both fds are freshly opened and owned by nothing else.
-    let (master, slave) = unsafe {
-        (
-            std::os::fd::OwnedFd::from_raw_fd(master),
-            std::os::fd::OwnedFd::from_raw_fd(slave),
-        )
-    };
-    let name = rustix::termios::ttyname(&slave, Vec::new()).unwrap();
-    (master, slave, name.into_string().unwrap())
+    let master = rustix::pty::openpt(OpenptFlags::RDWR | OpenptFlags::NOCTTY).unwrap();
+    rustix::pty::grantpt(&master).unwrap();
+    rustix::pty::unlockpt(&master).unwrap();
+    let name = rustix::pty::ptsname(&master, Vec::new())
+        .unwrap()
+        .into_string()
+        .unwrap();
+    let slave =
+        rustix::fs::open(name.as_str(), OFlags::RDWR | OFlags::NOCTTY, Mode::empty()).unwrap();
+    (master, slave, name)
 }
 
 // The agent can reopen the terminal it was started on by name, but another
@@ -294,6 +286,76 @@ fn run_agent_reaches_its_own_terminal_and_others_only_with_pty() {
             .unwrap();
         assert_eq!(status.code(), Some(expected), "config:\n{config}");
     }
+}
+
+// The relay end to end, with `sh` as the user's shell: the session leader
+// of a pty, running `airlock run` in its foreground. Its agent reads a line
+// typed at the terminal, provokes a reply the terminal sends only after the
+// agent has exited, and leaves a process that writes after that. The line
+// arrives; the reply is not left for the shell; the late write never
+// reaches the terminal.
+#[test]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_relays_the_terminal_and_leaves_the_shell_nothing() {
+    use std::io::{Read, Write};
+    use std::os::unix::process::CommandExt;
+
+    let fx = Fixture::new();
+    fx.write_config(minimal_config());
+    let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+    assert!(trust_output.status.success(), "{trust_output:?}");
+
+    let (master, slave, _) = openpty();
+    let agent = r#"IFS= read -r line; printf 'got[%s]\n' "$line"; printf '\033[6n'; (sleep 1; printf LATE) & exit 0"#;
+    let shell = r#""$AIRLOCK" run --no-session -- /bin/sh -c "$AGENT"
+stty -icanon -echo min 0 time 5; printf 'LEFT['; cat -v; printf ']'; sleep 2"#;
+    let mut cmd = fx.command("/bin/sh");
+    cmd.args(["-c", shell])
+        .env("AIRLOCK", airlock_bin())
+        .env("AGENT", agent)
+        .stdin(slave.try_clone().unwrap())
+        .stdout(slave.try_clone().unwrap())
+        .stderr(slave);
+    // SAFETY: setsid and ioctl are raw syscalls, safe between fork and exec.
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 || libc::ioctl(0, libc::TIOCSCTTY as _, 0) == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    let mut child = cmd.spawn().unwrap();
+
+    // The terminal emulator: types a line, answers a cursor-position query
+    // late (after the agent is gone) and a status query at once, in order.
+    let mut term = std::fs::File::from(master);
+    term.write_all(b"hello\r").unwrap();
+    let mut screen = Vec::new();
+    let mut buf = [0u8; 4096];
+    let mut answered = (0, 0);
+    loop {
+        match term.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => screen.extend_from_slice(&buf[..n]),
+        }
+        let count = |q: &[u8]| screen.windows(q.len()).filter(|w| *w == q).count();
+        if count(b"\x1b[6n") > answered.0 {
+            answered.0 += 1;
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            term.write_all(b"\x1b[5;1R").unwrap();
+        }
+        if count(b"\x1b[5n") > answered.1 {
+            answered.1 += 1;
+            term.write_all(b"\x1b[0n").unwrap();
+        }
+    }
+    child.wait().unwrap();
+
+    let screen = String::from_utf8_lossy(&screen);
+    assert!(screen.contains("got[hello]"), "{screen:?}");
+    assert!(screen.contains("LEFT[]"), "{screen:?}");
+    assert!(!screen.contains("LATE"), "{screen:?}");
 }
 
 // ─── Kits ─────────────────────────────────────────────────────────────────────

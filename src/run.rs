@@ -28,6 +28,7 @@ use crate::config::{AgentConfig, EnvValue};
 use crate::launcher::{self, DiscoverOpts, LauncherError, PrepareOptions, Prepared};
 use crate::policy::build_agent_policy;
 use crate::protocol::{SandboxKind, SessionEnds};
+use crate::relay::Relay;
 use crate::sandbox::{self, SandboxError, SandboxProfile};
 use crate::secrets::Secret;
 
@@ -86,6 +87,10 @@ pub enum RunError {
     /// The shim directory for `shim = true` tools could not be written.
     #[error("failed to create tool shims: {0}")]
     Shims(#[source] std::io::Error),
+
+    /// The pty between the agent and the user's terminal could not be set up.
+    #[error("failed to set up the agent's terminal: {0}")]
+    Terminal(#[source] std::io::Error),
 }
 
 impl From<LauncherError> for RunError {
@@ -385,7 +390,8 @@ pub fn run_agent(
     policy.runtime_base = Some(prepared.anchors.runtime_base.clone());
     policy.tmpdir = prepared.env_snapshot.get("TMPDIR").map(PathBuf::from);
     policy.home = home.map(PathBuf::from);
-    policy.terminals = own_terminals();
+    let mut relay = Relay::open(stdio_fds()).map_err(RunError::Terminal)?;
+    policy.terminals = relay.iter().map(|r| r.slave_path().to_path_buf()).collect();
     policy
         .read_paths
         .extend(resolve_paths(&opts.allow_read, cwd));
@@ -481,8 +487,12 @@ pub fn run_agent(
         let sigterm = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
             .expect("SIGTERM handler should be installable");
 
-        let (child, child_pid) = spawn_agent(&mut sandbox_profile, &command, &args, env)
-            .map_err(RunError::SpawnFailed)?;
+        let (child, child_pid) =
+            spawn_agent(&mut sandbox_profile, &command, &args, env, relay.as_ref())
+                .map_err(RunError::SpawnFailed)?;
+        if let Some(relay) = &mut relay {
+            relay.start().map_err(RunError::Terminal)?;
+        }
 
         let lease_ended = match session {
             Some(s) => watch_lease(s.lease),
@@ -497,14 +507,19 @@ pub fn run_agent(
             }
         };
 
-        let exit_code = signal_loop(child, child_pid, timeout, sigterm, lease_ended).await;
+        let resize = || {
+            if let Some(relay) = &relay {
+                relay.resize();
+            }
+        };
+        let exit_code = signal_loop(child, child_pid, timeout, sigterm, lease_ended, resize).await;
+        if let Some(relay) = relay {
+            relay.finish();
+        }
         Ok::<ExitCode, RunError>(exit_code)
     })?;
-    discard_pending_input();
     Ok(exit_code)
 }
-
-// ─── The agent's terminal ─────────────────────────────────────────────────────
 
 fn stdio_fds() -> [std::os::fd::BorrowedFd<'static>; 3] {
     [
@@ -512,39 +527,6 @@ fn stdio_fds() -> [std::os::fd::BorrowedFd<'static>; 3] {
         rustix::stdio::stdout(),
         rustix::stdio::stderr(),
     ]
-}
-
-/// The terminal devices behind this process's stdin/stdout/stderr, which
-/// the agent inherits: the only ones its sandbox may open by name.
-fn own_terminals() -> Vec<PathBuf> {
-    use std::os::unix::ffi::OsStringExt;
-
-    let mut terminals = Vec::new();
-    for fd in stdio_fds() {
-        if let Ok(name) = rustix::termios::ttyname(fd, Vec::new()) {
-            let path = PathBuf::from(std::ffi::OsString::from_vec(name.into_bytes()));
-            if !terminals.contains(&path) {
-                terminals.push(path);
-            }
-        }
-    }
-    terminals
-}
-
-/// Drops input still queued on the agent's terminal, so the user's shell
-/// doesn't read it as typed: say, a reply the agent made the terminal
-/// emulator send and never read. Not a boundary — a process the agent
-/// leaves running keeps the terminal open — but nothing is left queued at
-/// the moment the agent exits. Only from the foreground: `tcflush` from a
-/// background process group would stop this process with SIGTTOU.
-fn discard_pending_input() {
-    for fd in stdio_fds() {
-        if rustix::termios::isatty(fd)
-            && rustix::termios::tcgetpgrp(fd).ok() == Some(rustix::process::getpgrp())
-        {
-            let _ = rustix::termios::tcflush(fd, rustix::termios::QueueSelector::IFlush);
-        }
-    }
 }
 
 fn resolve_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
@@ -711,23 +693,50 @@ fn spawn_agent(
     command: &str,
     args: &[String],
     env: HashMap<String, String>,
+    relay: Option<&Relay>,
 ) -> Result<(Child, u32), std::io::Error> {
     let mut cmd = Command::new(command);
     cmd.args(args);
     cmd.env_clear();
     cmd.envs(env);
 
-    cmd.stdin(std::process::Stdio::inherit());
-    cmd.stdout(std::process::Stdio::inherit());
-    cmd.stderr(std::process::Stdio::inherit());
+    match relay {
+        Some(relay) => {
+            cmd.stdin(relay.stdio(0)?);
+            cmd.stdout(relay.stdio(1)?);
+            cmd.stderr(relay.stdio(2)?);
+            let slave = relay.slave_fd();
+            // SAFETY: setsid and ioctl are raw syscalls, async-signal-safe
+            // and allocation-free. Registered before the sandbox's own
+            // closure, so they run first: the agent leads a session of its
+            // own whose controlling terminal is the relay's pty, never the
+            // user's terminal.
+            unsafe {
+                cmd.pre_exec(move || {
+                    if libc::setsid() == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    if libc::ioctl(slave, libc::TIOCSCTTY as _, 0) == -1 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+        }
+        // No terminal at all: nothing for the agent to take over.
+        None => {
+            cmd.stdin(std::process::Stdio::inherit());
+            cmd.stdout(std::process::Stdio::inherit());
+            cmd.stderr(std::process::Stdio::inherit());
+        }
+    }
 
     #[cfg(target_os = "macos")]
     {
         let sbpl_ptr = SendSyncPtr(sandbox_profile.as_ptr());
 
         // SAFETY: see exec.rs's pre_exec safety argument; the same applies
-        // here. No setpgid(0, 0): the agent stays in the parent's process
-        // group so Ctrl+C reaches it directly.
+        // here.
         unsafe {
             cmd.pre_exec(move || {
                 let mut errorbuf: *mut std::ffi::c_char = std::ptr::null_mut();
@@ -778,24 +787,29 @@ fn spawn_agent(
     Ok((child, child_pid))
 }
 
-/// Wait for the agent child to exit, forwarding SIGTERM/SIGHUP, enforcing an
-/// optional session timeout, and reporting a lease that closed out from
-/// under the agent.
+/// Wait for the agent child to exit, forwarding SIGTERM/SIGHUP/SIGINT,
+/// passing terminal resizes on through `resize`, enforcing an optional
+/// session timeout, and reporting a lease that closed out from under the
+/// agent.
 async fn signal_loop(
     mut child: Child,
     child_pid: u32,
     timeout: Duration,
     mut sigterm: tokio::signal::unix::Signal,
     lease_ended: tokio::sync::oneshot::Receiver<()>,
+    resize: impl Fn(),
 ) -> ExitCode {
     let mut sighup = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
         .expect("SIGHUP handler should be installable");
-    // The agent shares this process's group, so a terminal Ctrl-C already
-    // delivers SIGINT to it directly; forwarding it again here is harmless
-    // (same as SIGTERM below) and covers a SIGINT sent to the launcher
-    // alone, e.g. via `kill -INT`.
+    // With the relay in raw mode, Ctrl-C reaches the agent as a keystroke
+    // its own pty turns into SIGINT, never as a signal here. A SIGINT that
+    // does arrive came from elsewhere (`kill -INT`, or the user's terminal
+    // when `airlock run` isn't relaying input) and is passed on.
     let mut sigint = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::interrupt())
         .expect("SIGINT handler should be installable");
+    let mut sigwinch =
+        tokio::signal::unix::signal(tokio::signal::unix::SignalKind::window_change())
+            .expect("SIGWINCH handler should be installable");
 
     let use_timeout = !timeout.is_zero();
     let timeout_sleep = tokio::time::sleep(if use_timeout {
@@ -826,6 +840,7 @@ async fn signal_loop(
             _ = sigint.recv() => {
                 unsafe { libc::kill(child_pid as i32, libc::SIGINT); }
             }
+            _ = sigwinch.recv() => resize(),
             _ = &mut lease_ended, if !lease_notified => {
                 lease_notified = true;
                 eprintln!(
@@ -1096,7 +1111,14 @@ mod tests {
         let (tx, rx) = tokio::sync::oneshot::channel();
         std::mem::forget(tx);
 
-        let handle = tokio::spawn(signal_loop(child, child_pid, Duration::ZERO, sigterm, rx));
+        let handle = tokio::spawn(signal_loop(
+            child,
+            child_pid,
+            Duration::ZERO,
+            sigterm,
+            rx,
+            || {},
+        ));
 
         // Give the spawned task a chance to run and install signal_loop's
         // own SIGINT handler before this sends one.
