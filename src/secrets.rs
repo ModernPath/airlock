@@ -331,6 +331,8 @@ pub(crate) enum CommandCtxError {
         argv0: String,
         dropped: Vec<(String, String)>,
     },
+    /// `argv[0]` (a path) does not resolve to an executable file.
+    NotExecutable { argv0: String, path: PathBuf },
     /// `argv[0]` resolved inside the project root.
     InsideRoot { argv0: String, path: PathBuf },
     /// `argv[0]` resolved inside a write grant (but not the root).
@@ -342,13 +344,17 @@ pub(crate) enum CommandCtxError {
 
 impl CommandCtxError {
     /// Render the full, label-prefixed message. Structural failures
-    /// (`NotOnPath`, `Inside*`) are formatted per the UX table's secret
+    /// (`NotOnPath`, `NotExecutable`, `Inside*`) are formatted per the UX table's secret
     /// command messages; a run failure defers to [`CommandRunError::to_flat`].
     pub(crate) fn to_flat(&self, label: &str) -> String {
         match self {
             CommandCtxError::NotOnPath { argv0, dropped } => format!(
                 "secret {label}: command {argv0:?} is not on the session's PATH{}",
                 crate::exec::format_dropped_suffix(dropped)
+            ),
+            CommandCtxError::NotExecutable { argv0, path } => format!(
+                "secret {label}: command {argv0:?} ({}) is not an executable file",
+                path.display()
             ),
             CommandCtxError::InsideRoot { argv0, path } => format!(
                 "secret {label}: command {argv0:?} resolves to {}, inside the project; \
@@ -379,7 +385,18 @@ fn resolve_command_argv0(argv0: &str, ctx: &CommandContext) -> Result<PathBuf, C
         } else {
             candidate.to_path_buf()
         };
-        std::fs::canonicalize(&candidate).unwrap_or(candidate)
+        // Resolved the same way a `PATH` hit is: a path that doesn't
+        // canonicalize to an executable is refused, never checked and run
+        // in its unresolved form.
+        match crate::exec::probe_executable(&candidate) {
+            Some(p) => p,
+            None => {
+                return Err(CommandCtxError::NotExecutable {
+                    argv0: argv0.to_string(),
+                    path: candidate,
+                });
+            }
+        }
     } else {
         match crate::exec::search_path_entries(argv0, &ctx.path.entries) {
             Some(p) => p,
@@ -1112,6 +1129,34 @@ mod tests {
                 assert!(msg.contains("secret pw"));
                 assert!(msg.contains("./scripts/token.sh"));
                 assert!(msg.contains("inside the project"));
+            }
+            other => panic!("expected CommandUnusable, got: {other:?}"),
+        }
+    }
+
+    /// A path `argv[0]` that doesn't resolve — here a dangling symlink — is
+    /// refused outright rather than location-checked in its unresolved form.
+    #[test]
+    fn collect_secrets_with_argv0_dangling_symlink_refused() {
+        let root = tempdir().unwrap();
+        let elsewhere = tempdir().unwrap();
+        let link = elsewhere.path().join("token");
+        std::os::unix::fs::symlink(root.path().join("not-yet-there.sh"), &link).unwrap();
+
+        let ctx = test_ctx(
+            std::collections::BTreeMap::new(),
+            root.path().to_path_buf(),
+            root.path().to_path_buf(),
+            vec![],
+        );
+        let argv0 = link.to_string_lossy().into_owned();
+        let config = make_config_command(vec![("pw", vec![argv0.as_str()], 5)]);
+
+        let err = collect_secrets_with(&config, &no_env, &ctx).unwrap_err();
+        match err {
+            SecretsError::CommandUnusable(msg) => {
+                assert!(msg.contains("secret pw"), "{msg}");
+                assert!(msg.contains("is not an executable file"), "{msg}");
             }
             other => panic!("expected CommandUnusable, got: {other:?}"),
         }
