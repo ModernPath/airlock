@@ -447,6 +447,12 @@ fn format_tools(tools: &[crate::protocol::ToolInfo]) -> String {
         if tool.proxy {
             out.push_str("  proxy tool\n");
         }
+        if tool.shim {
+            out.push_str(&format!(
+                "  shim: a plain `{}` also runs through Airlock\n",
+                esc(&tool.name)
+            ));
+        }
     }
     out
 }
@@ -476,6 +482,7 @@ mod tests {
             description: Some("evil\u{202e}desc\x1b[31m".to_string()),
             env: Vec::new(),
             proxy: false,
+            shim: false,
         }];
         let out = format_tools(&tools);
         assert!(!out.contains('\u{202e}'));

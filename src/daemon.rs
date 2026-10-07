@@ -1443,7 +1443,7 @@ async fn handle_admin_request(
                     let policy = s.current_policy();
                     DaemonMessage::Tools {
                         session: s.info(),
-                        tools: session::tools_info(&policy.config),
+                        tools: session::tools_info(&policy.config, s.sandbox),
                     }
                 }
                 Err(msg) => DaemonMessage::Error {
@@ -1727,7 +1727,7 @@ async fn handle_session_request(
             let policy = session.current_policy();
             let reply = DaemonMessage::Tools {
                 session: session.info(),
-                tools: session::tools_info(&policy.config),
+                tools: session::tools_info(&policy.config, session.sandbox),
             };
             let _ = responder.send(&reply).await;
         }

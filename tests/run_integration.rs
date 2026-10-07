@@ -208,6 +208,32 @@ fn run_agent_execs_a_tool_through_its_session_after_ten_seconds() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "via-daemon\n");
 }
 
+// A plain `env` from inside the agent runs the shim, which goes through the
+// daemon: only the daemon-spawned `env` has the tool's `VIA`. No
+// `--allow-read` for the dev build here, unlike the test above — `run`
+// grants the agent the binary its shims call.
+#[test]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_shims_a_tool_so_its_plain_name_goes_through_the_session() {
+    let fx = Fixture::new();
+    fx.write_config("[tools.env]\nshim = true\n\n[tools.env.env]\nVIA = \"daemon\"\n");
+    let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+    assert!(trust_output.status.success(), "{trust_output:?}");
+
+    let output = fx
+        .cmd()
+        .env("AIRLOCK_TEST_IDLE_EXIT_SECS", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .args(["run", "--", "/bin/sh", "-c", "env | grep '^VIA='"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "VIA=daemon\n");
+
+    let shims = fx.xdg_cache.path().join("airlock/shims");
+    assert_eq!(std::fs::read_dir(&shims).unwrap().count(), 0);
+}
+
 // ─── Kits ─────────────────────────────────────────────────────────────────────
 //
 // `--no-session` keeps these focused on the sandbox + env the kit produces,

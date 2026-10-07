@@ -293,6 +293,7 @@ mod tests {
                     access: None,
                     description: None,
                     proxy: None,
+                    shim: false,
                 },
             );
         }

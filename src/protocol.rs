@@ -47,7 +47,7 @@ use zeroize::Zeroizing;
 /// value interoperate; the launcher's "incompatible daemon" error compares
 /// this, not the binary version (docs/airlock-v2-technical-guidance.md,
 /// "One protocol version, separate from the binary version").
-pub const PROTOCOL_VERSION: u32 = 4;
+pub const PROTOCOL_VERSION: u32 = 5;
 
 /// NDJSON line cap for the session family, which comes from a sandboxed,
 /// untrusted client.
@@ -880,6 +880,10 @@ pub struct ToolInfo {
     /// Whether this is a proxy tool (credential-injecting HTTP proxy) rather
     /// than a spawned binary.
     pub proxy: bool,
+    /// Whether the agent's `PATH` has a shim for it, so a plain `<name>`
+    /// also goes through Airlock: `shim = true` in a session `airlock run`
+    /// started.
+    pub shim: bool,
 }
 
 /// A single entry in the daemon's ring-buffer log.
@@ -1048,7 +1052,7 @@ mod tests {
 
     #[test]
     fn constants_match_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 4);
+        assert_eq!(PROTOCOL_VERSION, 5);
         assert_eq!(MAX_SESSION_LINE_BYTES, 1024 * 1024);
         assert_eq!(MAX_ADMIN_LINE_BYTES, 16 * 1024 * 1024);
     }
@@ -1627,12 +1631,14 @@ mod tests {
                 ),
             ],
             proxy: false,
+            shim: true,
         });
         round_trip(&ToolInfo {
             name: "x".to_string(),
             description: None,
             env: vec![],
             proxy: true,
+            shim: false,
         });
     }
 
@@ -1748,6 +1754,7 @@ mod tests {
                 description: None,
                 env: vec![],
                 proxy: false,
+                shim: false,
             }],
         });
     }

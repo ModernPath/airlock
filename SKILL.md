@@ -34,6 +34,12 @@ it asks the daemon, not a config file — so it fails with the same message as
 If a tool shows `proxy tool; reachable hosts:`, it is a proxy tool. See
 [Proxy tools](#proxy-tools) for how to use one.
 
+If a tool shows a `shim:` line, your `PATH` starts with a shim for it: `git fetch` and `airlock exec -- git fetch`
+do the same thing, and so does a `git` run by any program you start. The
+shim is still `airlock exec` underneath, with the same
+[limitations](#important-limitations) and [exit codes](#exit-codes) — an
+`airlock:` message from a plain `git` comes from Airlock, not from git.
+
 Example output:
 
 ```
@@ -234,7 +240,8 @@ through airlock. This includes: `grep`, `find`, `cargo`, `npm`, `make`,
 `ls`, `cat`, and similar. Airlock is only for tools that need credential
 injection.
 
-`git` is a judgement call: reads, local commits, and SSH-based pushes don't
+`git` is a judgement call (unless it is shimmed, in which case every `git`
+goes through airlock anyway): reads, local commits, and SSH-based pushes don't
 need airlock, but signed commits (GPG key) and HTTPS pushes using a credential
 helper (GitHub token, etc.) are legitimate airlock-brokered use cases, and
 your session serves them if the project declares them.

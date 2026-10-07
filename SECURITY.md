@@ -258,6 +258,12 @@ Kits (`airlock run --kit <name>` / `agent.kits` / `[kits.<name>]`) add a languag
 
 This is why isolated is the default, and why `[kits.<name>]` (the table that sets a built-in kit's mode, or defines a custom one) is restricted to your global config or `airlock.local.toml` — the same restricted slot as `allow_home_root` — never a project's own `airlock.toml`. A teammate's checked-in config choosing shared mode for you, silently, would be exactly this risk without your consent.
 
+## Shims
+
+`shim = true` on a tool puts a `<name>` script first on `airlock run`'s agent `PATH`, which runs `airlock exec -- <name> "$@"`. It grants no new capability: the agent already holds its session token and can run `airlock exec` itself, and the daemon still resolves the real binary on the session's filtered `PATH` and applies the tool's own sandbox. The shim is a convenience, not a boundary. That the agent could read past it (to the real binary, without credentials) or replace its own `PATH` doesn't matter.
+
+What a shim does change is **how often the tool runs with its secrets.** Without a shim, a credentialed `git` runs only when something explicitly asks for `airlock exec -- git`. With one, every `git`, including each `git status` the harness runs, runs in the git tool's environment. Git reads agent-writable repository config on every invocation: `core.fsmonitor`, `core.sshCommand`, `core.pager` and aliases in `.git/config` can run a command, and that command inherits the tool's env. This is the same exposure [Agent-written code run outside the sandbox](#agent-written-code-run-outside-the-sandbox) describes for the user's own shell, and `airlock exec -- git` already has it. A shim makes it reachable from every git call, not just the ones that ask for credentials. Shim a tool only when you'd accept every invocation of it being credentialed. For git, prefer credentials that are useful only for what the tool is meant to do (a deploy key or fine-grained token scoped to the repository) over a broad personal token.
+
 ## External sandboxes
 
 A harness started from an `airlock session start` shell — Claude Code's own `--sandbox`, or an IDE extension `airlock run` can't wrap — runs in a sandbox Airlock did not build. Airlock's protections for the agent then depend entirely on that sandbox, and on the harness not inheriting secrets through some other path. Specifically, the harness's own sandbox **must**:

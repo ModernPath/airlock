@@ -461,6 +461,7 @@ Unknown keys are a config error at every level, in every layer — a typo fails 
 | `override`    | Local layer only. Replaces the repo's tool of the same name whole; a config error if the repo defines no such tool. |
 | `proxy`       | `true` marks a *proxy tool*. See [Proxy tools](#proxy-tools). A proxy tool needs at least one route and may not have secrets in `env`. |
 | `routes`      | `[[tools.<name>.routes]]`. Each route names a host the proxy tool may reach, an optional credential header to attach, and optional `METHOD /path` allow/deny rules. |
+| `shim`        | `true` makes a plain `<name>` run through Airlock under `airlock run`. See [Shims](#shims). |
 
 > **Only declare purpose-built CLIs as tools.** Never declare shells (`bash`), interpreters (`python`, `node`), or any tool where the agent controls the request. If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. `curl` is the one exception, and only as a [proxy tool](#proxy-tools). A proxy tool never holds a secret, so it has no secret to leak. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
 
@@ -475,6 +476,22 @@ Every tool's sandbox always gets its own binary, the project root (read-write), 
 | `"default"` | `"system"` plus read-only `/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, and `/home/linuxbrew/.linuxbrew` — the common toolchain install roots. **The default when `access` is unset**, at the top level or per tool. |
 
 Set the top-level `access` to change the project default, or a tool's own `access` to override it for just that tool — a config error names the three valid levels if either is misspelled.
+
+#### Shims
+
+A program the agent starts doesn't know about `airlock exec`: a CLI that runs `git fetch` itself gets the agent's own `git`, with no credentials. `shim = true` fixes that without changing the program:
+
+```toml
+[tools.git]
+shim = true
+```
+
+`airlock run` then puts a small `git` script first on the agent's `PATH`, which runs `airlock exec -- git "$@"`. Every `git`, typed by the agent or run by any program it starts, goes through the session. Programs that call a binary by absolute path (`/usr/bin/git`) bypass the shim and simply get no credentials.
+
+- **Every call goes through the daemon,** with `exec`'s limits: no terminal, text output only, and a daemon round trip per call. `git commit` without `-m`, `git add -p` and pagers won't work through a shim.
+- **Every call runs with the tool's secrets**, `git status` included — see [SECURITY.md](SECURITY.md#shims) before shimming a tool whose local config the agent can write.
+- **Only under `airlock run`.** A `session start` session has no shims; its harness builds its own environment. `airlock tools list` shows which tools are shimmed in the current session.
+- **Fixed at launch.** A `session reload` that adds or removes a shim reports "agent settings changed"; restart the agent to apply it.
 
 ### Proxy tools
 

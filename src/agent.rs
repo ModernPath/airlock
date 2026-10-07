@@ -354,7 +354,8 @@ fn tool_table(tools: &[ToolInfo]) -> String {
         .map(|t| {
             let name = esc(&t.name);
             let desc = t.description.as_deref().map(esc).unwrap_or_default();
-            format!("  {name:<width$}  {desc}")
+            let shim = if t.shim { "  [shim]" } else { "" };
+            format!("  {name:<width$}  {desc}{shim}")
         })
         .collect::<Vec<_>>()
         .join("\n")
@@ -558,11 +559,16 @@ fn self_test_failed_output(check: &str) -> (String, String) {
 /// the first sentence (whether the self-test ran) and in what, if
 /// anything, follows the table.
 fn preamble_and_table(preamble: &str, tools: &[ToolInfo]) -> String {
+    let shim_note = if tools.iter().any(|t| t.shim) {
+        " A tool marked [shim] is the exception: its plain name already runs through Airlock, for you and for any program you start."
+    } else {
+        ""
+    };
     format!(
         "{preamble}\n\n\
          These tools hold credentials. Run them only through Airlock, as `airlock exec -- <tool> [args...]`:\n\n\
          {}\n\n\
-         Running them directly fails: their credentials are not in your environment. Secrets in their output appear as [REDACTED:NAME]; that is expected. `airlock tools list` shows details. Other commands run directly as usual.",
+         Running them directly fails: their credentials are not in your environment.{shim_note} Secrets in their output appear as [REDACTED:NAME]; that is expected. `airlock tools list` shows details. Other commands run directly as usual.",
         tool_table(tools)
     )
 }
@@ -788,6 +794,7 @@ mod tests {
             description: Some(desc.to_string()),
             env: Vec::new(),
             proxy: false,
+            shim: false,
         }
     }
 
@@ -990,6 +997,16 @@ mod tests {
         assert!(!out.contains('\x1b'));
         assert!(out.contains("\\u{202e}"));
         assert!(out.contains("\\u{1b}"));
+    }
+
+    #[test]
+    fn shimmed_tools_are_marked_and_explained() {
+        let mut git = fake_tool("git", "Git");
+        git.shim = true;
+        let tools = vec![fake_tool("gh", "GitHub CLI"), git];
+        assert_eq!(tool_table(&tools), "  gh   GitHub CLI\n  git  Git  [shim]");
+        assert!(success_output("7f3a9c", &tools).contains("A tool marked [shim] is the exception"));
+        assert!(!success_output("7f3a9c", &sample_tools()).contains("[shim]"));
     }
 
     #[test]

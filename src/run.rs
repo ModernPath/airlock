@@ -82,6 +82,10 @@ pub enum RunError {
     /// The agent child process could not be spawned.
     #[error("failed to spawn agent process: {0}")]
     SpawnFailed(#[source] std::io::Error),
+
+    /// The shim directory for `shim = true` tools could not be written.
+    #[error("failed to create tool shims: {0}")]
+    Shims(#[source] std::io::Error),
 }
 
 impl From<LauncherError> for RunError {
@@ -400,6 +404,26 @@ pub fn run_agent(
         .read_write_paths
         .extend(prepared.kits.write_files.iter().cloned());
 
+    // A shim's `airlock exec` needs a session to reach.
+    let shimmed = prepared.config.shimmed_tools();
+    let shims = match &session {
+        Some(s) if !shimmed.is_empty() => {
+            let dir = prepared
+                .anchors
+                .tool_state_base
+                .join("shims")
+                .join(s.id.as_str());
+            let airlock = std::env::current_exe()
+                .and_then(std::fs::canonicalize)
+                .map_err(RunError::Shims)?;
+            let shims = ShimDir::create(dir, &airlock, &shimmed).map_err(RunError::Shims)?;
+            policy.read_paths.push(shims.path.clone());
+            policy.read_paths.push(airlock);
+            Some(shims)
+        }
+        _ => None,
+    };
+
     let sandbox_profile_kind = opts.profile.map(Profile::sandbox_kind);
     let mut sandbox_profile =
         sandbox::build_platform_agent_sandbox_profile(&policy, sandbox_profile_kind)?;
@@ -417,6 +441,9 @@ pub fn run_agent(
     if let Some(session) = &session {
         env.insert("AIRLOCK_ADDR".to_string(), prepared.runtime.addr());
         env.insert("AIRLOCK_SESSION".to_string(), session.token.expose_secret());
+    }
+    if let Some(shims) = &shims {
+        prepend_path(&mut env, &shims.path);
     }
 
     if opts.verbose {
@@ -495,6 +522,7 @@ fn resolve_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
 /// `AIRLOCK_SESSION`) and the still-open admin connection, which the daemon
 /// treats as the lease — closing it (dropping `lease`) ends the session.
 struct Session {
+    id: crate::protocol::SessionId,
     token: crate::protocol::SessionToken,
     lease: std::os::unix::net::UnixStream,
 }
@@ -530,7 +558,88 @@ fn start_session(
         );
     }
     let lease = conn.into_raw().map_err(LauncherError::from)?;
-    Ok(Session { token, lease })
+    Ok(Session { id, token, lease })
+}
+
+// ─── Tool shims ───────────────────────────────────────────────────────────────
+
+/// One `sh` script per `shim = true` tool, each running `airlock exec --
+/// <tool> "$@"` with this very binary, first on the agent's `PATH` — so a
+/// plain `git`, typed by the agent or run by any program it starts, goes
+/// through the session. It grants nothing new: the agent already holds the
+/// session token and can run `airlock exec` itself. The daemon resolves the
+/// real binary on the session's filtered `PATH`, built from the launcher's
+/// own `PATH` before this directory existed, so a shim never finds itself.
+///
+/// Written once at launch and removed on drop, when the agent exits.
+struct ShimDir {
+    path: PathBuf,
+}
+
+impl ShimDir {
+    fn create(path: PathBuf, airlock: &Path, tools: &[&str]) -> std::io::Result<Self> {
+        use std::io::Write;
+        use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt};
+
+        if let Some(parent) = path.parent() {
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(parent)?;
+        }
+        std::fs::DirBuilder::new().mode(0o700).create(&path)?;
+        let shims = ShimDir { path };
+        for tool in tools {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .mode(0o500)
+                .open(shims.path.join(tool))?
+                .write_all(&shim_script(airlock, tool))?;
+        }
+        Ok(shims)
+    }
+}
+
+impl Drop for ShimDir {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.path);
+    }
+}
+
+fn shim_script(airlock: &Path, tool: &str) -> Vec<u8> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let mut script = b"#!/bin/sh\nexec ".to_vec();
+    script.extend(sh_quote(airlock.as_os_str().as_bytes()));
+    script.extend(b" exec -- ");
+    script.extend(sh_quote(tool.as_bytes()));
+    script.extend(b" \"$@\"\n");
+    script
+}
+
+/// Single-quotes `s` for `sh`, closing and reopening the quotes around
+/// each `'` it contains.
+fn sh_quote(s: &[u8]) -> Vec<u8> {
+    let mut out = vec![b'\''];
+    for &b in s {
+        if b == b'\'' {
+            out.extend(b"'\\''");
+        } else {
+            out.push(b);
+        }
+    }
+    out.push(b'\'');
+    out
+}
+
+fn prepend_path(env: &mut HashMap<String, String>, dir: &Path) {
+    let dir = dir.display().to_string();
+    let path = match env.get("PATH") {
+        Some(rest) if !rest.is_empty() => format!("{dir}:{rest}"),
+        _ => dir,
+    };
+    env.insert("PATH".to_string(), path);
 }
 
 /// Spawns a blocking watcher on the lease connection's raw socket. Resolves
@@ -955,5 +1064,51 @@ mod tests {
         // `sleep` has no SIGINT handler of its own, so the forwarded signal
         // kills it; a signal-terminated child has no exit code.
         assert_eq!(exit_code, ExitCode::FAILURE);
+    }
+
+    #[test]
+    fn shim_forwards_every_argument_verbatim_to_airlock_exec() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        // A stand-in `airlock` in a path that needs quoting, printing each
+        // argument it got on its own line.
+        let bin = tmp.path().join("it's a dir");
+        std::fs::create_dir(&bin).unwrap();
+        let airlock = bin.join("airlock");
+        std::fs::write(&airlock, "#!/bin/sh\nprintf '%s\\n' \"$@\"\n").unwrap();
+        std::fs::set_permissions(&airlock, std::fs::Permissions::from_mode(0o700)).unwrap();
+
+        let shims = ShimDir::create(tmp.path().join("shims/s1"), &airlock, &["git", "gh"]).unwrap();
+        let out = std::process::Command::new(shims.path.join("git"))
+            .args(["fetch", "a b", "$HOME", "it's", ""])
+            .output()
+            .unwrap();
+        assert!(out.status.success(), "{out:?}");
+        assert_eq!(
+            String::from_utf8(out.stdout).unwrap(),
+            "exec\n--\ngit\nfetch\na b\n$HOME\nit's\n\n"
+        );
+        assert!(shims.path.join("gh").exists());
+    }
+
+    #[test]
+    fn shim_dir_is_removed_on_drop() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("shims/s1");
+        drop(ShimDir::create(path.clone(), Path::new("/bin/airlock"), &["git"]).unwrap());
+        assert!(!path.exists());
+        assert!(tmp.path().join("shims").exists());
+    }
+
+    #[test]
+    fn prepend_path_puts_the_shims_first() {
+        let mut env = HashMap::from([("PATH".to_string(), "/usr/bin:/bin".to_string())]);
+        prepend_path(&mut env, Path::new("/s"));
+        assert_eq!(env["PATH"], "/s:/usr/bin:/bin");
+
+        let mut env = HashMap::new();
+        prepend_path(&mut env, Path::new("/s"));
+        assert_eq!(env["PATH"], "/s");
     }
 }

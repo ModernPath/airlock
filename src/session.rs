@@ -262,8 +262,10 @@ pub fn build_session_policy(
 }
 
 /// Tools this session's config declares, in display form (never the secret
-/// values themselves).
-pub fn tools_info(config: &Config) -> Vec<ToolInfo> {
+/// values themselves). Only `airlock run` puts shims on its agent's `PATH`,
+/// so `shim = true` reports as a shim only in a session with Airlock's own
+/// sandbox.
+pub fn tools_info(config: &Config, sandbox: SandboxKind) -> Vec<ToolInfo> {
     let mut names: Vec<&String> = config.tools.keys().collect();
     names.sort();
     names
@@ -286,6 +288,7 @@ pub fn tools_info(config: &Config) -> Vec<ToolInfo> {
                 description: t.description.clone(),
                 env,
                 proxy: t.proxy.is_some(),
+                shim: t.shim && sandbox == SandboxKind::Airlock,
             }
         })
         .collect()
@@ -890,6 +893,7 @@ mod tests {
             access: None,
             description: None,
             proxy: None,
+            shim: false,
         }
     }
 }

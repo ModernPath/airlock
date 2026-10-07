@@ -174,6 +174,16 @@ update to `SKILL.md` describing the new field.
 
 ## Feature backlog
 
+### Shim only selected subcommands
+
+`shim = true` routes every call of a tool through `airlock exec`, so every
+`git status` pays a daemon round trip, loses its terminal, and runs with the
+git tool's secrets (see [SECURITY.md](SECURITY.md#shims)). A subcommand list
+(`shim = ["fetch", "pull", "push", "ls-remote", "clone"]`) would forward only
+those and `exec` the real binary directly for the rest, which needs a parser
+that skips the global options that take a value (for git: `-C`, `-c`,
+`--git-dir`, `--work-tree`, `--namespace`, `--config-env`).
+
 ### Multi-value command sources
 
 **What.** Let one `[secrets.<label>]` command populate several labels from

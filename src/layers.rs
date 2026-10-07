@@ -1529,6 +1529,7 @@ fn merge_level(
                 description: winning.description.clone(),
                 proxy: winning.proxy,
                 routes: winning.routes.clone(),
+                shim: winning.shim,
                 r#override: false,
             },
         );

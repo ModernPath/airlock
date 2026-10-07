@@ -885,6 +885,11 @@ pub struct RawToolConfig {
     /// Egress routes. Required when `proxy = true`, rejected otherwise.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub routes: Vec<RawProxyRoute>,
+    /// Put a `<name>` shim first on the agent's `PATH` under `airlock run`,
+    /// so a plain `<name>` — typed by the agent or run by any program it
+    /// starts — goes through `airlock exec`.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub shim: bool,
     /// Local-layer-only: replace the repo's whole definition of a tool of
     /// the same name. A config error on a tool the repo does not define,
     /// and outside the local layer. Never set on the wire — the launcher
@@ -962,6 +967,20 @@ pub struct Config {
     /// with mode 0700 before spawning anything — config.rs never creates
     /// directories itself.
     pub tool_state_dirs: Vec<PathBuf>,
+}
+
+impl Config {
+    /// Names of the tools with `shim = true`, sorted.
+    pub fn shimmed_tools(&self) -> Vec<&str> {
+        let mut names: Vec<&str> = self
+            .tools
+            .iter()
+            .filter(|(_, t)| t.shim)
+            .map(|(name, _)| name.as_str())
+            .collect();
+        names.sort_unstable();
+        names
+    }
 }
 
 /// Fully resolved `[secrets.<label>]` entry.
@@ -1052,6 +1071,9 @@ pub struct ToolConfig {
 
     /// Egress policy when this is a proxy tool; `None` for ordinary tools.
     pub proxy: Option<ProxyPolicy>,
+
+    /// Whether `airlock run` shims this tool onto the agent's `PATH`.
+    pub shim: bool,
 }
 
 /// Resolved configuration for the `[agent]` section.
@@ -1764,6 +1786,7 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
             access: tool_access,
             description: raw_tool.description,
             proxy,
+            shim: raw_tool.shim,
         };
 
         tools.insert(name, tool_config);
@@ -4169,6 +4192,7 @@ extra_read = ["/etc/hosts"]
 extra_write = ["output"]
 timeout = 30
 description = "a test tool"
+shim = true
 
 [tools.mytool.env]
 TOK = { secret = "tok" }
@@ -4183,6 +4207,7 @@ LOG_LEVEL = "debug"
         assert_eq!(tool.extra_write, vec![config.sandbox_root.join("output")]);
         assert_eq!(tool.timeout, Some(Duration::from_secs(30)));
         assert_eq!(tool.description.as_deref(), Some("a test tool"));
+        assert!(tool.shim);
         assert!(matches!(
             tool.env.get("TOK"),
             Some(EnvValue::SecretRef(l)) if l == "tok"

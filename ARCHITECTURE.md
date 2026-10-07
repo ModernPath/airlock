@@ -27,7 +27,7 @@ src/
 ├── redact.rs        Aho-Corasick automaton, streaming redaction; the daemon-wide last-pass redactor
 ├── sandbox.rs       SandboxBackend trait, macOS Seatbelt, Linux Landlock
 ├── exec.rs          Filtered PATH, binary resolution and location check, env construction, child spawn
-├── run.rs           `airlock run`: launcher + agent sandbox orchestration
+├── run.rs           `airlock run`: launcher + agent sandbox orchestration, tool shims
 ├── launcher.rs       Shared launcher steps: discover, approve, resolve secrets, `Register`/`Reload`
 ├── daemon.rs        Daemonization, accept loop, per-connection dispatch across sessions
 ├── agent.rs          `airlock agent check` / `agent hook`
@@ -108,6 +108,10 @@ A **launcher** (`airlock run`, `session start`, `session reload`, and `trust`/`c
 ### Kits
 
 Kits ([src/kits.rs](src/kits.rs)) add a language toolchain's cache access to `airlock run`'s agent sandbox — a layer orthogonal to the harness profile. They are purely a `run`-time, launcher-side concept: `layers::merge` validates and resolves `[kits.*]`/`agent.kits` but **never puts the `[kits.*]` option tables on the wire** (`agent.kits`, the plain name list, does ride along on `RawAgentConfig`, unused by the daemon, so it and the resolved option tables both feed the agent hash `session reload` checks). `kits::expand_all` is the one pure function that turns an active kit list into concrete paths and env — called from `launcher::prepare` (for `run`) and from `inspect::config_cmd`'s own display, never from `layers::merge`, which reads no environment by design. A kit's write dirs/files are folded into `write_grants` before the anchor and filtered-`PATH` checks in step 4 above, so no separate check was needed for them.
+
+### Tool shims
+
+`shim = true` on a tool is, like kits, a `run`-time concept the daemon only reports. After registering, `run_agent` ([src/run.rs](src/run.rs)) writes one `sh` script per shimmed tool into `$XDG_CACHE_HOME/airlock/shims/<session-id>`, each `exec`ing this very binary (`current_exe`, canonicalized) as `airlock exec -- <tool> "$@"`. It puts that directory first on the agent's `PATH`, grants the agent read on it and on the binary, and removes it when the agent exits. The daemon resolves the real tool on the session's filtered `PATH`, computed from the launcher's own `PATH` before the shim directory existed, so a shim can never resolve to itself. The shimmed names are part of the agent hash, since the scripts are written once at launch. `tools list` reports a tool as shimmed only for a session registered with Airlock's own sandbox (`SandboxKind::Airlock`), the only kind `run` creates.
 
 ## Sessions
 

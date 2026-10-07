@@ -326,9 +326,11 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     // option tables, so a kit's `mode` changing (not just the active list,
     // already part of `raw_config.agent.kits`) also changes the hash —
     // `session reload` uses it to decide whether to print "restart the
-    // agent to apply them".
-    let agent_bytes = serde_json::to_vec(&(&raw_config.agent, merged.kits()))
-        .expect("RawAgentConfig and the kits map always serialize");
+    // agent to apply them". The shimmed tool names are in it too: `run`
+    // writes the shims once, at launch.
+    let agent_bytes =
+        serde_json::to_vec(&(&raw_config.agent, merged.kits(), config.shimmed_tools()))
+            .expect("RawAgentConfig, the kits map and the shim names always serialize");
     let agent_hash = config::sha256_hex(&agent_bytes);
 
     Ok(Prepared {
