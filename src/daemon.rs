@@ -1176,6 +1176,41 @@ type Reader =
     tokio_util::codec::FramedRead<tokio::net::unix::OwnedReadHalf, tokio_util::codec::LinesCodec>;
 type Writer = tokio::net::unix::OwnedWriteHalf;
 
+/// The one way a connection's replies leave the daemon. Every message goes
+/// through [`write_ndjson_message`] with the daemon-wide redactor and, once
+/// a session is in scope, that session's own — so no handler can send an
+/// `Error` that skips redaction by passing the wrong arguments.
+struct Responder {
+    writer: Writer,
+    global: Arc<Redactor>,
+    session: Option<Arc<Redactor>>,
+}
+
+impl Responder {
+    fn new(writer: Writer, global: Arc<Redactor>) -> Self {
+        Responder {
+            writer,
+            global,
+            session: None,
+        }
+    }
+
+    async fn send(&mut self, msg: &DaemonMessage) -> std::io::Result<()> {
+        write_ndjson_message(&mut self.writer, msg, &self.global, self.session.as_deref()).await
+    }
+
+    /// Sends an `Error`. A failed write is ignored: the caller is about to
+    /// stop serving this connection either way.
+    async fn error(&mut self, kind: ErrorKind, message: impl Into<String>) {
+        let _ = self
+            .send(&DaemonMessage::Error {
+                kind,
+                message: message.into(),
+            })
+            .await;
+    }
+}
+
 /// Handle a single client connection: peer-uid check, handshake, one
 /// request, dispatch.
 async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonState>) {
@@ -1194,14 +1229,14 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonSta
         return;
     }
 
-    let (reader, mut writer) = stream.into_split();
+    let (reader, writer) = stream.into_split();
     let mut framed: Reader = FramedRead::new(
         reader,
         LinesCodec::new_with_max_length(protocol::MAX_ADMIN_LINE_BYTES),
     );
     // No session is resolved yet on this path, so only the daemon-wide
     // redactor applies to any `Error` sent before one is.
-    let global_redactor = state.global_redactor_snapshot();
+    let mut responder = Responder::new(writer, state.global_redactor_snapshot());
 
     let hello_line = match framed.next().await {
         Some(Ok(line)) => line,
@@ -1219,28 +1254,21 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonSta
         mode: state.mode,
         sessions: state.sessions.count() as u32,
     };
-    if write_ndjson_message(&mut writer, &our_hello, &global_redactor, None)
-        .await
-        .is_err()
-    {
+    if responder.send(&our_hello).await.is_err() {
         return;
     }
 
     if hello.protocol != protocol::PROTOCOL_VERSION {
-        let _ = write_ndjson_message(
-            &mut writer,
-            &DaemonMessage::Error {
-                kind: ErrorKind::IncompatibleProtocol,
-                message: format!(
+        responder
+            .error(
+                ErrorKind::IncompatibleProtocol,
+                format!(
                     "daemon speaks protocol {}, client speaks {}",
                     protocol::PROTOCOL_VERSION,
                     hello.protocol
                 ),
-            },
-            &global_redactor,
-            None,
-        )
-        .await;
+            )
+            .await;
         return;
     }
 
@@ -1251,16 +1279,9 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonSta
     let request: Request = match serde_json::from_str(line.trim()) {
         Ok(r) => r,
         Err(e) => {
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Malformed,
-                    message: format!("malformed request: {e}"),
-                },
-                &global_redactor,
-                None,
-            )
-            .await;
+            responder
+                .error(ErrorKind::Malformed, format!("malformed request: {e}"))
+                .await;
             return;
         }
     };
@@ -1271,74 +1292,50 @@ async fn handle_connection(stream: tokio::net::UnixStream, state: &Arc<DaemonSta
             | (Auth::Session { .. }, RequestBody::Session(_))
     );
     if !family_ok {
-        let _ = write_ndjson_message(
-            &mut writer,
-            &DaemonMessage::Error {
-                kind: ErrorKind::Unauthorized,
-                message: "request family does not match the presented credential".to_string(),
-            },
-            &global_redactor,
-            None,
-        )
-        .await;
+        responder
+            .error(
+                ErrorKind::Unauthorized,
+                "request family does not match the presented credential".to_string(),
+            )
+            .await;
         return;
     }
     if matches!(request.auth, Auth::Session { .. }) && line.len() > protocol::MAX_SESSION_LINE_BYTES
     {
-        let _ = write_ndjson_message(
-            &mut writer,
-            &DaemonMessage::Error {
-                kind: ErrorKind::Malformed,
-                message: "request exceeds the session family's maximum size".to_string(),
-            },
-            &global_redactor,
-            None,
-        )
-        .await;
+        responder
+            .error(
+                ErrorKind::Malformed,
+                "request exceeds the session family's maximum size".to_string(),
+            )
+            .await;
         return;
     }
 
     match request.auth {
         Auth::Admin { token } => {
             if !token.ct_eq(&state.admin_token) {
-                let _ = write_ndjson_message(
-                    &mut writer,
-                    &DaemonMessage::Error {
-                        kind: ErrorKind::Unauthorized,
-                        message: "invalid admin token".to_string(),
-                    },
-                    &global_redactor,
-                    None,
-                )
-                .await;
+                responder
+                    .error(ErrorKind::Unauthorized, "invalid admin token".to_string())
+                    .await;
                 return;
             }
             let RequestBody::Admin(req) = request.body else {
                 unreachable!("family checked above")
             };
-            handle_admin_request(req, state, peer_pid, framed, writer).await;
+            handle_admin_request(req, state, peer_pid, framed, responder).await;
         }
         Auth::Session { token } => {
             let session = match resolve_session(state, &token, peer_pid) {
                 Ok(s) => s,
                 Err(kind) => {
-                    let _ = write_ndjson_message(
-                        &mut writer,
-                        &DaemonMessage::Error {
-                            kind,
-                            message: session_error_message(kind),
-                        },
-                        &global_redactor,
-                        None,
-                    )
-                    .await;
+                    responder.error(kind, session_error_message(kind)).await;
                     return;
                 }
             };
             let RequestBody::Session(req) = request.body else {
                 unreachable!("family checked above")
             };
-            handle_session_request(req, state, session, framed, writer).await;
+            handle_session_request(req, state, session, framed, responder).await;
         }
     }
 }
@@ -1403,32 +1400,27 @@ async fn handle_admin_request(
     state: &Arc<DaemonState>,
     peer_pid: i32,
     framed: Reader,
-    mut writer: Writer,
+    mut responder: Responder,
 ) {
-    let global_redactor = state.global_redactor_snapshot();
     match req {
-        AdminRequest::Register(reg) => handle_register(*reg, state, peer_pid, framed, writer).await,
+        AdminRequest::Register(reg) => {
+            handle_register(*reg, state, peer_pid, framed, responder).await
+        }
         AdminRequest::Reload { session, payload } => {
             let reply = handle_reload(&session, *payload, state).await;
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         AdminRequest::ListSessions => {
             let sessions = state.sessions.list().iter().map(|s| s.info()).collect();
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Sessions { sessions },
-                &global_redactor,
-                None,
-            )
-            .await;
+            let _ = responder.send(&DaemonMessage::Sessions { sessions }).await;
         }
         AdminRequest::Revoke { sessions } => {
             let reply = handle_revoke(&sessions, state);
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         AdminRequest::Renew { session, ttl_secs } => {
             let reply = handle_renew(&session, ttl_secs, state);
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         AdminRequest::Tools { session } => {
             let reply = match state.sessions.resolve_ref(&session) {
@@ -1444,7 +1436,7 @@ async fn handle_admin_request(
                     message: msg,
                 },
             };
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         AdminRequest::Logs { session } => {
             let entries = state.ring_buffer.entries();
@@ -1455,17 +1447,12 @@ async fn handle_admin_request(
                     .collect(),
                 None => entries,
             };
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::LogsResponse { entries },
-                &global_redactor,
-                None,
-            )
-            .await;
+            let _ = responder
+                .send(&DaemonMessage::LogsResponse { entries })
+                .await;
         }
         AdminRequest::Stop => {
-            let _ =
-                write_ndjson_message(&mut writer, &DaemonMessage::Ok, &global_redactor, None).await;
+            let _ = responder.send(&DaemonMessage::Ok).await;
             state
                 .ring_buffer
                 .log("stop requested over the admin connection");
@@ -1495,7 +1482,7 @@ async fn handle_register(
     state: &Arc<DaemonState>,
     peer_pid: i32,
     mut framed: Reader,
-    mut writer: Writer,
+    mut responder: Responder,
 ) {
     use tokio_stream::StreamExt;
 
@@ -1506,8 +1493,6 @@ async fn handle_register(
     state.registrations_in_flight.fetch_add(1, Ordering::SeqCst);
     state.note_activity();
     let _registration_guard = RegistrationGuard(state);
-
-    let global_redactor = state.global_redactor_snapshot();
 
     let protocol::RegisterRequest {
         payload,
@@ -1527,16 +1512,12 @@ async fn handle_register(
     let anchor = match anchor {
         Ok(a) => a,
         Err(e) => {
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Internal,
-                    message: format!("failed to resolve the session's anchor process: {e}"),
-                },
-                &global_redactor,
-                None,
-            )
-            .await;
+            responder
+                .error(
+                    ErrorKind::Internal,
+                    format!("failed to resolve the session's anchor process: {e}"),
+                )
+                .await;
             return;
         }
     };
@@ -1558,16 +1539,7 @@ async fn handle_register(
     ) {
         Ok(p) => p,
         Err(e) => {
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Internal,
-                    message: e,
-                },
-                &global_redactor,
-                None,
-            )
-            .await;
+            responder.error(ErrorKind::Internal, e).await;
             return;
         }
     };
@@ -1620,17 +1592,14 @@ async fn handle_register(
         token,
         ca_path,
     };
-    if write_ndjson_message(&mut writer, &reply, &global_redactor, None)
-        .await
-        .is_err()
-    {
+    if responder.send(&reply).await.is_err() {
         // The launcher vanished before the reply landed; treat exactly like
         // a lease that closed immediately.
         state.end_session(&id, EndedReason::LeaseClosed);
         return;
     }
 
-    // `writer` stays alive until this function returns: dropping an
+    // `responder` stays alive until this function returns: dropping its
     // `OwnedWriteHalf` shuts down the write side, and the launcher reads
     // that EOF as the lease ending.
     if is_lease {
@@ -1780,9 +1749,8 @@ async fn handle_session_request(
     state: &Arc<DaemonState>,
     session: Arc<Session>,
     framed: Reader,
-    mut writer: Writer,
+    mut responder: Responder,
 ) {
-    let global_redactor = state.global_redactor_snapshot();
     match req {
         SessionRequest::List => {
             let policy = session.current_policy();
@@ -1790,7 +1758,7 @@ async fn handle_session_request(
                 session: session.info(),
                 tools: session::tools_info(&policy.config),
             };
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         SessionRequest::Check => {
             let policy = session.current_policy();
@@ -1801,10 +1769,10 @@ async fn handle_session_request(
                 secret_env_names: session::secret_env_names(&policy.config),
                 credential_paths: session::credential_paths(&policy.config),
             };
-            let _ = write_ndjson_message(&mut writer, &reply, &global_redactor, None).await;
+            let _ = responder.send(&reply).await;
         }
         SessionRequest::Exec { tool, args, cwd } => {
-            handle_exec_request(tool, args, cwd, state, session, framed, writer).await;
+            handle_exec_request(tool, args, cwd, state, session, framed, responder).await;
         }
     }
 }
@@ -1992,37 +1960,34 @@ async fn handle_exec_request(
     state: &Arc<DaemonState>,
     session: Arc<Session>,
     mut framed: Reader,
-    mut writer: Writer,
+    mut responder: Responder,
 ) {
     use tokio::io::AsyncWriteExt;
     use tokio_stream::StreamExt;
     use tokio_util::codec::LinesCodecError;
 
-    // Fetched once, up front, so every `Error` this request can send — even
-    // one refused before a tool is ever started, like a stale secret's
-    // refresh-failure reason below — can be passed through this session's
-    // own redactor. `policy_redactor` outlives `StartedTool::session_redactor`,
-    // which gets moved into the output pipeline once a tool actually spawns.
+    // Set once, up front, so every `Error` this request can send — even one
+    // refused before a tool is ever started, like a stale secret's
+    // refresh-failure reason below — passes through this session's own
+    // redactor too.
     let policy = session.current_policy();
-    let policy_redactor = Arc::clone(&policy.redactor.read().unwrap_or_else(|e| e.into_inner()));
+    responder.session = Some(Arc::clone(
+        &policy.redactor.read().unwrap_or_else(|e| e.into_inner()),
+    ));
 
     let permit = match Arc::clone(&session.exec_permits).try_acquire_owned() {
         Ok(p) => p,
         Err(_) => {
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Busy,
-                    message: format!(
+            responder
+                .error(
+                    ErrorKind::Busy,
+                    format!(
                         "session {} is already running {} concurrent execs",
                         session.id,
                         session::EXEC_CAP
                     ),
-                },
-                &state.global_redactor_snapshot(),
-                Some(&policy_redactor),
-            )
-            .await;
+                )
+                .await;
             return;
         }
     };
@@ -2040,20 +2005,14 @@ async fn handle_exec_request(
                 session.id.as_str(),
                 format!("exec {tool:?} refused: {}", e.message),
             );
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: e.kind,
-                    message: e.message,
-                },
-                &state.global_redactor_snapshot(),
-                Some(&policy_redactor),
-            )
-            .await;
+            responder.error(e.kind, e.message).await;
             return;
         }
     };
 
+    // The snapshot taken alongside the tool's secrets covers its output and
+    // everything sent after it.
+    responder.global = Arc::clone(&global_redactor);
     session.execs.fetch_add(1, Ordering::Relaxed);
 
     let pid = spawned.pid;
@@ -2100,14 +2059,14 @@ async fn handle_exec_request(
 
             data = stdout_rx.recv(), if !stdout_done => {
                 match data {
-                    Some(bytes) => send_output(&mut writer, &bytes, &global_redactor, stdout_message).await,
+                    Some(bytes) => send_output(&mut responder, &bytes, stdout_message).await,
                     None => stdout_done = true,
                 }
             }
 
             data = stderr_rx.recv(), if !stderr_done => {
                 match data {
-                    Some(bytes) => send_output(&mut writer, &bytes, &global_redactor, stderr_message).await,
+                    Some(bytes) => send_output(&mut responder, &bytes, stderr_message).await,
                     None => stderr_done = true,
                 }
             }
@@ -2166,29 +2125,11 @@ async fn handle_exec_request(
             let _ = stdout_task.await;
             let _ = stderr_task.await;
 
-            drain_channel_to_client(
-                &mut stdout_rx,
-                &mut writer,
-                &global_redactor,
-                stdout_message,
-            )
-            .await;
-            drain_channel_to_client(
-                &mut stderr_rx,
-                &mut writer,
-                &global_redactor,
-                stderr_message,
-            )
-            .await;
+            drain_channel_to_client(&mut stdout_rx, &mut responder, stdout_message).await;
+            drain_channel_to_client(&mut stderr_rx, &mut responder, stderr_message).await;
 
             let code = exit_code_from_status(status);
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Exit { code },
-                &global_redactor,
-                None,
-            )
-            .await;
+            let _ = responder.send(&DaemonMessage::Exit { code }).await;
             state.ring_buffer.log_session(
                 session.id.as_str(),
                 format!("tool {tool:?} exited (PID: {pid}, code: {code})"),
@@ -2196,13 +2137,7 @@ async fn handle_exec_request(
         }
         TermReason::ChildWaitError(e) => {
             let _ = exec::kill_process_group(pid, libc::SIGKILL);
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Exit { code: -1 },
-                &global_redactor,
-                None,
-            )
-            .await;
+            let _ = responder.send(&DaemonMessage::Exit { code: -1 }).await;
             state.ring_buffer.log_session(
                 session.id.as_str(),
                 format!("tool {tool:?} wait error (PID: {pid}): {e}"),
@@ -2218,16 +2153,7 @@ async fn handle_exec_request(
                 "tool {tool:?} timed out after {} seconds",
                 timeout.as_secs()
             );
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Internal,
-                    message: msg,
-                },
-                &global_redactor,
-                Some(&policy_redactor),
-            )
-            .await;
+            responder.error(ErrorKind::Internal, msg).await;
         }
         TermReason::ClientDisconnect => {
             state.ring_buffer.log_session(
@@ -2239,23 +2165,13 @@ async fn handle_exec_request(
         TermReason::ClientLineOverflow => {
             state.ring_buffer.log_session(session.id.as_str(), format!("client sent an oversized stdin line during tool {tool:?} (PID: {pid}); terminating"));
             sigterm_then_sigkill(&mut child, pid).await;
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Error {
-                    kind: ErrorKind::Malformed,
-                    message: "stdin line exceeds maximum length".to_string(),
-                },
-                &global_redactor,
-                Some(&policy_redactor),
-            )
-            .await;
-            let _ = write_ndjson_message(
-                &mut writer,
-                &DaemonMessage::Exit { code: -1 },
-                &global_redactor,
-                None,
-            )
-            .await;
+            responder
+                .error(
+                    ErrorKind::Malformed,
+                    "stdin line exceeds maximum length".to_string(),
+                )
+                .await;
+            let _ = responder.send(&DaemonMessage::Exit { code: -1 }).await;
         }
     }
 
@@ -2280,28 +2196,26 @@ async fn sigterm_then_sigkill(child: &mut tokio::process::Child, pid: u32) {
     }
 }
 
-async fn drain_channel_to_client<W: tokio::io::AsyncWriteExt + Unpin>(
+async fn drain_channel_to_client(
     rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
-    writer: &mut W,
-    global_redactor: &Redactor,
+    responder: &mut Responder,
     message: fn(String) -> DaemonMessage,
 ) {
     while let Ok(bytes) = rx.try_recv() {
-        send_output(writer, &bytes, global_redactor, message).await;
+        send_output(responder, &bytes, message).await;
     }
 }
 
 /// Send one chunk of output that [`spawn_redaction_pipeline`] has already
 /// redacted to the client.
-async fn send_output<W: tokio::io::AsyncWriteExt + Unpin>(
-    writer: &mut W,
+async fn send_output(
+    responder: &mut Responder,
     bytes: &[u8],
-    global_redactor: &Redactor,
     message: fn(String) -> DaemonMessage,
 ) {
     let text = redact::bytes_to_lossy_utf8(bytes);
     if !text.is_empty() {
-        let _ = write_ndjson_message(writer, &message(text), global_redactor, None).await;
+        let _ = responder.send(&message(text)).await;
     }
 }
 
