@@ -44,6 +44,37 @@ pub enum NetworkAccess {
     ProxyOnly(u16),
 }
 
+/// How much of the system's dynamic-linking and toolchain filesystem a tool
+/// gets, independent of its config-granted `read_paths`/`read_write_paths`.
+///
+/// Governs only the built-in baseline that `emit_common_rules`/
+/// `build_landlock_profile` add on top of a tool's explicit grants (project
+/// root, `[filesystem]`, `extra_read`/`extra_write`, the tool binary itself,
+/// a proxy tool's CA file) — none of those are affected by this setting.
+/// The agent's own sandbox profile is never governed by this type; it always
+/// gets the equivalent of [`System`](ToolAccess::System).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolAccess {
+    /// The tool's own binary plus the bare minimum any dynamically linked
+    /// program needs to start and exit: the dynamic linker, the shared
+    /// library cache it loads from, and `/dev/null`. Nothing else of the
+    /// system — no `/etc`, no `/usr/share`, no other system binaries.
+    None,
+    /// Today's baseline: system libraries, binaries, shared data, and
+    /// configuration (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,
+    /// random,urandom}`, ...) on macOS; the equivalent fixed path list on
+    /// Linux.
+    System,
+    /// [`System`](ToolAccess::System) plus read-only toolchain roots (`/nix/store`,
+    /// `/opt/homebrew`, `/usr/local`, `/opt/local`,
+    /// `/home/linuxbrew/.linuxbrew`) so dynamically linked tools installed
+    /// by Nix, Homebrew, MacPorts, or Linuxbrew can load their libraries.
+    /// The default when `access` is unset anywhere in config — a deliberate
+    /// widening over the pre-`access` baseline.
+    #[default]
+    Default,
+}
+
 /// Describes what a tool is allowed to access.
 ///
 /// Used as input to a `SandboxBackend` to produce a `SandboxProfile`.
@@ -72,6 +103,9 @@ pub struct ToolPolicy {
     /// Set by the daemon after binary resolution; `None` in unit tests that
     /// don't exercise the full daemon flow.
     pub binary_path: Option<PathBuf>,
+    /// How much of the system's dynamic-linking and toolchain filesystem
+    /// this tool gets. Defaults to [`ToolAccess::Default`].
+    pub access: ToolAccess,
     /// The daemon's runtime directory (holds the socket, PID file,
     /// `admin.token`, and session CA certs), when known.
     ///
@@ -186,6 +220,28 @@ const _: fn() = || {
     fn assert_send_sync_static<T: Send + Sync + 'static>() {}
     assert_send_sync_static::<SandboxProfile>();
 };
+
+/// Read-only toolchain roots granted to a tool at [`ToolAccess::Default`],
+/// and reused by `run::detect_toolchain_paths` for the agent's own
+/// (unconditional) toolchain grant — one constant so the two lists cannot
+/// drift apart.
+///
+/// Nix (`/nix/store`), Homebrew on Apple Silicon (`/opt/homebrew`) and on
+/// Intel/Linuxbrew (`/usr/local`, `/home/linuxbrew/.linuxbrew`), and
+/// MacPorts (`/opt/local`) all install dynamically linked binaries whose
+/// shared libraries live outside the standard system directories; without
+/// read access here, such a binary fails to load under the sandbox with
+/// "Library not loaded ... (blocked by sandbox)" (macOS) or an equivalent
+/// linker error (Linux). A nonexistent root is harmless to grant — macOS
+/// Seatbelt does not require a path to exist, and Landlock already skips
+/// missing paths (`PathFd::new` fails with `ENOENT`).
+pub(crate) const TOOLCHAIN_ROOTS: &[&str] = &[
+    "/nix/store",
+    "/opt/homebrew",
+    "/usr/local",
+    "/opt/local",
+    "/home/linuxbrew/.linuxbrew",
+];
 
 // ─── Platform type aliases ────────────────────────────────────────────────────
 
@@ -347,7 +403,8 @@ pub mod macos {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile, ToolPolicy,
+        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile,
+        TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
     };
 
     // ─── FFI bindings ────────────────────────────────────────────────────────
@@ -622,28 +679,77 @@ pub mod macos {
         // `file-read*` on the root literal grants this without exposing any
         // file contents in subdirectories (those require separate subpath rules).
         out.push_str("(allow file-read* (literal \"/\"))\n");
+    }
 
-        // ── System read paths (always allowed, read-only) ───────────────────
-        // These are macOS system directories that virtually every program
-        // needs at runtime. They contain no user secrets — only OS
-        // frameworks, shared libraries, certificates, and configuration.
-        //
-        //  /usr/lib       — system shared libraries (libSystem, dyld stubs)
-        //  /usr/bin       — system binaries (ls, git, ssh, curl, ...)
-        //  /usr/sbin      — system admin binaries
-        //  /usr/share     — shared data (locale, timezone, terminfo)
-        //  /bin           — core binaries (sh, ls, cat, ...)
-        //  /sbin          — core admin binaries
-        //  /System        — OS frameworks, Security.framework trust stores,
-        //                   system keychains (SystemRootCertificates.keychain)
-        //  /Library       — system-wide frameworks, keychains, CA certs
-        //  /private/etc   — system configuration (ssl/openssl.cnf, hosts,
-        //                   resolv.conf); canonical path of /etc symlink
-        //  /dev/null      — required by many programs for I/O redirection
-        //                   (read and write: shells open it O_WRONLY for 2>/dev/null)
-        //  /dev/zero      — source of zero bytes; many programs read it
-        //  /dev/random    — cryptographic random number generation
-        //  /dev/urandom   — non-blocking random number generation
+    /// The dyld shared cache directory, tried in both its modern
+    /// cryptex-mounted location and the pre-cryptex location on older
+    /// macOS releases. `libSystem` lives inside the cache rather than as a
+    /// standalone file, so [`ToolAccess::None`] needs read access to it —
+    /// without it, even `/bin/echo` fails with "Library not loaded" before
+    /// `main()` runs. A path that doesn't exist on the running release is
+    /// harmless to list — see [`TOOLCHAIN_ROOTS`]'s doc comment.
+    const MACOS_DYLD_SHARED_CACHE_DIRS: &[&str] = &[
+        "/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld",
+        "/System/Library/dyld",
+    ];
+
+    /// Emit the filesystem rules for [`ToolAccess::None`]: read access to
+    /// the dynamic linker and the shared library cache it loads from (plus
+    /// the ancestor metadata needed to traverse down to both), and
+    /// `/dev/null` read+write with the ioctl/char-device rules shells and
+    /// libc need for `2>/dev/null`-style redirection. Nothing else of the
+    /// system.
+    ///
+    /// Verified empirically with `sandbox-exec`: a profile containing
+    /// exactly these rules (plus what `emit_common_rules` always emits —
+    /// process ops, sysctl, Mach lookups, and the root-directory literal)
+    /// runs `/bin/echo hi` successfully, while `cat /etc/hosts` and
+    /// `ls /usr/share` both fail with "Operation not permitted".
+    fn emit_none_filesystem_baseline(out: &mut String) -> Result<(), SandboxError> {
+        let dyld = Path::new("/usr/lib/dyld");
+        emit_ancestor_rules(dyld, out)?;
+        let escaped = escape_path(dyld)?;
+        out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+
+        for cache_dir in MACOS_DYLD_SHARED_CACHE_DIRS {
+            let path = Path::new(cache_dir);
+            emit_ancestor_rules(path, out)?;
+            let escaped = escape_path(path)?;
+            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+        }
+
+        out.push_str("(allow file-read* (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-write* (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-read-metadata (literal \"/dev\"))\n");
+        out.push_str("(allow file-ioctl (literal \"/dev/null\"))\n");
+        out.push_str("(allow file-ioctl file-read-data file-write-data\n");
+        out.push_str("  (require-all\n");
+        out.push_str("    (literal \"/dev/null\")\n");
+        out.push_str("    (vnode-type CHARACTER-DEVICE)))\n");
+        Ok(())
+    }
+
+    /// Emit the filesystem rules [`ToolAccess::System`] adds on top of
+    /// [`ToolAccess::None`] — today's baseline, unchanged from before
+    /// `access` existed: system libraries, binaries, shared data, and
+    /// configuration. They contain no user secrets — only OS frameworks,
+    /// shared libraries, certificates, and configuration.
+    ///
+    ///  /usr/lib       — system shared libraries (libSystem, dyld stubs)
+    ///  /usr/bin       — system binaries (ls, git, ssh, curl, ...)
+    ///  /usr/sbin      — system admin binaries
+    ///  /usr/share     — shared data (locale, timezone, terminfo)
+    ///  /bin           — core binaries (sh, ls, cat, ...)
+    ///  /sbin          — core admin binaries
+    ///  /System        — OS frameworks, Security.framework trust stores,
+    ///                   system keychains (SystemRootCertificates.keychain)
+    ///  /Library       — system-wide frameworks, keychains, CA certs
+    ///  /private/etc   — system configuration (ssl/openssl.cnf, hosts,
+    ///                   resolv.conf); canonical path of /etc symlink
+    ///  /dev/zero      — source of zero bytes; many programs read it
+    ///  /dev/random    — cryptographic random number generation
+    ///  /dev/urandom   — non-blocking random number generation
+    fn emit_system_filesystem_baseline(out: &mut String) {
         out.push_str("(allow file-read* (subpath \"/usr/lib\"))\n");
         out.push_str("(allow file-read* (subpath \"/usr/bin\"))\n");
         out.push_str("(allow file-read* (subpath \"/usr/sbin\"))\n");
@@ -654,7 +760,6 @@ pub mod macos {
         out.push_str("(allow file-read* (subpath \"/Library\"))\n");
         out.push_str("(allow file-read* (subpath \"/private/etc\"))\n");
         out.push_str("(allow file-read* (subpath \"/etc\"))\n");
-        out.push_str("(allow file-read* (literal \"/dev/null\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/zero\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/random\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/urandom\"))\n");
@@ -665,26 +770,52 @@ pub mod macos {
         // focused on real problems.
         out.push_str("(allow file-read* (literal \"/dev/dtracehelper\"))\n");
         out.push_str("(allow file-read* (literal \"/dev/autofs_nowait\"))\n");
-        out.push_str("(allow file-write* (literal \"/dev/null\"))\n");
         // Ancestor metadata for path traversal into the above directories.
+        // (/dev's own metadata rule is part of the None baseline already.)
         out.push_str("(allow file-read-metadata (literal \"/usr\"))\n");
         out.push_str("(allow file-read-metadata (literal \"/private\"))\n");
-        out.push_str("(allow file-read-metadata (literal \"/dev\"))\n");
 
         // ── File I/O on device files ──────────────────────────────────────────
         // Programs commonly call ioctl() on standard device nodes. Without
         // these rules the sandbox returns EPERM even for benign operations
         // (e.g. querying the terminal window size on /dev/tty).
-        out.push_str("(allow file-ioctl (literal \"/dev/null\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/zero\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/random\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/urandom\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/dtracehelper\"))\n");
         out.push_str("(allow file-ioctl (literal \"/dev/tty\"))\n");
-        out.push_str("(allow file-ioctl file-read-data file-write-data\n");
-        out.push_str("  (require-all\n");
-        out.push_str("    (literal \"/dev/null\")\n");
-        out.push_str("    (vnode-type CHARACTER-DEVICE)))\n");
+    }
+
+    /// Emit the filesystem rules [`ToolAccess::Default`] adds on top of
+    /// [`ToolAccess::System`]: read-only access to [`TOOLCHAIN_ROOTS`].
+    fn emit_toolchain_filesystem_baseline(out: &mut String) -> Result<(), SandboxError> {
+        for root in TOOLCHAIN_ROOTS {
+            let path = Path::new(root);
+            emit_ancestor_rules(path, out)?;
+            let escaped = escape_path(path)?;
+            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+        }
+        Ok(())
+    }
+
+    /// Emit the tool filesystem baseline for the given [`ToolAccess`]
+    /// level: [`emit_none_filesystem_baseline`] always, plus
+    /// [`emit_system_filesystem_baseline`] at `System` and `Default`, plus
+    /// [`emit_toolchain_filesystem_baseline`] at `Default` only.
+    fn emit_tool_filesystem_baseline(
+        access: ToolAccess,
+        out: &mut String,
+    ) -> Result<(), SandboxError> {
+        emit_none_filesystem_baseline(out)?;
+        match access {
+            ToolAccess::None => {}
+            ToolAccess::System => emit_system_filesystem_baseline(out),
+            ToolAccess::Default => {
+                emit_system_filesystem_baseline(out);
+                emit_toolchain_filesystem_baseline(out)?;
+            }
+        }
+        Ok(())
     }
 
     /// Emit SBPL filesystem read and write rules for the given path lists.
@@ -859,6 +990,7 @@ pub mod macos {
         // Tool profiles restrict signal and process-info scope to the process
         // itself — tools run as single processes, not process trees.
         emit_common_rules("self", &mut out);
+        emit_tool_filesystem_baseline(policy.access, &mut out)?;
 
         // ── Binary executable read access ────────────────────────────────────
         // On macOS, Security.framework re-reads the process's own binary at
@@ -932,6 +1064,11 @@ pub mod macos {
         // the profile. Tool profiles use `(target self)` instead, which is
         // narrower and appropriate for single-process tools.
         emit_common_rules("same-sandbox", &mut out);
+        // The agent's own sandbox baseline is never governed by `ToolAccess`
+        // (that type exists for tools only) — it always gets the `None` plus
+        // `System` filesystem baseline, unchanged from before `access` existed.
+        emit_none_filesystem_baseline(&mut out)?;
+        emit_system_filesystem_baseline(&mut out);
 
         // ── Agent-only system permissions ─────────────────────────────────────
         // User preferences (NSUserDefaults) and distributed notifications are
@@ -1302,15 +1439,24 @@ pub mod macos {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
+        use super::super::{
+            NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
+        };
         use super::MacOSSeatbelt;
 
+        // These helpers pin `access: ToolAccess::System` explicitly rather
+        // than relying on `ToolAccess::default()` (`Default`, which also
+        // grants `TOOLCHAIN_ROOTS`) — every test written before `access`
+        // existed assumed exactly today's unconditional baseline, and that
+        // assumption must keep holding regardless of what the default
+        // level becomes. Tests for `None`/`Default` set `access` explicitly.
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -1321,6 +1467,7 @@ pub mod macos {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -1331,6 +1478,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -1341,6 +1489,7 @@ pub mod macos {
                 read_write_paths: vec![],
                 network: NetworkAccess::Full,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -1416,6 +1565,84 @@ pub mod macos {
                 sbpl.contains("\"hw.pagesize\""),
                 "SBPL sysctl-read block should include hw.pagesize, got: {sbpl}"
             );
+        }
+
+        // ── ToolAccess levels (pure SBPL-text checks) ────────────────────────
+
+        fn policy_with_access(access: ToolAccess) -> ToolPolicy {
+            ToolPolicy {
+                access,
+                network: NetworkAccess::None,
+                ..Default::default()
+            }
+        }
+
+        #[test]
+        fn access_none_grants_dyld_but_no_usr_share_or_private_etc() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::None));
+            assert!(
+                sbpl.contains("/usr/lib/dyld"),
+                "ToolAccess::None should grant the dynamic linker, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains("dyld"),
+                "ToolAccess::None should grant the dyld shared cache, got:\n{sbpl}"
+            );
+            assert!(
+                sbpl.contains("(allow file-read* (literal \"/dev/null\"))"),
+                "ToolAccess::None should grant /dev/null read, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("/usr/share"),
+                "ToolAccess::None must not contain a /usr/share subpath, got:\n{sbpl}"
+            );
+            assert!(
+                !sbpl.contains("/private/etc"),
+                "ToolAccess::None must not contain a /private/etc subpath, got:\n{sbpl}"
+            );
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    !sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::None must not grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_system_grants_usr_share_but_no_toolchain_roots() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::System));
+            for path in &["/usr/lib", "/usr/share", "/private/etc", "/etc"] {
+                assert!(
+                    sbpl.contains(&format!("(allow file-read* (subpath \"{path}\"))")),
+                    "ToolAccess::System should grant {path}, got:\n{sbpl}"
+                );
+            }
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    !sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::System must not grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_default_grants_system_baseline_plus_toolchain_roots() {
+            let sbpl = sbpl_from_profile(&policy_with_access(ToolAccess::Default));
+            assert!(
+                sbpl.contains("(allow file-read* (subpath \"/usr/share\"))"),
+                "ToolAccess::Default should still grant the system baseline, got:\n{sbpl}"
+            );
+            for root in TOOLCHAIN_ROOTS {
+                assert!(
+                    sbpl.contains(&format!("(allow file-read* (subpath \"{root}\"))")),
+                    "ToolAccess::Default should grant toolchain root {root}, got:\n{sbpl}"
+                );
+            }
+        }
+
+        #[test]
+        fn access_default_is_the_access_default_value() {
+            assert_eq!(ToolAccess::default(), ToolAccess::Default);
         }
 
         // ── Process self-inspection ─────────────────────────────────────────
@@ -3008,6 +3235,137 @@ pub mod macos {
                  readable, bit 2 (4) = socket connect FAILED; got exit code {code}"
             );
         }
+
+        // ── ToolAccess levels (needs a real nested sandbox) ──────────────────
+
+        /// Run `program` under `profile` and return its output. Mirrors the
+        /// `pre_exec`/`sandbox_init` pattern in
+        /// `agent_profile_isolates_runtime_base_from_tmpdir_grant` above.
+        fn run_under_profile(
+            profile: &super::SandboxProfile,
+            program: &str,
+            args: &[&str],
+        ) -> std::process::Output {
+            use std::os::unix::process::CommandExt;
+            use std::process::Command;
+
+            let sbpl_addr = profile.as_ptr() as usize;
+            let mut cmd = Command::new(program);
+            cmd.args(args);
+            // SAFETY: sandbox_init takes only its own argument and a
+            // thread-local error pointer; no allocation; same call made by
+            // exec::spawn() in production. `profile` outlives this call.
+            unsafe {
+                cmd.pre_exec(move || {
+                    let sbpl_ptr = sbpl_addr as *const std::os::raw::c_char;
+                    let mut errorbuf: *mut std::os::raw::c_char = std::ptr::null_mut();
+                    if crate::sandbox::macos::sandbox_init(sbpl_ptr, 0, &mut errorbuf) != 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                    Ok(())
+                });
+            }
+            cmd.output().expect("probe process should spawn")
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_none_runs_echo_but_denies_system_paths() {
+            // Empirically determined minimum (see `emit_none_filesystem_baseline`):
+            // verified directly with `sandbox-exec` before being ported here.
+            let policy = ToolPolicy {
+                access: ToolAccess::None,
+                binary_path: Some(PathBuf::from("/bin/echo")),
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("none-access profile should build");
+
+            let echo = run_under_profile(&profile, "/bin/echo", &["hi"]);
+            assert!(
+                echo.status.success(),
+                "echo should run under ToolAccess::None, stderr:\n{}",
+                String::from_utf8_lossy(&echo.stderr)
+            );
+            assert_eq!(echo.stdout, b"hi\n");
+
+            let cat = run_under_profile(&profile, "/bin/cat", &["/etc/hosts"]);
+            assert!(
+                !cat.status.success(),
+                "reading /etc/hosts must fail under ToolAccess::None"
+            );
+
+            let ls = run_under_profile(&profile, "/bin/ls", &["/usr/share"]);
+            assert!(
+                !ls.status.success(),
+                "listing /usr/share must fail under ToolAccess::None"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_system_reads_etc_but_denies_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            let policy = ToolPolicy {
+                access: ToolAccess::System,
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("system-access profile should build");
+
+            let hosts = run_under_profile(&profile, "/bin/cat", &["/etc/hosts"]);
+            assert!(
+                hosts.status.success(),
+                "reading /etc/hosts should succeed under ToolAccess::System, stderr:\n{}",
+                String::from_utf8_lossy(&hosts.stderr)
+            );
+
+            let listing = run_under_profile(&profile, "/bin/ls", &[root]);
+            assert!(
+                !listing.status.success(),
+                "listing toolchain root {root} must fail under ToolAccess::System"
+            );
+        }
+
+        #[test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        fn tool_access_default_reads_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+
+            let policy = ToolPolicy {
+                access: ToolAccess::Default,
+                network: NetworkAccess::None,
+                ..Default::default()
+            };
+            let profile = MacOSSeatbelt
+                .build(&policy)
+                .expect("default-access profile should build");
+
+            let listing = run_under_profile(&profile, "/bin/ls", &[root]);
+            assert!(
+                listing.status.success(),
+                "listing toolchain root {root} should succeed under ToolAccess::Default, \
+                 stderr:\n{}",
+                String::from_utf8_lossy(&listing.stderr)
+            );
+        }
     }
 }
 
@@ -3023,7 +3381,8 @@ pub mod linux {
     };
 
     use super::{
-        AgentPolicy, NetworkAccess, SandboxBackend, SandboxError, SandboxProfile, ToolPolicy,
+        AgentPolicy, NetworkAccess, SandboxBackend, SandboxError, SandboxProfile, TOOLCHAIN_ROOTS,
+        ToolAccess, ToolPolicy,
     };
 
     /// Convert any `Display`-able Landlock error into a [`SandboxError::ProfileBuildError`].
@@ -3074,6 +3433,31 @@ pub mod linux {
         "/dev/random",
         "/dev/urandom",
     ];
+
+    /// Baseline read-only paths for [`ToolAccess::None`]: the dynamic loader,
+    /// libc, and the loader's own cache file — the bare minimum a
+    /// dynamically linked binary needs to resolve its shared libraries and
+    /// then exit. No shared data, no other system binaries, no system
+    /// configuration beyond the loader cache.
+    const LINUX_NONE_BASELINE_READ_PATHS: &[&str] = &[
+        "/lib",
+        "/lib64",
+        "/usr/lib",
+        "/usr/lib64",
+        "/etc/ld.so.cache",
+        "/dev/null",
+    ];
+
+    /// Returns the baseline read-only path list for a [`ToolAccess`] level,
+    /// before the caller appends [`TOOLCHAIN_ROOTS`] for
+    /// [`ToolAccess::Default`]. A pure function (no kernel/Landlock
+    /// involved) so it can be unit-tested directly.
+    fn baseline_paths_for_access(access: ToolAccess) -> &'static [&'static str] {
+        match access {
+            ToolAccess::None => LINUX_NONE_BASELINE_READ_PATHS,
+            ToolAccess::System | ToolAccess::Default => LINUX_BASELINE_READ_PATHS,
+        }
+    }
 
     /// Extended baseline read-only paths granted to every agent process.
     ///
@@ -3435,8 +3819,12 @@ pub mod linux {
 
     impl SandboxBackend for LinuxLandlock {
         fn build(&self, policy: &ToolPolicy) -> Result<SandboxProfile, SandboxError> {
+            let mut baseline: Vec<&str> = baseline_paths_for_access(policy.access).to_vec();
+            if policy.access == ToolAccess::Default {
+                baseline.extend_from_slice(TOOLCHAIN_ROOTS);
+            }
             build_landlock_profile(
-                LINUX_BASELINE_READ_PATHS,
+                &baseline,
                 &policy.read_paths,
                 &policy.read_write_paths,
                 policy.network,
@@ -3466,15 +3854,24 @@ pub mod linux {
     mod tests {
         use std::path::PathBuf;
 
-        use super::super::{NetworkAccess, SandboxBackend, ToolPolicy};
-        use super::{FdClosedProbe, LinuxLandlock, check_landlock_availability};
+        use super::super::{
+            NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
+        };
+        use super::{
+            FdClosedProbe, LINUX_BASELINE_READ_PATHS, LinuxLandlock, check_landlock_availability,
+        };
 
+        // Pinned to `ToolAccess::System` for the same reason as the macOS
+        // test helpers: these predate `access` and assume today's
+        // unconditional baseline, independent of whatever the default
+        // level becomes.
         fn read_only_policy(path: &str) -> ToolPolicy {
             ToolPolicy {
                 read_paths: vec![PathBuf::from(path)],
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -3485,6 +3882,7 @@ pub mod linux {
                 read_write_paths: vec![PathBuf::from(path)],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -3495,6 +3893,7 @@ pub mod linux {
                 read_write_paths: vec![],
                 network: NetworkAccess::None,
                 binary_path: None,
+                access: ToolAccess::System,
                 ..Default::default()
             }
         }
@@ -3629,6 +4028,50 @@ pub mod linux {
             );
         }
 
+        // ── ToolAccess baseline path-set (pure function, no kernel needed) ───
+
+        #[test]
+        fn baseline_paths_for_access_none_excludes_system_extras() {
+            use super::{LINUX_NONE_BASELINE_READ_PATHS, baseline_paths_for_access};
+
+            let none = baseline_paths_for_access(super::super::ToolAccess::None);
+            assert_eq!(none, LINUX_NONE_BASELINE_READ_PATHS);
+            assert!(
+                none.contains(&"/usr/lib"),
+                "None baseline should include /usr/lib"
+            );
+            assert!(
+                none.contains(&"/etc/ld.so.cache"),
+                "None baseline should include the loader cache file"
+            );
+            assert!(
+                !none.contains(&"/usr/share"),
+                "None baseline must not include /usr/share"
+            );
+            assert!(
+                !none.contains(&"/etc"),
+                "None baseline must not include the whole of /etc, only ld.so.cache"
+            );
+            assert!(
+                !none.contains(&"/usr/bin") && !none.contains(&"/bin"),
+                "None baseline must not include system binary directories"
+            );
+        }
+
+        #[test]
+        fn baseline_paths_for_access_system_and_default_share_the_full_baseline() {
+            use super::baseline_paths_for_access;
+
+            assert_eq!(
+                baseline_paths_for_access(super::super::ToolAccess::System),
+                LINUX_BASELINE_READ_PATHS
+            );
+            assert_eq!(
+                baseline_paths_for_access(super::super::ToolAccess::Default),
+                LINUX_BASELINE_READ_PATHS
+            );
+        }
+
         // ── build_platform_agent_sandbox_profile smoke test (Linux) ──────────
 
         #[test]
@@ -3675,6 +4118,121 @@ pub mod linux {
             assert!(
                 status.success(),
                 "redirecting to /dev/null failed: {status:?}"
+            );
+        }
+
+        // ── ToolAccess levels (needs a real nested sandbox) ──────────────────
+
+        /// Build a tool profile at `access`, spawn `/bin/sh -c script` under
+        /// it, and return its exit status. `read_paths` stands in for a
+        /// tool's own `extra_read`/binary grant — independent of `access` at
+        /// every level (see `build_tool_policy`) — since Landlock ties
+        /// execute rights to path coverage: without granting `/bin` and
+        /// `/usr/bin` explicitly here, `/bin/sh` itself cannot exec under
+        /// `ToolAccess::None`, whose baseline deliberately excludes them.
+        async fn run_under_access(
+            access: ToolAccess,
+            read_paths: Vec<PathBuf>,
+            script: &str,
+        ) -> std::process::ExitStatus {
+            let tmp = tempfile::tempdir().unwrap();
+            let profile = LinuxLandlock
+                .build(&ToolPolicy {
+                    read_paths,
+                    access,
+                    network: NetworkAccess::None,
+                    ..Default::default()
+                })
+                .expect("tool profile should build");
+            let mut env = std::collections::HashMap::new();
+            env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
+            let request = crate::exec::ExecRequest {
+                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                arg0: "sh".to_string(),
+                args: vec!["-c".to_string(), script.to_string()],
+                work_dir: std::fs::canonicalize(tmp.path()).unwrap(),
+                env,
+                sandbox_profile: profile,
+                timeout: std::time::Duration::from_secs(10),
+            };
+            let mut spawned = crate::exec::spawn(request).expect("spawn should succeed");
+            spawned.child.wait().await.expect("wait should succeed")
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_none_denies_etc() {
+            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+            let status = run_under_access(
+                ToolAccess::None,
+                shell_dirs,
+                "cat /etc/hosts >/dev/null 2>/dev/null",
+            )
+            .await;
+            assert!(
+                !status.success(),
+                "reading /etc/hosts must fail under ToolAccess::None, got {status:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_system_reads_etc_but_denies_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+            let hosts_status = run_under_access(
+                ToolAccess::System,
+                shell_dirs.clone(),
+                "cat /etc/hosts >/dev/null",
+            )
+            .await;
+            assert!(
+                hosts_status.success(),
+                "reading /etc/hosts should succeed under ToolAccess::System, got {hosts_status:?}"
+            );
+
+            let listing_status = run_under_access(
+                ToolAccess::System,
+                shell_dirs,
+                &format!("ls {root} >/dev/null"),
+            )
+            .await;
+            assert!(
+                !listing_status.success(),
+                "listing toolchain root {root} must fail under ToolAccess::System, \
+                 got {listing_status:?}"
+            );
+        }
+
+        #[tokio::test]
+        #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+        async fn tool_access_default_reads_toolchain_roots() {
+            let Some(root) = TOOLCHAIN_ROOTS
+                .iter()
+                .find(|p| std::path::Path::new(p).exists())
+            else {
+                // No toolchain root present on this host — nothing to assert.
+                return;
+            };
+            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
+
+            let listing_status = run_under_access(
+                ToolAccess::Default,
+                shell_dirs,
+                &format!("ls {root} >/dev/null"),
+            )
+            .await;
+            assert!(
+                listing_status.success(),
+                "listing toolchain root {root} should succeed under ToolAccess::Default, \
+                 got {listing_status:?}"
             );
         }
 

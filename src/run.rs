@@ -180,12 +180,16 @@ pub(crate) fn profile_read_write_paths(profile: Profile, home: Option<&str>) -> 
 // ─── Toolchain auto-detection ─────────────────────────────────────────────────
 
 /// Probe common toolchain installation directories and return those that exist.
+///
+/// The system-wide candidates are exactly [`crate::sandbox::TOOLCHAIN_ROOTS`]
+/// — the same list a tool gets at `access = "default"` — so the agent's
+/// grant and a tool's can't drift apart. Only the home-relative candidates
+/// below are agent-specific.
 pub(crate) fn detect_toolchain_paths(home: Option<&str>) -> Vec<PathBuf> {
-    let mut candidates: Vec<PathBuf> = vec![
-        PathBuf::from("/usr/local"),
-        PathBuf::from("/opt/homebrew"),
-        PathBuf::from("/nix/store"),
-    ];
+    let mut candidates: Vec<PathBuf> = crate::sandbox::TOOLCHAIN_ROOTS
+        .iter()
+        .map(PathBuf::from)
+        .collect();
 
     const TILDE_CANDIDATES: &[&str] = &[
         "~/.local/bin",
