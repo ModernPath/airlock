@@ -61,46 +61,53 @@ fn encode_hex(value: &str) -> String {
         .collect()
 }
 
-/// Push the four encoding-variant patterns for a single (name, value) pair.
-/// Empty values are skipped (they would match everywhere).
-fn push_patterns_for_value(
-    patterns: &mut Vec<Vec<u8>>,
-    replacements: &mut Vec<String>,
-    name: &str,
-    value: &str,
-) {
-    if value.is_empty() {
-        return;
-    }
-    let replacement = format!("[REDACTED:{name}]");
-
-    patterns.push(value.as_bytes().to_vec());
-    replacements.push(replacement.clone());
-
-    patterns.push(encode_base64(value).into_bytes());
-    replacements.push(replacement.clone());
-
-    patterns.push(encode_url(value).into_bytes());
-    replacements.push(replacement.clone());
-
-    patterns.push(encode_hex(value).into_bytes());
-    replacements.push(replacement);
+/// Collects secrets for a [`Redactor`], registering each one's encoded
+/// variants as it is added, so a caller can add values while it holds the
+/// locks that guard them instead of copying them out first.
+#[derive(Default)]
+pub struct RedactorBuilder {
+    patterns: Vec<Vec<u8>>,
+    replacements: Vec<String>,
 }
 
-/// Build a [`Redactor`] from accumulated `(pattern, replacement)` pairs.
-fn finalize(patterns: Vec<Vec<u8>>, replacements: Vec<String>) -> Result<Redactor, RedactError> {
-    if patterns.is_empty() {
-        return Ok(Redactor {
-            automaton: None,
-            replacements: Vec::new(),
-        });
+impl RedactorBuilder {
+    /// Registers `secret` under `name`, as its raw, base64, URL-encoded and
+    /// hex forms. An empty value is skipped: it would match everywhere.
+    pub fn add(&mut self, name: &str, secret: &Secret<String>) {
+        let value = secret.expose_secret();
+        if value.is_empty() {
+            return;
+        }
+        let replacement = format!("[REDACTED:{name}]");
+        for pattern in [
+            value.as_bytes().to_vec(),
+            encode_base64(value).into_bytes(),
+            encode_url(value).into_bytes(),
+            encode_hex(value).into_bytes(),
+        ] {
+            self.patterns.push(pattern);
+            self.replacements.push(replacement.clone());
+        }
     }
-    let automaton =
-        AhoCorasick::new(&patterns).map_err(|e| RedactError::AutomatonBuildError(e.to_string()))?;
-    Ok(Redactor {
-        automaton: Some(automaton),
-        replacements,
-    })
+
+    /// # Errors
+    ///
+    /// Returns [`RedactError::AutomatonBuildError`] if the Aho-Corasick
+    /// automaton cannot be constructed from the patterns.
+    pub fn build(self) -> Result<Redactor, RedactError> {
+        if self.patterns.is_empty() {
+            return Ok(Redactor {
+                automaton: None,
+                replacements: Vec::new(),
+            });
+        }
+        let automaton = AhoCorasick::new(&self.patterns)
+            .map_err(|e| RedactError::AutomatonBuildError(e.to_string()))?;
+        Ok(Redactor {
+            automaton: Some(automaton),
+            replacements: self.replacements,
+        })
+    }
 }
 
 // ─── Redactor ─────────────────────────────────────────────────────────────────
@@ -122,14 +129,9 @@ pub struct Redactor {
 }
 
 impl Redactor {
-    /// Build a new redactor from a collection of secret name-value pairs.
-    ///
-    /// For each secret, four encoding variants are generated as search patterns.
-    /// An empty collection produces a valid pass-through scanner.
-    ///
-    /// # Arguments
-    ///
-    /// * `secrets` — An iterator yielding `(name, &Secret<String>)` pairs.
+    /// Build a redactor from `(name, secret)` pairs; see
+    /// [`RedactorBuilder::add`]. An empty collection produces a valid
+    /// pass-through scanner.
     ///
     /// # Errors
     ///
@@ -138,46 +140,11 @@ impl Redactor {
     pub fn new<'a>(
         secrets: impl IntoIterator<Item = (&'a str, &'a Secret<String>)>,
     ) -> Result<Self, RedactError> {
-        let mut patterns: Vec<Vec<u8>> = Vec::new();
-        let mut replacements: Vec<String> = Vec::new();
-
+        let mut builder = RedactorBuilder::default();
         for (name, secret) in secrets {
-            push_patterns_for_value(
-                &mut patterns,
-                &mut replacements,
-                name,
-                secret.expose_secret(),
-            );
+            builder.add(name, secret);
         }
-
-        finalize(patterns, replacements)
-    }
-
-    /// Build a redactor that covers multiple value generations per secret.
-    ///
-    /// The refresh task uses this to keep the previous value's patterns alive
-    /// for one cycle after a swap, so output captured just before the swap
-    /// (still flowing through pipes) continues to be redacted. Empty
-    /// generation slices are tolerated.
-    pub fn build_from_generations<'a, I>(generations: I) -> Result<Self, RedactError>
-    where
-        I: IntoIterator<Item = (&'a str, &'a [Arc<Secret<String>>])>,
-    {
-        let mut patterns: Vec<Vec<u8>> = Vec::new();
-        let mut replacements: Vec<String> = Vec::new();
-
-        for (name, gens) in generations {
-            for secret in gens {
-                push_patterns_for_value(
-                    &mut patterns,
-                    &mut replacements,
-                    name,
-                    secret.expose_secret(),
-                );
-            }
-        }
-
-        finalize(patterns, replacements)
+        builder.build()
     }
 
     /// Scan raw bytes and replace all secret occurrences with placeholders.
@@ -186,11 +153,7 @@ impl Redactor {
     /// replacement suitable for processing complete chunks.
     pub fn redact_bytes(&self, input: &[u8]) -> Vec<u8> {
         match &self.automaton {
-            Some(automaton) => {
-                let replacement_bytes: Vec<&[u8]> =
-                    self.replacements.iter().map(|r| r.as_bytes()).collect();
-                automaton.replace_all_bytes(input, &replacement_bytes)
-            }
+            Some(automaton) => automaton.replace_all_bytes(input, &self.replacements),
             None => input.to_vec(),
         }
     }
@@ -209,11 +172,7 @@ impl Redactor {
     /// to writer without modification.
     pub fn redact_stream<R: io::Read, W: io::Write>(&self, reader: R, writer: W) -> io::Result<()> {
         match &self.automaton {
-            Some(automaton) => {
-                let replacement_bytes: Vec<&[u8]> =
-                    self.replacements.iter().map(|r| r.as_bytes()).collect();
-                automaton.try_stream_replace_all(reader, writer, &replacement_bytes)
-            }
+            Some(automaton) => automaton.try_stream_replace_all(reader, writer, &self.replacements),
             None => {
                 let mut reader = reader;
                 let mut writer = writer;
@@ -383,13 +342,10 @@ mod tests {
     // ── Multi-generation tests ────────────────────────────────────────────
 
     #[test]
-    fn build_from_generations_redacts_both_old_and_new_values() {
+    fn redacts_both_generations_of_a_secret() {
         let prev = Arc::new(Secret::new("old-token".to_string()));
         let curr = Arc::new(Secret::new("new-token".to_string()));
-        let gens = [("TOKEN", vec![Arc::clone(&curr), Arc::clone(&prev)])];
-        let refs: Vec<(&str, &[Arc<Secret<String>>])> =
-            gens.iter().map(|(n, v)| (*n, v.as_slice())).collect();
-        let redactor = Redactor::build_from_generations(refs).unwrap();
+        let redactor = Redactor::new([("TOKEN", &*curr), ("TOKEN", &*prev)]).unwrap();
 
         let out = redactor.redact_bytes(b"saw old-token then new-token");
         let s = String::from_utf8_lossy(&out);
@@ -399,12 +355,9 @@ mod tests {
     }
 
     #[test]
-    fn build_from_generations_with_only_current_drops_previous_pattern() {
+    fn a_retired_generation_is_no_longer_redacted() {
         let curr = Arc::new(Secret::new("new-token".to_string()));
-        let gens = [("TOKEN", vec![Arc::clone(&curr)])];
-        let refs: Vec<(&str, &[Arc<Secret<String>>])> =
-            gens.iter().map(|(n, v)| (*n, v.as_slice())).collect();
-        let redactor = Redactor::build_from_generations(refs).unwrap();
+        let redactor = Redactor::new([("TOKEN", &*curr)]).unwrap();
 
         let out = redactor.redact_bytes(b"saw old-token then new-token");
         let s = String::from_utf8_lossy(&out);

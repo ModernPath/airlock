@@ -42,7 +42,6 @@ use crate::protocol::{
 use crate::proxy::server::ProxySession;
 use crate::redact::{self, Redactor, RedactorSwap, StreamRedactor};
 use crate::runtime_dir::{RuntimeDir, RuntimeDirError};
-use crate::secrets::Secret;
 use crate::session::{self, EndedReason, Ends, Session, SessionPolicy, Sessions};
 
 // ─── Constants ────────────────────────────────────────────────────────────────
@@ -854,7 +853,7 @@ impl DaemonState {
     /// doesn't lose a just-rotated value either. Called after register,
     /// reload, revoke/end, and from a session's own refresh callback.
     pub fn rebuild_global_redactor(&self) {
-        let mut owned: Vec<(String, Vec<Arc<Secret<String>>>)> = Vec::new();
+        let mut builder = redact::RedactorBuilder::default();
         for live_session in self.sessions.list() {
             let policy = live_session.current_policy();
             let previous = policy
@@ -862,17 +861,13 @@ impl DaemonState {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             for (label, slot) in policy.secrets.iter() {
-                let s = slot.read().unwrap_or_else(|e| e.into_inner());
-                let mut generations = vec![Arc::clone(&s.value)];
-                generations.extend(previous.get(label).cloned());
-                owned.push((label.clone(), generations));
+                builder.add(label, &slot.read().unwrap_or_else(|e| e.into_inner()).value);
+                if let Some(old) = previous.get(label) {
+                    builder.add(label, old);
+                }
             }
         }
-        let refs: Vec<(&str, &[Arc<Secret<String>>])> = owned
-            .iter()
-            .map(|(n, g)| (n.as_str(), g.as_slice()))
-            .collect();
-        if let Ok(new_redactor) = Redactor::build_from_generations(refs) {
+        if let Ok(new_redactor) = builder.build() {
             let mut g = self
                 .global_redactor
                 .write()

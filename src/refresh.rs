@@ -42,7 +42,7 @@ use tokio::task::JoinSet;
 
 use crate::config::{CommandEnv, Config, RefreshSpec, SecretSource};
 use crate::daemon::RingBuffer;
-use crate::redact::{Redactor, RedactorSwap};
+use crate::redact::{RedactorBuilder, RedactorSwap};
 use crate::secrets::{CommandContext, Health, Secret, SecretStore};
 
 /// Initial sleep before the first retry after a refresh failure.
@@ -291,7 +291,7 @@ fn apply_refresh_result(
     }
 }
 
-/// Rebuild the shared [`Redactor`] from the current store and the previous
+/// Rebuild the shared [`Redactor`](crate::redact::Redactor) from the current store and the previous
 /// generation of every refreshed secret, with `refreshed_current` standing
 /// in for the not-yet-published value of `refreshed_label`.
 fn rebuild_redactor(
@@ -301,24 +301,22 @@ fn rebuild_redactor(
     refreshed_current: &Arc<Secret<String>>,
     redactor_swap: &RedactorSwap,
 ) -> Result<(), String> {
-    let mut owned: HashMap<String, Vec<Arc<Secret<String>>>> = HashMap::with_capacity(store.len());
+    let mut builder = RedactorBuilder::default();
     for (label, slot_lock) in store.iter() {
-        let current = if label == refreshed_label {
-            Arc::clone(refreshed_current)
+        if label == refreshed_label {
+            builder.add(label, refreshed_current);
         } else {
-            let slot = slot_lock.read().unwrap_or_else(|e| e.into_inner());
-            Arc::clone(&slot.value)
-        };
-        let mut gens = vec![current];
-        gens.extend(previous.get(label).cloned());
-        owned.insert(label.clone(), gens);
+            builder.add(
+                label,
+                &slot_lock.read().unwrap_or_else(|e| e.into_inner()).value,
+            );
+        }
+        if let Some(old) = previous.get(label) {
+            builder.add(label, old);
+        }
     }
-
-    let refs: Vec<(&str, &[Arc<Secret<String>>])> = owned
-        .iter()
-        .map(|(name, gens)| (name.as_str(), gens.as_slice()))
-        .collect();
-    let new_redactor = Redactor::build_from_generations(refs)
+    let new_redactor = builder
+        .build()
         .map_err(|e| format!("failed to rebuild redactor: {e}"))?;
 
     let mut slot = redactor_swap.write().unwrap_or_else(|e| e.into_inner());
@@ -329,6 +327,7 @@ fn rebuild_redactor(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::redact::Redactor;
     use crate::secrets::{Health, SecretSlot};
     use std::collections::HashMap;
     use std::path::PathBuf;
