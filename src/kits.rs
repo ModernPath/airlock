@@ -390,6 +390,13 @@ fn expand_rust(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
         }
         Mode::Shared => {
             let cargo_home = env_or(inputs, "CARGO_HOME", home.join(".cargo"));
+            // The user's own cargo settings (aliases, build flags, registry
+            // sources) apply to the agent too. Read-only: a writable config
+            // could set `build.rustc-wrapper` and run code in the user's
+            // next unsandboxed build. `config` is the pre-1.39 name. The
+            // credentials files stay unreadable.
+            out.read.push(cargo_home.join("config.toml"));
+            out.read.push(cargo_home.join("config"));
             out.write.push(cargo_home.join("registry"));
             out.write.push(cargo_home.join("git"));
             // `.global-cache` is a SQLite database; its rollback journal is
@@ -1055,6 +1062,20 @@ mod tests {
                 .write_files
                 .contains(&home.join(".cargo/.global-cache-journal"))
         );
+        assert!(expanded.read.contains(&home.join(".cargo/config.toml")));
+        assert!(expanded.read.contains(&home.join(".cargo/config")));
+        let everything: Vec<&PathBuf> = expanded
+            .read
+            .iter()
+            .chain(&expanded.write)
+            .chain(&expanded.write_files)
+            .collect();
+        assert!(
+            !everything
+                .iter()
+                .any(|p| p.ends_with(".cargo") || p.to_string_lossy().contains("credentials")),
+            "shared mode must grant neither CARGO_HOME itself nor its credentials: {everything:?}"
+        );
         assert!(
             expanded.state_dirs.is_empty(),
             "shared mode has no kit_state"
@@ -1083,6 +1104,11 @@ mod tests {
                 .contains(&PathBuf::from("/custom/cargo/registry"))
         );
         assert!(!expanded.write.contains(&home.join(".cargo/registry")));
+        assert!(
+            expanded
+                .read
+                .contains(&PathBuf::from("/custom/cargo/config.toml"))
+        );
     }
 
     // ── expand_all: node (platform-dependent defaults) ───────────────
