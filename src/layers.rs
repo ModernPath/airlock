@@ -1292,6 +1292,13 @@ mod tests {
         }
     }
 
+    /// Loads `dir`'s layers by the default walk (with `dir` standing in
+    /// for home too) and merges them.
+    fn merge_default(dir: &Path) -> Result<MergedConfig, ConfigError> {
+        let layers = load_default(dir, dir).unwrap();
+        merge(&layers, &ctx(&layers.root.clone(), dir))
+    }
+
     fn load_default(cwd: &Path, home: &Path) -> Result<LoadedLayers, ConfigError> {
         // No real global file in these tests unless a test writes one;
         // point at a path that does not exist, which load_layers treats as
@@ -1314,8 +1321,7 @@ mod tests {
             "airlock.local.toml",
             "[tools.gh.env]\nGH_TOKEN = { secret = \"ghost\" }\n\n[agent.env]\nX = { secret = \"ghost\" }\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         let message = err.to_string();
         assert!(message.contains("[tools.gh.env.GH_TOKEN]"), "{message}");
         assert!(message.contains("[agent.env.X]"), "{message}");
@@ -1445,8 +1451,7 @@ mod tests {
         let tmp = tempdir().unwrap();
         write(tmp.path(), "airlock.toml", "[tools.gh]\n");
         write(tmp.path(), "airlock.local.toml", "[tools.gh]\n");
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::DuplicateTool { ref tool, .. } if tool == "gh"));
         assert!(err.to_string().contains("override = true"));
     }
@@ -1464,8 +1469,7 @@ mod tests {
             "airlock.local.toml",
             "[tools.gh]\ndescription = \"local\"\noverride = true\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let merged = merge_default(tmp.path()).unwrap();
         let wire = merged.to_wire();
         assert_eq!(
             wire.tools.unwrap()["gh"].description.as_deref(),
@@ -1482,8 +1486,7 @@ mod tests {
             "airlock.local.toml",
             "[tools.gh]\noverride = true\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::OverrideWithoutRepoTool { ref tool, .. } if tool == "gh")
         );
@@ -1493,8 +1496,7 @@ mod tests {
     fn merge_override_in_repo_layer_errors() {
         let tmp = tempdir().unwrap();
         write(tmp.path(), "airlock.toml", "[tools.gh]\noverride = true\n");
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::OverrideOutsideLocal { .. }));
     }
 
@@ -1502,8 +1504,7 @@ mod tests {
     fn merge_allow_home_root_in_repo_errors() {
         let tmp = tempdir().unwrap();
         write(tmp.path(), "airlock.toml", "allow_home_root = true\n");
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::AllowHomeRootInRepo { .. }));
     }
 
@@ -1515,8 +1516,7 @@ mod tests {
             "airlock.toml",
             "[secrets.GH_TOKEN]\ndescription = \"GitHub token\"\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         match err {
             ConfigError::UnboundSecretLabels { labels, .. } => {
                 assert_eq!(
@@ -1541,8 +1541,7 @@ mod tests {
             "airlock.local.toml",
             "[secrets.GH_TOKEN]\nsource = \"env\"\nfrom = \"MY_GH\"\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let merged = merge_default(tmp.path()).unwrap();
         let wire = merged.to_wire();
         let secrets = wire.secrets.unwrap();
         assert_eq!(secrets["GH_TOKEN"].source.as_deref(), Some("env"));
@@ -1605,8 +1604,7 @@ mod tests {
             "airlock.toml",
             "[tools.gh.env]\nX = { secret = \"NOPE\" }\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::RepoItemUsesNonRepoLabel { .. }));
     }
 
@@ -1897,8 +1895,7 @@ LOG_LEVEL = "debug"
             "airlock.toml",
             "[kits.rust]\nmode = \"shared\"\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::KitsInRepo { .. }));
     }
 
@@ -1911,8 +1908,7 @@ LOG_LEVEL = "debug"
             "airlock.local.toml",
             "[kits.rust]\nmode = \"shared\"\n",
         );
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let merged = merge_default(tmp.path()).unwrap();
         assert_eq!(
             merged.kits().get("rust").and_then(|d| d.mode.as_deref()),
             Some("shared")
@@ -2032,8 +2028,7 @@ LOG_LEVEL = "debug"
     fn to_wire_rejects_deny_unknown_fields_round_trip_via_toml() {
         let tmp = tempdir().unwrap();
         write(tmp.path(), "airlock.toml", "[tools.t]\n");
-        let layers = load_default(tmp.path(), tmp.path()).unwrap();
-        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let merged = merge_default(tmp.path()).unwrap();
         let wire = merged.to_wire();
         let toml_text = toml::to_string(&wire).unwrap();
         let reparsed: RawConfig = toml::from_str(&toml_text).unwrap();
