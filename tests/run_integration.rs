@@ -194,6 +194,96 @@ fn run_agent_execs_a_tool_through_its_session_after_ten_seconds() {
     assert_eq!(String::from_utf8_lossy(&output.stdout), "via-daemon\n");
 }
 
+// ─── Kits ─────────────────────────────────────────────────────────────────────
+//
+// `--no-session` keeps these focused on the sandbox + env the kit produces,
+// the same way `run_no_session_after_trust_runs_the_command` does — no
+// daemon round trip needed to prove what the agent can and cannot touch.
+
+#[test]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_with_rust_kit_isolated_cannot_write_the_real_cargo_registry() {
+    let fx = Fixture::new();
+    fx.write_config("[agent]\nkits = [\"rust\"]\n");
+    let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+    assert!(trust_output.status.success(), "{trust_output:?}");
+
+    // Pre-exists, as a real ~/.cargo/registry would on a machine that has
+    // used cargo before — isolated mode must still refuse it.
+    let real_registry = fx.home.path().join(".cargo/registry");
+    std::fs::create_dir_all(&real_registry).unwrap();
+
+    let script = r#"
+        [ -n "$CARGO_HOME" ] || { echo NO_CARGO_HOME; exit 1; }
+        case "$CARGO_HOME" in */kits/*) echo CARGO_HOME_IS_KIT_STATE ;; *) echo CARGO_HOME_WRONG ;; esac
+        mkdir -p "$CARGO_HOME/registry" && echo ISOLATED_WRITE_OK
+        (echo poison > "$HOME/.cargo/registry/marker" && echo REAL_REGISTRY_WRITE_OK) || echo REAL_REGISTRY_WRITE_DENIED
+    "#;
+    let output = fx
+        .cmd()
+        .args(["run", "--no-session", "--", "/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("CARGO_HOME_IS_KIT_STATE"), "{stdout}");
+    assert!(stdout.contains("ISOLATED_WRITE_OK"), "{stdout}");
+    assert!(stdout.contains("REAL_REGISTRY_WRITE_DENIED"), "{stdout}");
+    assert!(!stdout.contains("REAL_REGISTRY_WRITE_OK"), "{stdout}");
+    assert!(!real_registry.join("marker").exists());
+}
+
+#[test]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_with_rust_kit_shared_via_global_config_writes_registry_not_bin_or_credentials() {
+    let fx = Fixture::new();
+    fx.write_config("[agent]\nkits = [\"rust\"]\n");
+
+    // [kits.*] is global/local only — shared mode has to be set here, not
+    // in the project's own airlock.toml.
+    let global_dir = fx.xdg_config.path().join("airlock");
+    std::fs::create_dir_all(&global_dir).unwrap();
+    std::fs::write(
+        global_dir.join("airlock.toml"),
+        "[kits.rust]\nmode = \"shared\"\n",
+    )
+    .unwrap();
+
+    let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+    assert!(trust_output.status.success(), "{trust_output:?}");
+
+    // A real ~/.cargo/bin and ~/.cargo/credentials.toml, as cargo itself
+    // would create — shared mode reads neither path from the kit (only
+    // `~/.cargo/registry`/`git` and the lock files are write-granted, and
+    // credentials.toml is never granted at all).
+    let cargo_home = fx.home.path().join(".cargo");
+    std::fs::create_dir_all(cargo_home.join("bin")).unwrap();
+    std::fs::write(cargo_home.join("bin/rustc"), b"real rustc").unwrap();
+    std::fs::write(cargo_home.join("credentials.toml"), b"token = \"secret\"").unwrap();
+
+    let script = r#"
+        (echo ok > "$HOME/.cargo/registry/marker" && echo REGISTRY_WRITE_OK) || echo REGISTRY_WRITE_DENIED
+        (echo poison > "$HOME/.cargo/bin/rustc" && echo BIN_WRITE_OK) || echo BIN_WRITE_DENIED
+        (cat "$HOME/.cargo/credentials.toml" && echo CRED_READ_OK) || echo CRED_READ_DENIED
+    "#;
+    let output = fx
+        .cmd()
+        .args(["run", "--no-session", "--", "/bin/sh", "-c", script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(stdout.contains("REGISTRY_WRITE_OK"), "{stdout}");
+    assert!(stdout.contains("BIN_WRITE_DENIED"), "{stdout}");
+    assert!(stdout.contains("CRED_READ_DENIED"), "{stdout}");
+    assert!(!stdout.contains("BIN_WRITE_OK"), "{stdout}");
+    assert!(!stdout.contains("CRED_READ_OK"), "{stdout}");
+    assert_eq!(
+        std::fs::read(cargo_home.join("bin/rustc")).unwrap(),
+        b"real rustc"
+    );
+}
+
 // Sanity check that the fixture's runtime dir is actually usable by
 // `anchors::validate` the way the other tests assume (mode 0700, owned by
 // us) — catches a fixture regression before it masquerades as a product

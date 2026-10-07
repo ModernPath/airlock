@@ -16,3 +16,9 @@ AWS_PROFILE = "personal"
 
 [agent]
 passthrough_env = ["COLORTERM"]
+kits = ["rust"]   # cargo's caches, isolated per project by default
+
+# Only global or airlock.local.toml may set a built-in kit's mode — never a
+# project's own airlock.toml. isolated (the default) is left unset here.
+[kits.rust]
+mode = "isolated"
