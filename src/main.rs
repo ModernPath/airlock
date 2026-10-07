@@ -1053,7 +1053,7 @@ fn cmd_session_list(cwd: &std::path::Path, here: bool) -> CliResult {
                 inspect::format_hhmm_local(s.started_unix),
                 format!("{} execs", s.execs),
                 ends_text(&s.ends, now),
-                if layers_changed_on_disk(&s.layers) {
+                if airlock::client::layers_changed(&s.layers) {
                     "config changed".to_string()
                 } else {
                     String::new()
@@ -1342,13 +1342,6 @@ fn discover_root_quietly(cwd: &std::path::Path) -> Option<PathBuf> {
     )
     .ok()?;
     Some(loaded.root)
-}
-
-fn layers_changed_on_disk(layers: &[airlock::protocol::WireLayer]) -> bool {
-    layers.iter().any(|l| match std::fs::read(&l.path) {
-        Ok(bytes) => airlock::config::sha256_hex(&bytes) != l.sha256,
-        Err(_) => false,
-    })
 }
 
 #[cfg(test)]

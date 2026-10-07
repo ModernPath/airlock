@@ -58,36 +58,12 @@ pub enum SecretsError {
         missing: Vec<String>,
     },
 
-    /// An environment variable's value is not valid UTF-8.
-    #[error("secret environment variable {name:?} contains invalid UTF-8")]
-    InvalidUtf8 {
-        /// The name of the environment variable with the invalid value.
-        name: String,
-    },
-
-    /// One or more `source = "command"` secrets failed to produce a value.
-    ///
-    /// Reports all failures in a single error, each annotated with the label
-    /// and a short explanation of what went wrong.
-    #[error(
-        "{} secret command(s) failed: {}",
-        failures.len(),
-        failures.iter()
-            .map(|(label, reason)| format!("[secrets.{label}]: {reason}"))
-            .collect::<Vec<_>>()
-            .join("; ")
-    )]
-    CommandFailures {
-        /// Pairs of (secret label, failure reason).
-        failures: Vec<(String, String)>,
-    },
-
     /// Under [`collect_secrets_with`]: a `source = "command"` secret's
     /// `argv[0]` is not on the session's filtered `PATH`, or resolves inside
     /// the project root or a write grant (B2 in the design doc — approving
     /// `airlock.toml` does not approve a binary the agent can rewrite).
-    /// Returned eagerly, like [`SecretsError::InvalidUtf8`], rather than
-    /// batched: it is a config problem, not a one-off command failure.
+    /// Returned eagerly rather than batched: it is a config problem, not a
+    /// one-off command failure.
     #[error("{0}")]
     CommandUnusable(String),
 
@@ -1266,29 +1242,5 @@ mod tests {
         assert!(msg.contains("API_KEY"));
         assert!(msg.contains("DB_PASS"));
         assert!(msg.contains("missing secret environment variables"));
-    }
-
-    #[test]
-    fn secrets_error_command_failures_display() {
-        let err = SecretsError::CommandFailures {
-            failures: vec![
-                ("alpha".to_string(), "exited with status 1".to_string()),
-                ("beta".to_string(), "timed out after 5s".to_string()),
-            ],
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("[secrets.alpha]"));
-        assert!(msg.contains("[secrets.beta]"));
-        assert!(msg.contains("timed out"));
-    }
-
-    #[test]
-    fn secrets_error_invalid_utf8_display() {
-        let err = SecretsError::InvalidUtf8 {
-            name: "BAD_VAR".to_string(),
-        };
-        let msg = err.to_string();
-        assert!(msg.contains("BAD_VAR"));
-        assert!(msg.contains("invalid UTF-8"));
     }
 }

@@ -36,10 +36,6 @@ use crate::sandbox::SandboxProfile;
 /// Errors that can occur during binary resolution, spawn preparation, or spawn.
 #[derive(Debug, Error)]
 pub enum ExecError {
-    /// No executable with the given name was found in any directory in `PATH`.
-    #[error("binary {0:?} not found in PATH")]
-    BinaryNotFound(String),
-
     /// A declared tool's binary is not on the session's filtered `PATH`
     /// ([`resolve_binary_in`]). The message lists the `PATH` entries
     /// [`filter_path`] dropped and why, per the "Binary not found" row of

@@ -187,7 +187,7 @@ pub async fn exec(tool: String, args: Vec<String>, cwd: &Path) -> i32 {
     };
 
     let outcome = tokio::select! {
-        result = read_responses(&mut reader, &tool, &token, &socket_path) => result,
+        result = read_responses(&mut reader, &token, &socket_path) => result,
         _ = sigint.recv() => {
             drop(reader);
             if let Some(handle) = stdin_handle {
@@ -251,7 +251,6 @@ async fn forward_stdin<W: tokio::io::AsyncWriteExt + Unpin>(mut writer: W) {
 /// changes the config") before returning the mapped exit code.
 async fn read_responses<R: tokio::io::AsyncBufReadExt + Unpin>(
     reader: &mut R,
-    tool: &str,
     token: &SessionToken,
     socket_path: &Path,
 ) -> Result<i32, String> {
@@ -277,7 +276,6 @@ async fn read_responses<R: tokio::io::AsyncBufReadExt + Unpin>(
                 if kind == ErrorKind::UnknownTool {
                     print_config_changed_hint_if_any(socket_path, token).await;
                 }
-                let _ = tool;
                 return Ok(kind.exit_code() as i32);
             }
             _ => continue,
@@ -324,7 +322,7 @@ async fn print_config_changed_hint_if_any(socket_path: &Path, token: &SessionTok
 
 /// `pub(crate)`: shared with `agent.rs`'s config-changed note in both
 /// `agent check`'s report and `agent hook`'s outcomes.
-pub(crate) fn layers_changed(layers: &[WireLayer]) -> bool {
+pub fn layers_changed(layers: &[WireLayer]) -> bool {
     layers.iter().any(|layer| match std::fs::read(&layer.path) {
         Ok(bytes) => config::sha256_hex(&bytes) != layer.sha256,
         Err(_) => false,
