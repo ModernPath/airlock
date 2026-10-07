@@ -10,8 +10,10 @@ rules; this is a worked example.
   know, and shouldn't need to know, how each teammate keeps those
   credentials.
 - **[`global.toml`](global.toml)** — one user's `~/.config/airlock/airlock.toml`.
-  Binds `GH_TOKEN` to their own 1Password item, and adds an `aws` tool and
-  an env passthrough they want in every project, not just this one.
+  Binds `GH_TOKEN` to their own 1Password item, adds an `aws` tool and an
+  env passthrough they want in every project, and turns on the `rust` kit
+  for `airlock run` (isolated mode, the default — see
+  [README: Kits](../../README.md#kits)).
 - **[`airlock.local.toml`](airlock.local.toml)** — that same user's
   per-project file for `acme/app`. Links the repo's `GH_TOKEN` to their
   global binding with `from = "global"`, binds `CLOUDFLARE_API_TOKEN`
@@ -30,6 +32,7 @@ What `airlock run` actually registers, with the layer each item came from:
 | `filesystem.read` | `/opt/homebrew/share` | repo |
 | `agent.passthrough_env` | `COLORTERM`, `NO_COLOR` | union (global + repo) |
 | `agent.env.LOG_LEVEL` | `"debug"` | local (overrides the repo's `"info"`) |
+| `agent.kits` | `rust` | global |
 
 Nobody but this user sees `CLOUDFLARE_API_TOKEN` bound to this 1Password
 item, or that `GH_TOKEN` comes from the same place as their other projects'
