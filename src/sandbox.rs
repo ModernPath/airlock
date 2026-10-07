@@ -3660,6 +3660,7 @@ pub mod linux {
             env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
             let request = crate::exec::ExecRequest {
                 binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                arg0: "sh".to_string(),
                 args: vec![
                     "-c".to_string(),
                     "echo hidden >/dev/null 2>/dev/null".to_string(),
@@ -3800,6 +3801,7 @@ pub mod linux {
 
             let request = crate::exec::ExecRequest {
                 binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                arg0: "sh".to_string(),
                 args: vec!["-c".to_string(), probe_script],
                 work_dir: work,
                 env,
