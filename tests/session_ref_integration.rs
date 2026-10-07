@@ -130,6 +130,19 @@ fn revoke_with_an_ambiguous_name_refuses_and_ends_neither() {
     // Neither session was ended by the ambiguous ref.
     assert_eq!(fx.session_count(), 2);
 
+    // A unique id prefix ends exactly that session, reported by id and name.
+    let revoke = fx
+        .cmd()
+        .args(["session", "revoke", &id_a[..5]])
+        .output()
+        .unwrap();
+    assert!(revoke.status.success(), "{revoke:?}");
+    assert_eq!(
+        String::from_utf8_lossy(&revoke.stdout).trim(),
+        format!("ended {id_a} \"dup\"")
+    );
+    assert_eq!(fx.session_count(), 1);
+
     let _ = fx.cmd().args(["daemon", "stop", "--yes"]).output();
 }
 
