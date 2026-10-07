@@ -474,11 +474,31 @@ fn tokio_runtime_or_fail() -> Result<tokio::runtime::Runtime, ExitCode> {
     })
 }
 
+/// The line [`eprint_error`] prints, split out so the escaping itself is
+/// testable without capturing real stderr.
+fn format_error_line(message: impl std::fmt::Display) -> String {
+    format!(
+        "error: {}",
+        airlock::trust::escape_for_terminal(&message.to_string())
+    )
+}
+
+/// Prints an error whose text can carry content the user running this
+/// command never chose — a tool name or secret label from a project config
+/// not yet trusted, or a session name echoed back by the daemon. These
+/// reach the terminal before (or instead of) the trust prompt that would
+/// otherwise be the user's first look at that content, so they get the
+/// same escaping `airlock trust`'s review already gives it
+/// ([`airlock::trust::escape_for_terminal`]) rather than going out raw.
+fn eprint_error(message: impl std::fmt::Display) {
+    eprintln!("{}", format_error_line(message));
+}
+
 /// Prints a `LauncherError`'s message, unless it is `Aborted` (the launcher
 /// already printed everything the user needs to see).
 fn report_launcher_error(e: &LauncherError) {
     if !matches!(e, LauncherError::Aborted) {
-        eprintln!("error: {e}");
+        eprint_error(e);
     }
 }
 
@@ -584,7 +604,7 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
         Ok(code) => code,
         Err(run::RunError::Aborted) => ExitCode::from(125),
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             ExitCode::from(125)
         }
     }
@@ -798,7 +818,7 @@ fn cmd_trust(config: Option<PathBuf>, yes: bool, expect_sha256: Vec<String>) -> 
         Ok(()) => ExitCode::SUCCESS,
         Err(LauncherError::Aborted) => ExitCode::from(125),
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             ExitCode::from(125)
         }
     }
@@ -1022,11 +1042,11 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
             return ExitCode::from(125);
         }
         Err(AdminError::Daemon { message, .. }) => {
-            eprintln!("error: {message}");
+            eprint_error(message);
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     }
@@ -1085,7 +1105,7 @@ fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     };
@@ -1127,7 +1147,7 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     };
@@ -1209,7 +1229,7 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     };
@@ -1247,7 +1267,7 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     }
@@ -1331,14 +1351,14 @@ fn cmd_daemon_stop(yes: bool) -> ExitCode {
             return ExitCode::SUCCESS;
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     };
     let token = match launcher::read_admin_token(&runtime) {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     };
@@ -1382,7 +1402,7 @@ fn cmd_daemon_stop(yes: bool) -> ExitCode {
             return ExitCode::from(125);
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             return ExitCode::from(125);
         }
     }
@@ -1417,7 +1437,7 @@ fn cmd_daemon_logs(session: Option<String>) -> ExitCode {
             ExitCode::from(125)
         }
         Err(e) => {
-            eprintln!("error: {e}");
+            eprint_error(e);
             ExitCode::from(125)
         }
     }
@@ -1432,11 +1452,11 @@ fn connect_admin()
         ExitCode::from(125)
     })?;
     let conn = admin::Connection::connect(&runtime.socket_path()).map_err(|e| {
-        eprintln!("error: {e}");
+        eprint_error(e);
         ExitCode::from(125)
     })?;
     let token = launcher::read_admin_token(&runtime).map_err(|e| {
-        eprintln!("error: {e}");
+        eprint_error(e);
         ExitCode::from(125)
     })?;
     Ok((conn, token, runtime))
@@ -1482,4 +1502,29 @@ fn layers_changed_on_disk(layers: &[airlock::protocol::WireLayer]) -> bool {
         Ok(bytes) => airlock::config::sha256_hex(&bytes) != l.sha256,
         Err(_) => false,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `ConfigError`/`LauncherError`/`AdminError`'s text can echo a tool
+    /// name, secret label or session name the user hasn't trusted yet; the
+    /// terminal must not run it. `escape_for_terminal` keeps newlines (an
+    /// error is allowed to span lines) but neutralizes a control sequence.
+    #[test]
+    fn format_error_line_escapes_terminal_hostile_text() {
+        let line = format_error_line(format!(
+            "invalid tool name {:?}: tool names may only contain ASCII letters, digits, '.', '_', '+' and '-'",
+            "tool\u{1b}[31mname"
+        ));
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(line.starts_with("error: "), "{line:?}");
+    }
+
+    #[test]
+    fn format_error_line_keeps_newlines() {
+        let line = format_error_line("first line\nsecond line");
+        assert_eq!(line, "error: first line\nsecond line");
+    }
 }

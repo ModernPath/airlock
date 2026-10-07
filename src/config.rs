@@ -78,12 +78,17 @@ pub enum ConfigError {
         source: toml::de::Error,
     },
 
-    /// A tool name contains a path separator character.
+    /// A tool name contains a character outside the allowed set.
     ///
-    /// Tool names must be bare identifiers (e.g., `"mytool"`, `"python3"`);
-    /// names containing `/` or `\` are rejected at parse time for safety.
+    /// Tool names must be bare identifiers (e.g., `"mytool"`, `"python3"`):
+    /// ASCII letters, digits, `.`, `_`, `+` and `-` only. This is narrower
+    /// than "not a path separator" because the name is interpolated,
+    /// unescaped, into error messages a user reads before ever approving
+    /// the config that chose it — a control character, bidi override or
+    /// zero-width character in the name could otherwise reorder or hide
+    /// terminal text at that point.
     #[error(
-        "invalid tool name {name:?}: tool names must not contain path separators ('/' or '\\')"
+        "invalid tool name {name:?}: tool names may only contain ASCII letters, digits, '.', '_', '+' and '-'"
     )]
     InvalidToolName {
         /// The offending tool name.
@@ -1126,7 +1131,11 @@ pub fn project_id(root: &Path) -> String {
 /// up front and `exec::resolve_binary_in` never has to consider it.
 /// `\` is also rejected for cross-platform safety.
 pub(crate) fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
-    if name.contains('/') || name.contains('\\') {
+    let is_sane = !name.is_empty()
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '+' | '-'));
+    if !is_sane {
         return Err(ConfigError::InvalidToolName {
             name: name.to_string(),
         });
@@ -2197,6 +2206,8 @@ S = { secret = "s" }
         assert!(validate_tool_name("my-tool").is_ok());
         assert!(validate_tool_name("my_tool").is_ok());
         assert!(validate_tool_name("TOOL").is_ok());
+        assert!(validate_tool_name("my.tool").is_ok());
+        assert!(validate_tool_name("my+tool").is_ok());
     }
 
     // ── Tool name validation: forward slash rejected ─────────────────────
@@ -2219,6 +2230,59 @@ S = { secret = "s" }
         assert!(
             matches!(result.unwrap_err(), ConfigError::InvalidToolName { name } if name == "path\\to\\tool")
         );
+    }
+
+    // ── Tool name validation: terminal-hostile characters rejected ───────
+    //
+    // A tool name is interpolated unescaped into error messages printed
+    // before the config that chose it has been trusted (`report_launcher_error`
+    // and friends in src/main.rs). These would otherwise let an untrusted
+    // config manipulate that terminal output.
+
+    #[test]
+    fn tool_name_control_character_rejected() {
+        assert!(matches!(
+            validate_tool_name("tool\x1b[31mred"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+        assert!(matches!(
+            validate_tool_name("tool\nname"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_bidi_override_rejected() {
+        // U+202E RIGHT-TO-LEFT OVERRIDE.
+        assert!(matches!(
+            validate_tool_name("tool\u{202e}loot"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_zero_width_character_rejected() {
+        // U+200B ZERO WIDTH SPACE.
+        assert!(matches!(
+            validate_tool_name("too\u{200b}l"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_space_rejected() {
+        assert!(matches!(
+            validate_tool_name("my tool"),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
+    }
+
+    #[test]
+    fn tool_name_empty_rejected() {
+        assert!(matches!(
+            validate_tool_name(""),
+            Err(ConfigError::InvalidToolName { .. })
+        ));
     }
 
     // ── Tool name validation in parsing context ──────────────────────────
