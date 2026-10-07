@@ -24,7 +24,6 @@ use clap::ValueEnum;
 use thiserror::Error;
 use tokio::process::{Child, Command};
 
-use crate::admin::Connection;
 use crate::config::{AgentConfig, EnvValue};
 use crate::launcher::{self, DiscoverOpts, LauncherError, PrepareOptions, Prepared};
 use crate::policy::build_agent_policy;
@@ -399,7 +398,7 @@ pub fn run_agent(
             .map_err(RunError::SpawnFailed)?;
 
         let lease_ended = match session {
-            Some(s) => watch_lease(s.conn),
+            Some(s) => watch_lease(s.lease),
             // No session to watch: a receiver whose sender we deliberately
             // never drop (leaking the sender half, scoped to this process's
             // lifetime) so it never resolves and the `lease_ended` branch in
@@ -431,10 +430,10 @@ fn resolve_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
 
 /// The session a leased `airlock run` registered: its token (for
 /// `AIRLOCK_SESSION`) and the still-open admin connection, which the daemon
-/// treats as the lease — closing it (dropping `conn`) ends the session.
+/// treats as the lease — closing it (dropping `lease`) ends the session.
 struct Session {
     token: crate::protocol::SessionToken,
-    conn: Connection,
+    lease: std::os::unix::net::UnixStream,
 }
 
 fn start_session(
@@ -466,17 +465,17 @@ fn start_session(
             if n == 1 { "" } else { "s" }
         );
     }
-    Ok(Session { token, conn })
+    let lease = conn.into_raw().map_err(LauncherError::from)?;
+    Ok(Session { token, lease })
 }
 
 /// Spawns a blocking watcher on the lease connection's raw socket. Resolves
 /// (sends on the oneshot) when the daemon closes it — which means the
 /// session ended (revoked, or the daemon stopped) — so `signal_loop` can
 /// tell the user while the agent keeps running.
-fn watch_lease(conn: Connection) -> tokio::sync::oneshot::Receiver<()> {
+fn watch_lease(mut stream: std::os::unix::net::UnixStream) -> tokio::sync::oneshot::Receiver<()> {
     let (tx, rx) = tokio::sync::oneshot::channel();
     std::thread::spawn(move || {
-        let mut stream = conn.into_raw();
         let mut buf = [0u8; 1];
         // Any read outcome (EOF, data, or error) means the connection is no
         // longer a quiet, open lease; either is a reason to notify.

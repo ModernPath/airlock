@@ -150,6 +150,39 @@ fn run_with_session_registers_and_execs_through_the_daemon() {
     assert!(output.status.success(), "{output:?}");
 }
 
+// The whole point of `airlock run`: the sandboxed agent reaches the daemon
+// through `AIRLOCK_ADDR`/`AIRLOCK_SESSION` and runs a tool. The agent first
+// outlives the 10-second request timeout the launcher's admin connection
+// starts with — the lease must not inherit it, or the session ends under the
+// agent. A dev build sits outside the agent's default read grants, hence
+// `--allow-read` for its directory. `PATH` is pinned to the system's own
+// binaries: a tool profile grants the tool binary but not the libraries a
+// Nix or Homebrew build links from elsewhere, so the `echo` a dev shell puts
+// first would need a `filesystem_read` this test has no reason to declare.
+#[test]
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+fn run_agent_execs_a_tool_through_its_session_after_ten_seconds() {
+    let fx = Fixture::new();
+    fx.write_config(minimal_config());
+    let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
+    assert!(trust_output.status.success(), "{trust_output:?}");
+
+    let bin_dir = Path::new(airlock_bin()).parent().unwrap();
+    let agent_script = format!("sleep 11 && '{}' exec -- echo via-daemon", airlock_bin());
+    let output = fx
+        .cmd()
+        .env("AIRLOCK_TEST_IDLE_EXIT_SECS", "1")
+        .env("PATH", "/usr/bin:/bin")
+        .arg("run")
+        .arg("--allow-read")
+        .arg(bin_dir)
+        .args(["--", "/bin/sh", "-c", &agent_script])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "via-daemon\n");
+}
+
 // Sanity check that the fixture's runtime dir is actually usable by
 // `anchors::validate` the way the other tests assume (mode 0700, owned by
 // us) — catches a fixture regression before it masquerades as a product
