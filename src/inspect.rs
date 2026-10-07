@@ -215,6 +215,11 @@ pub struct ToolRow {
     /// `(VAR, LABEL)` for each `env` entry that references a secret —
     /// static values are not shown here.
     pub secret_env: Vec<(String, String)>,
+    /// Effective `access` level plus provenance, e.g. `"default"` (built-in,
+    /// nothing sets it), `"system (global)"` (inherited from the top-level
+    /// default some layer set), or `"none (repo)"` (the tool's own
+    /// override).
+    pub access_text: String,
     pub replaces_global: bool,
     pub unapproved: bool,
 }
@@ -224,6 +229,10 @@ pub struct ToolRow {
 pub enum SettingRow {
     Timeout {
         value: u64,
+        layer_text: String,
+    },
+    Access {
+        value: String,
         layer_text: String,
     },
     FilesystemPath {
@@ -333,6 +342,7 @@ pub fn render_config(report: &ConfigReport) -> String {
                     t.layer_text.clone(),
                     esc(&t.description),
                     secret_env,
+                    esc(&t.access_text),
                     marker,
                 ]
             })
@@ -406,6 +416,13 @@ fn render_settings_rows(settings: &[SettingRow]) -> String {
                 "timeout".to_string(),
                 "timeout".to_string(),
                 value.to_string(),
+                layer_text.clone(),
+                String::new(),
+            ),
+            SettingRow::Access { value, layer_text } => (
+                "access".to_string(),
+                "access".to_string(),
+                esc(value),
                 layer_text.clone(),
                 String::new(),
             ),
@@ -598,11 +615,20 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
                     }
                 }
             }
+            let access_text = match &tool.access {
+                Some(a) => format!("{a} ({})", layer_label(layer)),
+                None => match (&wire.access, prov.settings.access) {
+                    (Some(v), Some(top_layer)) => format!("{v} ({})", layer_label(top_layer)),
+                    (Some(v), None) => v.clone(),
+                    (None, _) => "default".to_string(),
+                },
+            };
             tools.push(ToolRow {
                 name: name.clone(),
                 layer_text: layer_label(layer).to_string(),
                 description: tool.description.clone().unwrap_or_default(),
                 secret_env,
+                access_text,
                 replaces_global,
                 unapproved,
             });
@@ -613,6 +639,12 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
     if let (Some(value), Some(layer)) = (wire.timeout, prov.settings.timeout) {
         settings.push(SettingRow::Timeout {
             value,
+            layer_text: layer_label(layer).to_string(),
+        });
+    }
+    if let (Some(value), Some(layer)) = (&wire.access, prov.settings.access) {
+        settings.push(SettingRow::Access {
+            value: value.clone(),
             layer_text: layer_label(layer).to_string(),
         });
     }
@@ -1479,6 +1511,7 @@ mod tests {
                     layer_text: "global".to_string(),
                     description: "AWS CLI".to_string(),
                     secret_env: vec![],
+                    access_text: "default".to_string(),
                     replaces_global: false,
                     unapproved: false,
                 },
@@ -1487,6 +1520,7 @@ mod tests {
                     layer_text: "repo".to_string(),
                     description: "GitHub CLI".to_string(),
                     secret_env: vec![("GH_TOKEN".to_string(), "GH_TOKEN".to_string())],
+                    access_text: "default".to_string(),
                     replaces_global: false,
                     unapproved: false,
                 },
@@ -1495,6 +1529,7 @@ mod tests {
                     layer_text: "local".to_string(),
                     description: "Postgres shell".to_string(),
                     secret_env: vec![],
+                    access_text: "none (local)".to_string(),
                     replaces_global: false,
                     unapproved: true,
                 },
@@ -1541,11 +1576,20 @@ mod tests {
         );
 
         assert!(out.contains("tools\n"));
-        assert!(lines.contains(&"gh repo GitHub CLI GH_TOKEN = <secret \"GH_TOKEN\">".to_string()));
+        assert!(
+            lines.contains(
+                &"gh repo GitHub CLI GH_TOKEN = <secret \"GH_TOKEN\"> default".to_string()
+            )
+        );
         assert!(
             lines
                 .iter()
                 .any(|l| l.starts_with("psql local Postgres shell") && l.ends_with("(unapproved)"))
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.starts_with("psql") && l.contains("none (local)"))
         );
 
         assert!(out.contains("settings\n"));
@@ -1576,6 +1620,90 @@ mod tests {
         assert_eq!(out, "layers\n  repo  airlock.toml  trusted\n");
     }
 
+    // ── build_config_report: access level provenance ─────────────────────
+
+    #[test]
+    fn build_config_report_shows_tool_access_with_provenance() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let global = home.join("global.toml");
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(
+            root.join("airlock.toml"),
+            r#"
+access = "system"
+
+[tools.aws]
+description = "AWS CLI"
+
+[tools.gh]
+description = "GitHub CLI"
+access = "none"
+"#,
+        )
+        .unwrap();
+
+        let loaded = layers::load_layers(&DiscoveryMode::Default, &root, home, &global).unwrap();
+        let ctx = MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: home.to_path_buf(),
+        };
+        let merged = layers::merge(&loaded, &ctx).unwrap();
+        let report = build_config_report(&merged, &[]);
+
+        // "aws" doesn't set its own access — it shows the effective
+        // top-level default and which layer set it.
+        let aws = report.tools.iter().find(|t| t.name == "aws").unwrap();
+        assert_eq!(aws.access_text, "system (repo)");
+
+        // "gh" overrides access on the tool itself — provenance is the
+        // tool's own layer, independent of the top-level setting.
+        let gh = report.tools.iter().find(|t| t.name == "gh").unwrap();
+        assert_eq!(gh.access_text, "none (repo)");
+
+        assert!(report.settings.iter().any(|s| matches!(
+            s,
+            SettingRow::Access { value, layer_text }
+                if value == "system" && layer_text == "repo"
+        )));
+    }
+
+    #[test]
+    fn build_config_report_tool_access_defaults_when_nothing_sets_it() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let root = home.join("project");
+        std::fs::create_dir(&root).unwrap();
+        let global = home.join("global.toml");
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(
+            root.join("airlock.toml"),
+            "[tools.aws]\ndescription = \"AWS CLI\"\n",
+        )
+        .unwrap();
+
+        let loaded = layers::load_layers(&DiscoveryMode::Default, &root, home, &global).unwrap();
+        let ctx = MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: home.to_path_buf(),
+        };
+        let merged = layers::merge(&loaded, &ctx).unwrap();
+        let report = build_config_report(&merged, &[]);
+
+        let aws = report.tools.iter().find(|t| t.name == "aws").unwrap();
+        assert_eq!(aws.access_text, "default");
+        assert!(
+            !report
+                .settings
+                .iter()
+                .any(|s| matches!(s, SettingRow::Access { .. }))
+        );
+    }
+
     #[test]
     fn render_config_tool_replacing_global_is_marked() {
         let report = ConfigReport {
@@ -1589,6 +1717,7 @@ mod tests {
                 layer_text: "repo".to_string(),
                 description: "GitHub CLI".to_string(),
                 secret_env: vec![],
+                access_text: "default".to_string(),
                 replaces_global: true,
                 unapproved: false,
             }],
@@ -1596,7 +1725,9 @@ mod tests {
         };
         let out = render_config(&report);
         // Matches docs/airlock-v2-design.md, "Duplicate tool".
-        assert!(norm_lines(&out).contains(&"gh repo GitHub CLI (replaces global)".to_string()));
+        assert!(
+            norm_lines(&out).contains(&"gh repo GitHub CLI default (replaces global)".to_string())
+        );
     }
 
     #[test]
@@ -1615,6 +1746,7 @@ mod tests {
                 layer_text: "repo".to_string(),
                 description: "evil\u{202e}desc\x1b[31m".to_string(),
                 secret_env: vec![],
+                access_text: "default".to_string(),
                 replaces_global: false,
                 unapproved: true,
             }],
