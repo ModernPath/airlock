@@ -24,7 +24,7 @@
 
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 
 use similar::{ChangeTag, TextDiff};
@@ -148,10 +148,8 @@ fn ensure_dir(dir: &Path) -> Result<(), TrustError> {
         }),
         Ok(_) => Ok(()),
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            std::fs::create_dir_all(dir).map_err(|source| TrustError::io(dir, source))?;
-            std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
-                .map_err(|source| TrustError::io(dir, source))?;
-            Ok(())
+            crate::anchors::create_private_dir_all(dir)
+                .map_err(|source| TrustError::io(dir, source))
         }
         Err(source) => Err(TrustError::io(dir, source)),
     }

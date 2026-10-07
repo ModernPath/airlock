@@ -10,8 +10,7 @@
 //! this module produces.
 
 use std::collections::HashMap;
-use std::io::{self, Write};
-use std::os::unix::fs::DirBuilderExt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
@@ -1174,16 +1173,6 @@ impl GitRunner for RealGitRunner {
     }
 }
 
-fn create_dir_0700(dir: &Path) -> io::Result<()> {
-    if dir.is_dir() {
-        return Ok(());
-    }
-    std::fs::DirBuilder::new()
-        .recursive(true)
-        .mode(0o700)
-        .create(dir)
-}
-
 /// Labels in `[secrets.<label>]` with neither `source` nor `from` — the
 /// repo's own "this project needs X, bind it yourself" requests.
 fn unbound_repo_labels(repo: &config::RawConfig) -> Vec<(String, Option<String>)> {
@@ -1288,7 +1277,7 @@ fn init_global(home: &Path, global_config: &Path, out: &mut dyn Write) -> ExitCo
         writeln!(out, "error: {} already exists", display_path(path, home)).ok();
         return ExitCode::from(125);
     }
-    if let Err(e) = create_dir_0700(dir) {
+    if let Err(e) = crate::anchors::create_private_dir_all(dir) {
         writeln!(
             out,
             "error: failed to create {}: {e}",
