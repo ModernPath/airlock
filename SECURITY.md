@@ -147,6 +147,18 @@ The streaming implementation (`aho-corasick`'s `try_stream_replace_all`) correct
 
 Tools, and the agent itself under `airlock run`, run with **deny-by-default** filesystem access, enforced by OS-level mechanisms.
 
+### Tool access levels
+
+Beyond a tool's own grants (project root, `[filesystem]`, `extra_read`/`extra_write`, its own binary, a proxy tool's CA — unaffected by this setting, at every level), the daemon also layers in a *built-in* filesystem baseline, sized by that tool's `access` level (`tools.<name>.access`, or the config's top-level `access`; see [README.md](README.md#access-how-much-of-the-system-a-tools-sandbox-sees)):
+
+- **`none`** — just the dynamic linker, the shared library cache, and `/dev/null`. Nothing else of the system.
+- **`system`** — `none` plus the fixed baseline described below (system libraries, binaries, shared data, configuration).
+- **`default`** — `system` plus read-only `/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, and `/home/linuxbrew/.linuxbrew`. **This is the default when `access` is unset anywhere** — a deliberate widening over the pre-`access` baseline, approved so Nix- and Homebrew-built tools work without per-tool `extra_read` entries.
+
+  `/usr/local/etc` and `/opt/homebrew/etc` are inside those toolchain roots and can hold other installed services' configuration — not secrets Airlock itself manages, but data a tool at `default` can now read that it couldn't before. A project that cares picks `system` or `none` for tools that don't need a toolchain root, instead of relying on the default.
+
+The agent's own sandbox is **not** governed by `access` — it always gets the `none` + `system` baseline, same as every tool did before `access` existed.
+
 ### macOS — Apple Seatbelt (SBPL)
 
 The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execution, and the launcher generates one for the agent:
@@ -157,7 +169,7 @@ The daemon generates an SBPL (Scheme-based) sandbox profile for each tool execut
 - **Mach IPC**: `mach-lookup` is an explicit allowlist (no blanket allow). `(deny mach-priv*)` blocks privileged operations.
   - **Keychain is out of the baseline.** `com.apple.SecurityServer`, `com.apple.securityd.xpc`, and every other Mach endpoint that fronts Keychain Services are intentionally absent from the allowlist. A sandboxed process running under the baseline (or under the strict `claude` profile) cannot read or write any keychain item. TLS trust evaluation (`SecTrustEvaluate`, `SecPolicyCreateSSL`) reaches the network through `com.apple.trustd.agent` and does not depend on `securityd` — verified empirically — so dropping the keychain services does not affect HTTPS. Profiles that need keychain access opt back in: see `claude-relaxed` under "Built-in agent profiles" below.
   - **File-change notification is in the baseline.** `com.apple.FSEvents` is on the allowlist because every macOS file watcher goes through it — without it `node --watch`, nodemon, vite, and `cargo watch` fail, and they fail unrecognisably: libuv surfaces a failed `FSEventStreamStart` as `EMFILE: too many open files, watch` even with a 1M descriptor limit, and Bun reports `error: Error starting FSEvents stream`. The capability is notification-only: reading a changed file still goes through the filesystem rules. It does widen metadata disclosure — an event stream rooted outside the sandbox reports the *paths* of files the process cannot open — which is the accepted cost of working dev servers.
-- **Baseline filesystem reads**: `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification). `/dev/null` is the one exception to "reads": it also gets `file-write*` and `file-ioctl`, since shells open it `O_WRONLY` for `2>/dev/null` redirection.
+- **Baseline filesystem reads** (the `system` access level; `none` drops this to just the dynamic linker (`/usr/lib/dyld`) and the dyld shared cache — verified empirically with `sandbox-exec` that this alone runs `/bin/echo` but not `cat /etc/hosts` or `ls /usr/share`; `default` adds the toolchain roots above): `/usr/lib`, `/usr/share`, `/System`, `/Library`, `/private/etc`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, and the tool binary itself (needed for TLS code signature verification, granted at every level). `/dev/null` is the one exception to "reads": it also gets `file-write*` and `file-ioctl`, since shells open it `O_WRONLY` for `2>/dev/null` redirection, and is granted at every level including `none`.
 - **Config-declared paths**: `(allow file-read* (subpath ...))` for read paths; `(allow file-write* (subpath ...))` for write paths.
 - **The runtime base, `admin.token` and `.git/hooks` are denied last, after every allow.** In SBPL the *last* matching rule wins, so a deny placed before a broader allow (`$TMPDIR`, `agent.filesystem.write`, `--allow-write`, a built-in profile rule) would be silently re-enabled by it. Every agent and tool profile therefore ends with, in this order:
   1. `(deny file-write* (subpath "<root>/.git/hooks"))` — [F9](#git-hooks-write-denial-f9), defense in depth.
@@ -184,7 +196,7 @@ Git hooks run with no review step, on ordinary commands (`commit`, `push`, and `
 
 The daemon uses Landlock (kernel 5.13+) with **ABI V1 and hard requirement** — if Landlock is not available, the daemon refuses to start rather than silently degrading.
 
-- **Baseline filesystem reads** (mirrors the macOS Seatbelt baseline; missing entries are silently skipped): `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`, `/usr/share`, `/usr/bin`, `/bin`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`. These are required by the dynamic linker, libc, TLS trust store, and entropy sources; they contain no user secrets. As on macOS, `/dev/null` is also writable, for `2>/dev/null` redirection.
+- **Baseline filesystem reads** (the `system` access level, mirroring the macOS Seatbelt baseline; missing entries are silently skipped): `/usr/lib`, `/usr/lib64`, `/lib`, `/lib64`, `/usr/share`, `/usr/bin`, `/bin`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`. These are required by the dynamic linker, libc, TLS trust store, and entropy sources; they contain no user secrets. As on macOS, `/dev/null` is also writable, for `2>/dev/null` redirection. `none` drops this to just `/lib`, `/lib64`, `/usr/lib`, `/usr/lib64`, `/etc/ld.so.cache`, and `/dev/null`; `default` adds the toolchain roots from the previous section, also skipped when absent.
 - Read paths → `PathBeneath` with `AccessFs::from_read(abi)`
 - Read-write paths → `PathBeneath` with `AccessFs::from_all(abi)`
 - The Landlock ruleset fd is pre-built, extracted as an `OwnedFd`, and its raw integer is passed into the `pre_exec` closure (inherited across fork).

@@ -180,6 +180,35 @@ No sandbox gets write access to the runtime dir.
   the anchor check refuses any config or `--allow-write` that would grant
   the base.
 
+### Tool filesystem access levels
+
+Separately from the runtime dir, a tool's sandbox also gets a *built-in*
+filesystem baseline sized by a new `access` level — `tools.<name>.access`,
+falling back to a top-level `access` default, falling back to
+`ToolAccess::Default` when neither is set (merge rule: highest layer that
+sets it wins, same as `timeout`). It governs only this baseline; the
+project root, `[filesystem]`, `extra_read`/`extra_write`, the tool's own
+binary, and a proxy tool's CA are granted at every level, unchanged.
+
+- **`none`** — the dynamic linker, the shared library cache, and
+  `/dev/null`. The bare minimum to exec and exit.
+- **`system`** — `none` plus the fixed baseline every tool got before this
+  setting existed (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,random,
+  urandom}`, ... on macOS; the Linux equivalent via Landlock).
+- **`default`** — `system` plus read-only toolchain roots (`/nix/store`,
+  `/opt/homebrew`, `/usr/local`, `/opt/local`, `/home/linuxbrew/.linuxbrew`
+  — one shared constant, `TOOLCHAIN_ROOTS` in
+  [src/sandbox.rs](../src/sandbox.rs)). **This is the default when `access`
+  is unset anywhere** — a deliberate widening over the pre-`access`
+  baseline, approved so Nix- and Homebrew-built tools stop failing with
+  `dyld`/`ld.so` "blocked by sandbox" without per-tool `extra_read` entries.
+
+The agent's own profile is never governed by `access` — it keeps the
+`none` + `system` baseline unconditionally, exactly as before. See
+[SECURITY.md](../SECURITY.md#tool-access-levels) for the per-level
+tradeoffs and [README.md](../README.md#access-how-much-of-the-system-a-tools-sandbox-sees)
+for the config surface.
+
 ### Stale state and migration
 
 Stale-state cleanup works as today (`check_and_cleanup_stale_state`), but in
@@ -252,6 +281,7 @@ must not hold a secret" is checked against the merged tools.
 | `agent.filesystem.read`, `agent.filesystem.write` | union |
 | `agent.env.<VAR>` | per key, highest layer wins |
 | `timeout`, `agent.timeout` | highest layer that sets it |
+| `access` (top-level) | highest layer that sets it; see [Tool filesystem access levels](#tool-filesystem-access-levels) |
 | `allow_home_root` | Honored in global or local. In the repo layer it is a config error. |
 | `agent.kits` | union across layers (see [Kits](#kits)) |
 | `[kits.<name>]` | Honored in global or local, local wins whole by name. In the repo layer it is a config error. Launcher-only — never part of the wire config. |
@@ -1866,3 +1896,11 @@ proposed:
   and `tool_state_base`, called only from `prepare` (for `airlock run`) and
   from `airlock config`'s own display — never from `layers::merge`, which
   by design never reads the environment.
+- **Tool `access` levels shipped as proposed in [Tool filesystem access
+  levels](#tool-filesystem-access-levels)**, added after the rest of this
+  doc: the macOS `none` baseline (dyld plus the shared cache) was
+  determined empirically with `sandbox-exec`, not derived from any existing
+  Seatbelt documentation — `/usr/lib/dyld` plus
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` (with
+  `/System/Library/dyld` as a pre-cryptex fallback) is both necessary and
+  sufficient for `/bin/echo hi` to run.
