@@ -98,40 +98,30 @@ pub fn kit_state_dir(tool_state_base: &Path, project_id: &str, kit: &str) -> Pat
 }
 
 /// The env var names a kit sets, for the `[agent.env.<key>]`-vs-kit
-/// collision check ([`check_env_collision`]). Shared mode never sets env,
-/// so this is only non-empty for an isolated built-in or a user-defined
-/// kit (which has no mode at all).
+/// collision check ([`check_env_collision`]). A built-in's names are read
+/// off its own expansion, not kept in a second list that would have to be
+/// updated by hand alongside it; which names a mode sets never depends on
+/// the inputs, only their values do.
 fn env_var_names(name: &str, mode: Mode, kit_defs: &BTreeMap<String, RawKitConfig>) -> Vec<String> {
     if is_builtin(name) {
-        if mode == Mode::Shared {
-            return Vec::new();
-        }
-        builtin_isolated_env_names(name)
-            .iter()
-            .map(|s| s.to_string())
+        let no_env = BTreeMap::new();
+        let inputs = Inputs {
+            home: Path::new("/"),
+            env: &no_env,
+            platform: Platform::current(),
+            project_id: "",
+            tool_state_base: Path::new("/"),
+            root: Path::new("/"),
+        };
+        expand_builtin(name, mode, &inputs, Path::new("/"))
+            .env
+            .into_keys()
             .collect()
     } else {
         kit_defs
             .get(name)
             .map(|d| d.env.keys().cloned().collect())
             .unwrap_or_default()
-    }
-}
-
-fn builtin_isolated_env_names(kit: &str) -> &'static [&'static str] {
-    match kit {
-        "rust" => &["CARGO_HOME"],
-        "node" => &[
-            "npm_config_cache",
-            "YARN_CACHE_FOLDER",
-            "npm_config_store_dir",
-            "BUN_INSTALL_CACHE_DIR",
-            "COREPACK_HOME",
-        ],
-        "python" => &["PIP_CACHE_DIR", "UV_CACHE_DIR", "POETRY_CACHE_DIR"],
-        "go" => &["GOMODCACHE", "GOCACHE", "GOPATH"],
-        "elixir" => &["MIX_HOME", "HEX_HOME", "REBAR_CACHE_DIR"],
-        _ => &[],
     }
 }
 
@@ -976,6 +966,20 @@ mod tests {
         let err =
             check_env_collision(Some(&agent), &["rust".to_string()], &BTreeMap::new()).unwrap_err();
         assert!(matches!(err, ConfigError::AgentEnvSetByKit { kit, .. } if kit == "rust"));
+    }
+
+    #[test]
+    fn check_env_collision_catches_every_var_an_isolated_builtin_sets() {
+        let agent = RawAgentConfig {
+            env: HashMap::from([(
+                "MIX_ARCHIVES".to_string(),
+                crate::config::RawEnvValue::Static("/x".to_string()),
+            )]),
+            ..Default::default()
+        };
+        let err = check_env_collision(Some(&agent), &["elixir".to_string()], &BTreeMap::new())
+            .unwrap_err();
+        assert!(matches!(err, ConfigError::AgentEnvSetByKit { kit, .. } if kit == "elixir"));
     }
 
     #[test]
