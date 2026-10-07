@@ -704,9 +704,7 @@ pub fn register(
     }));
     match conn.admin_request(token, request)? {
         DaemonMessage::Registered { id, token, ca_path } => Ok((id, token, ca_path)),
-        _ => Err(LauncherError::Message(
-            "unexpected response from the daemon".to_string(),
-        )),
+        _ => Err(AdminError::UnexpectedResponse.into()),
     }
 }
 
@@ -728,10 +726,7 @@ pub fn reload(
             changes,
             agent_changed,
         } => Ok((id, changes, agent_changed)),
-        DaemonMessage::Error { message, .. } => Err(LauncherError::Message(message)),
-        _ => Err(LauncherError::Message(
-            "unexpected response from the daemon".to_string(),
-        )),
+        _ => Err(AdminError::UnexpectedResponse.into()),
     }
 }
 

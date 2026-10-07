@@ -16,7 +16,7 @@ use thiserror::Error;
 
 use crate::protocol::{
     AdminRequest, AdminToken, Auth, ClientHello, DaemonMessage, DaemonMode, ErrorKind,
-    MAX_ADMIN_LINE_BYTES, PROTOCOL_VERSION, Request, RequestBody,
+    MAX_ADMIN_LINE_BYTES, PROTOCOL_VERSION, Request, RequestBody, SessionInfo,
 };
 
 /// Errors talking to the daemon's admin family.
@@ -146,6 +146,22 @@ impl Connection {
             },
         )?;
         read_message(&mut self.reader)
+    }
+
+    /// Sends `body` and expects a bare `Ok` back.
+    pub fn request_ok(&mut self, token: &AdminToken, body: AdminRequest) -> Result<(), AdminError> {
+        match self.admin_request(token, body)? {
+            DaemonMessage::Ok => Ok(()),
+            _ => Err(AdminError::UnexpectedResponse),
+        }
+    }
+
+    /// Every live session.
+    pub fn list_sessions(&mut self, token: &AdminToken) -> Result<Vec<SessionInfo>, AdminError> {
+        match self.admin_request(token, AdminRequest::ListSessions)? {
+            DaemonMessage::Sessions { sessions } => Ok(sessions),
+            _ => Err(AdminError::UnexpectedResponse),
+        }
     }
 
     /// Unwraps the connection into its raw socket, for a `Register { ends:
@@ -303,6 +319,30 @@ mod tests {
             sent.body,
             RequestBody::Admin(AdminRequest::ListSessions)
         ));
+    }
+
+    #[test]
+    fn typed_requests_refuse_a_reply_of_the_wrong_shape() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("airlock.sock");
+        let token = AdminToken::parse(&"a".repeat(64)).unwrap();
+
+        let handle = fake_daemon(socket_path.clone(), ok_hello(), DaemonMessage::Ok);
+        let mut conn = Connection::connect(&socket_path).unwrap();
+        let err = conn.list_sessions(&token).unwrap_err();
+        assert!(matches!(err, AdminError::UnexpectedResponse), "{err:?}");
+        let _ = handle.join();
+
+        let socket_path = dir.path().join("airlock2.sock");
+        let handle = fake_daemon(
+            socket_path.clone(),
+            ok_hello(),
+            DaemonMessage::Sessions { sessions: vec![] },
+        );
+        let mut conn = Connection::connect(&socket_path).unwrap();
+        let err = conn.request_ok(&token, AdminRequest::Stop).unwrap_err();
+        assert!(matches!(err, AdminError::UnexpectedResponse), "{err:?}");
+        let _ = handle.join();
     }
 
     #[test]

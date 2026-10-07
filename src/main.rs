@@ -1042,26 +1042,14 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
         Err(code) => return code,
     };
 
-    match conn.admin_request(
+    if let Err(e) = conn.request_ok(
         &token,
         AdminRequest::Renew {
             session: id.clone(),
             ttl_secs,
         },
     ) {
-        Ok(DaemonMessage::Ok) => {}
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(AdminError::Daemon { message, .. }) => {
-            eprint_error(message);
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+        return admin_failed(e);
     }
 
     match find_session(&mut conn, &token, &id) {
@@ -1100,16 +1088,9 @@ fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
         Ok(v) => v,
         Err(code) => return code,
     };
-    let sessions = match conn.admin_request(&token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => sessions,
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+    let sessions = match conn.list_sessions(&token) {
+        Ok(sessions) => sessions,
+        Err(e) => return admin_failed(e),
     };
 
     let project_root = discover_root_quietly(cwd);
@@ -1142,16 +1123,9 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
         Ok(v) => v,
         Err(code) => return code,
     };
-    let sessions = match conn.admin_request(&token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => sessions,
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+    let sessions = match conn.list_sessions(&token) {
+        Ok(sessions) => sessions,
+        Err(e) => return admin_failed(e),
     };
 
     let project_root = discover_root_quietly(cwd);
@@ -1236,16 +1210,9 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
         Err(code) => return code,
     };
 
-    let sessions = match conn.admin_request(&token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => sessions,
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+    let sessions = match conn.list_sessions(&token) {
+        Ok(sessions) => sessions,
+        Err(e) => return admin_failed(e),
     };
 
     // Refs resolve by the daemon's rule (exact id, unique id prefix, unique
@@ -1276,25 +1243,13 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
         return ExitCode::from(125);
     }
 
-    match conn.admin_request(
+    if let Err(e) = conn.request_ok(
         &token,
         AdminRequest::Revoke {
             sessions: targets.iter().map(|s| s.id.to_string()).collect(),
         },
     ) {
-        Ok(DaemonMessage::Ok) => {}
-        Ok(DaemonMessage::Error { kind, message }) => {
-            eprint_error(message);
-            return ExitCode::from(kind.exit_code());
-        }
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+        return admin_failed(e);
     }
 
     for s in &targets {
@@ -1422,16 +1377,8 @@ fn cmd_daemon_stop(yes: bool) -> ExitCode {
     }
 
     let pid = conn.hello.pid;
-    match conn.admin_request(&token, AdminRequest::Stop) {
-        Ok(DaemonMessage::Ok) => {}
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            return ExitCode::from(125);
-        }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+    if let Err(e) = conn.request_ok(&token, AdminRequest::Stop) {
+        return admin_failed(e);
     }
     drop(conn);
 
@@ -1459,18 +1406,23 @@ fn cmd_daemon_logs(session: Option<String>) -> ExitCode {
             }
             ExitCode::SUCCESS
         }
-        Ok(_) => {
-            eprintln!("error: unexpected response from the daemon");
-            ExitCode::from(125)
-        }
-        Err(e) => {
-            eprint_error(e);
-            ExitCode::from(125)
-        }
+        Ok(_) => admin_failed(AdminError::UnexpectedResponse),
+        Err(e) => admin_failed(e),
     }
 }
 
 // ─── Shared admin helpers ─────────────────────────────────────────────────────
+
+/// Reports a failed admin request and picks its exit code: the daemon's
+/// own [`ErrorKind`](airlock::protocol::ErrorKind) when it answered with
+/// one, else 125.
+fn admin_failed(e: AdminError) -> ExitCode {
+    eprint_error(&e);
+    match e {
+        AdminError::Daemon { kind, .. } => ExitCode::from(kind.exit_code()),
+        _ => ExitCode::from(125),
+    }
+}
 
 fn connect_admin()
 -> Result<(admin::Connection, airlock::protocol::AdminToken, RuntimeDir), ExitCode> {
@@ -1495,12 +1447,8 @@ fn find_session(
     token: &airlock::protocol::AdminToken,
     id: &str,
 ) -> Option<airlock::protocol::SessionInfo> {
-    match conn.admin_request(token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => {
-            session::resolve_session_ref(id, &sessions).ok().cloned()
-        }
-        _ => None,
-    }
+    let sessions = conn.list_sessions(token).ok()?;
+    session::resolve_session_ref(id, &sessions).ok().cloned()
 }
 
 /// Best-effort project root discovery for `--here` filtering: walks up from
