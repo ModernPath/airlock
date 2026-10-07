@@ -16,8 +16,9 @@ use thiserror::Error;
 
 use crate::protocol::{
     AdminRequest, AdminToken, Auth, ClientHello, DaemonMessage, DaemonMode, ErrorKind,
-    MAX_ADMIN_LINE_BYTES, PROTOCOL_VERSION, Request, RequestBody, SessionInfo,
+    MAX_ADMIN_LINE_BYTES, Request, RequestBody, SessionInfo,
 };
+use crate::runtime_dir::RuntimeDir;
 
 /// Errors talking to the daemon's admin family.
 #[derive(Debug, Error)]
@@ -40,6 +41,17 @@ pub enum AdminError {
     #[error("unexpected response from the daemon")]
     UnexpectedResponse,
 
+    /// `admin.token` could not be read.
+    #[error("cannot read {}: {source}", path.display())]
+    TokenUnreadable {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+
+    /// `admin.token` does not hold a well-formed token.
+    #[error("admin.token is malformed")]
+    MalformedToken,
+
     /// The daemon answered with an [`ErrorKind`].
     #[error("{message}")]
     Daemon {
@@ -48,6 +60,23 @@ pub enum AdminError {
         /// The daemon's message.
         message: String,
     },
+}
+
+/// Reads and parses `admin.token` from the runtime directory: the
+/// credential every admin request carries.
+pub fn read_admin_token(runtime: &RuntimeDir) -> Result<AdminToken, AdminError> {
+    let path = runtime.admin_token_path();
+    let raw = std::fs::read_to_string(&path)
+        .map_err(|source| AdminError::TokenUnreadable { path, source })?;
+    AdminToken::parse(raw.trim()).map_err(|_| AdminError::MalformedToken)
+}
+
+/// Connects to the daemon in `runtime` and reads its admin token: what
+/// every admin command needs before its first request.
+pub fn connect_with_token(runtime: &RuntimeDir) -> Result<(Connection, AdminToken), AdminError> {
+    let conn = Connection::connect(&runtime.socket_path())?;
+    let token = read_admin_token(runtime)?;
+    Ok((conn, token))
 }
 
 /// What the daemon said in its handshake [`DaemonMessage::Hello`].
@@ -87,13 +116,7 @@ impl Connection {
         stream.set_write_timeout(Some(Duration::from_secs(10)))?;
         let mut reader = BufReader::new(stream);
 
-        write_line(
-            &mut reader,
-            &ClientHello {
-                protocol: PROTOCOL_VERSION,
-                version: env!("CARGO_PKG_VERSION").to_string(),
-            },
-        )?;
+        write_line(&mut reader, &ClientHello::current())?;
 
         let hello = match read_message(&mut reader)? {
             DaemonMessage::Hello {
@@ -216,6 +239,7 @@ fn write_line<T: serde::Serialize>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_VERSION;
     use std::os::unix::net::UnixListener;
 
     fn tempdir() -> tempfile::TempDir {

@@ -15,7 +15,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use airlock::admin;
-use airlock::launcher;
 use airlock::protocol::{AdminRequest, DaemonMessage};
 use airlock::runtime_dir::RuntimeDir;
 
@@ -73,7 +72,7 @@ impl Fixture {
     fn session_count(&self) -> usize {
         let runtime = self.runtime_dir();
         let mut conn = admin::Connection::connect(&runtime.socket_path()).expect("connect");
-        let token = launcher::read_admin_token(&runtime).expect("read admin token");
+        let token = admin::read_admin_token(&runtime).expect("read admin token");
         match conn
             .admin_request(&token, AdminRequest::ListSessions)
             .expect("ListSessions")

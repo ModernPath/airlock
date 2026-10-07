@@ -792,7 +792,7 @@ impl inspect::DaemonProbe for AdminProbe {
             started_unix,
             addr: self.runtime.addr(),
         };
-        self.token = launcher::read_admin_token(&self.runtime).ok();
+        self.token = admin::read_admin_token(&self.runtime).ok();
         self.conn = Some(conn);
         Some(status)
     }
@@ -942,7 +942,7 @@ fn cmd_session_start(
     )?;
 
     let (mut conn, _started_new) = launcher::ensure_daemon(&prepared.runtime, false, quiet)?;
-    let admin_token = launcher::read_admin_token(&prepared.runtime)?;
+    let admin_token = admin::read_admin_token(&prepared.runtime)?;
     let (id, token, _ca_path) = launcher::register(
         &mut conn,
         &admin_token,
@@ -1242,7 +1242,7 @@ fn cmd_daemon_stop(yes: bool) -> CliResult {
         }
         Err(e) => return Err(e.into()),
     };
-    let token = launcher::read_admin_token(&runtime)?;
+    let token = admin::read_admin_token(&runtime)?;
 
     if conn.hello.sessions > 0 {
         let interactive = airlock::trust::is_interactive();
@@ -1308,8 +1308,7 @@ fn cmd_daemon_logs(session: Option<String>) -> CliResult {
 fn connect_admin()
 -> Result<(admin::Connection, airlock::protocol::AdminToken, RuntimeDir), CliError> {
     let runtime = RuntimeDir::locate()?;
-    let conn = admin::Connection::connect(&runtime.socket_path())?;
-    let token = launcher::read_admin_token(&runtime)?;
+    let (conn, token) = admin::connect_with_token(&runtime)?;
     Ok((conn, token, runtime))
 }
 

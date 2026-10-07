@@ -512,7 +512,8 @@ fn start_session(
             conn.hello.pid
         );
     }
-    let admin_token = launcher::read_admin_token(&prepared.runtime)?;
+    let admin_token =
+        crate::admin::read_admin_token(&prepared.runtime).map_err(LauncherError::from)?;
     let (id, token, _ca_path) = launcher::register(
         &mut conn,
         &admin_token,

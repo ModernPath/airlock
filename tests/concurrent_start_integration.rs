@@ -22,7 +22,6 @@ use std::os::unix::fs::PermissionsExt;
 use std::process::Command;
 
 use airlock::admin;
-use airlock::launcher;
 use airlock::protocol::{AdminRequest, DaemonMessage};
 use airlock::runtime_dir::RuntimeDir;
 
@@ -135,7 +134,7 @@ fn concurrent_session_starts_all_succeed_against_one_daemon() {
     // as "stale", or a second daemon could have bound a second socket.
     let runtime = fx.runtime_dir();
     let mut conn = admin::Connection::connect(&runtime.socket_path()).expect("connect to daemon");
-    let token = launcher::read_admin_token(&runtime).expect("read admin token");
+    let token = admin::read_admin_token(&runtime).expect("read admin token");
     match conn
         .admin_request(&token, AdminRequest::ListSessions)
         .expect("ListSessions")

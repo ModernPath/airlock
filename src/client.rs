@@ -15,8 +15,8 @@ use tokio::net::UnixStream;
 use crate::admin::{self, AdminError};
 use crate::config;
 use crate::protocol::{
-    Auth, ClientHello, DaemonMessage, ErrorKind, PROTOCOL_VERSION, Request, RequestBody,
-    SessionRequest, SessionToken, StdinFrame, WireLayer,
+    Auth, ClientHello, DaemonMessage, ErrorKind, Request, RequestBody, SessionRequest,
+    SessionToken, StdinFrame, WireLayer,
 };
 use crate::runtime_dir;
 use crate::trust::escape_for_terminal as esc;
@@ -57,10 +57,7 @@ async fn connect(socket_path: &Path) -> Result<UnixStream, String> {
 }
 
 async fn handshake(stream: &mut UnixStream) -> Result<(), String> {
-    let bytes = crate::protocol::encode_line(&ClientHello {
-        protocol: PROTOCOL_VERSION,
-        version: env!("CARGO_PKG_VERSION").to_string(),
-    });
+    let bytes = crate::protocol::encode_line(&ClientHello::current());
     stream
         .write_all(&bytes)
         .await
@@ -381,8 +378,8 @@ async fn tools_list_by_id(id: String) -> i32 {
             return 125;
         }
     };
-    let mut conn = match admin::Connection::connect(&runtime.socket_path()) {
-        Ok(c) => c,
+    let (mut conn, token) = match admin::connect_with_token(&runtime) {
+        Ok(v) => v,
         Err(AdminError::Unreachable { path }) => {
             eprintln!(
                 "error: the daemon at unix://{} does not answer",
@@ -390,13 +387,6 @@ async fn tools_list_by_id(id: String) -> i32 {
             );
             return 125;
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            return 125;
-        }
-    };
-    let token = match crate::launcher::read_admin_token(&runtime) {
-        Ok(t) => t,
         Err(e) => {
             eprintln!("error: {e}");
             return 125;
@@ -474,6 +464,7 @@ fn print_tools(tools: &[crate::protocol::ToolInfo]) {
 )]
 mod tests {
     use super::*;
+    use crate::protocol::PROTOCOL_VERSION;
     use std::sync::MutexGuard;
     use tokio::io::AsyncBufReadExt;
 

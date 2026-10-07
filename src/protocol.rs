@@ -410,6 +410,16 @@ pub struct ClientHello {
     pub version: String,
 }
 
+impl ClientHello {
+    /// The hello this binary sends.
+    pub fn current() -> Self {
+        ClientHello {
+            protocol: PROTOCOL_VERSION,
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        }
+    }
+}
+
 /// How the daemon was started. Carried in [`DaemonMessage::Hello`] so a
 /// launcher can decide whether it may replace an idle daemon.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
