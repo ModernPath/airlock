@@ -124,18 +124,11 @@ fn secret_store_from_wire(secrets: &[crate::protocol::WireSecret]) -> SecretStor
 
 /// Build a [`Redactor`] from every value currently in `store`.
 pub fn build_redactor(store: &SecretStore) -> Result<Redactor, crate::redact::RedactError> {
-    let pairs: Vec<(String, Arc<Secret<String>>)> = store
-        .iter()
-        .map(|(name, slot)| {
-            let s = slot.read().unwrap_or_else(|e| e.into_inner());
-            (name.clone(), Arc::clone(&s.value))
-        })
-        .collect();
-    let refs: Vec<(&str, &Secret<String>)> = pairs
-        .iter()
-        .map(|(n, v)| (n.as_str(), v.as_ref()))
-        .collect();
-    Redactor::new(refs)
+    let mut builder = crate::redact::RedactorBuilder::default();
+    for (name, slot) in store.iter() {
+        builder.add(name, &slot.read().unwrap_or_else(|e| e.into_inner()).value);
+    }
+    builder.build()
 }
 
 /// Build the [`SessionPolicy`] a `Register` or `Reload` request describes.
