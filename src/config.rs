@@ -362,6 +362,113 @@ pub enum ConfigError {
         tool: String,
     },
 
+    /// `[kits.<name>]` was set in the repo layer, which is not allowed —
+    /// same spirit as [`ConfigError::AllowHomeRootInRepo`]: a teammate's
+    /// checked-in file must not decide what a kit may write in your home.
+    #[error(
+        "{file}: [kits.*] is not allowed in the repo config; set it in airlock.local.toml or your global config"
+    )]
+    KitsInRepo {
+        /// The repo config file.
+        file: PathBuf,
+    },
+    /// A built-in kit's `[kits.<name>]` table set `read`, `write` or `env`,
+    /// which only a user-defined kit may use.
+    #[error(
+        "[kits.{kit}] is a built-in kit; only `mode` is allowed ({field} is not — built-in kits \
+         have their own fixed paths and env)"
+    )]
+    KitBuiltinExtraField {
+        /// The built-in kit name.
+        kit: String,
+        /// The field it illegally set (`"read"`, `"write"`, or `"env"`).
+        field: &'static str,
+    },
+    /// A built-in kit's `[kits.<name>]` table set `mode` to something other
+    /// than `"isolated"` or `"shared"`.
+    #[error("[kits.{kit}] mode {mode:?} is not valid; use \"isolated\" or \"shared\"")]
+    KitUnknownMode {
+        /// The built-in kit name.
+        kit: String,
+        /// The offending mode string.
+        mode: String,
+    },
+    /// A user-defined kit's `[kits.<name>]` table set `mode`, which only a
+    /// built-in kit has.
+    #[error("[kits.{kit}] sets mode, which only a built-in kit (rust, node, python, go) has")]
+    KitUserDefinedHasMode {
+        /// The user-defined kit name.
+        kit: String,
+    },
+    /// A kit's `read`, `write` or `env` references `{tool_state}` — the
+    /// agent must never see a tool's own state.
+    #[error(
+        "[kits.{kit}].{field} references {{tool_state}}, which is reserved for tools; the \
+         agent sandbox has no access to it"
+    )]
+    KitToolStateForbidden {
+        /// The kit name.
+        kit: String,
+        /// Where the placeholder appeared (`"read"`, `"write"`, or `"env"`).
+        field: &'static str,
+    },
+    /// A key in a user-defined kit's `env` table is not a valid POSIX
+    /// environment variable name.
+    #[error("[kits.{kit}.env] invalid environment variable name: {name:?}")]
+    KitInvalidEnvVarName {
+        /// The kit name.
+        kit: String,
+        /// The offending env var name.
+        name: String,
+    },
+    /// A static value in a user-defined kit's `env` table references a
+    /// placeholder other than `{kit_state}`.
+    #[error(
+        "[kits.{kit}.env.{var_name}] references unknown placeholder {{{placeholder}}}; only {{kit_state}} is supported"
+    )]
+    KitUnknownEnvPlaceholder {
+        /// The kit name.
+        kit: String,
+        /// The env var name.
+        var_name: String,
+        /// The unrecognized placeholder key.
+        placeholder: String,
+    },
+    /// A static value in a user-defined kit's `env` table is a malformed
+    /// template.
+    #[error("[kits.{kit}.env.{var_name}] is not a valid template: {message}")]
+    KitEnvTemplateParse {
+        /// The kit name.
+        kit: String,
+        /// The env var name.
+        var_name: String,
+        /// The underlying parser message.
+        message: String,
+    },
+    /// `agent.kits` names a kit that is neither built-in nor declared by any
+    /// `[kits.<name>]` table.
+    #[error(
+        "agent.kits names {kit:?}, which is not a built-in kit and has no [kits.{kit}] table; \
+         known kits: {}",
+        known.join(", ")
+    )]
+    UnknownKit {
+        /// The offending name.
+        kit: String,
+        /// Every kit name known at merge/resolve time (built-ins plus any
+        /// `[kits.<name>]` table), sorted.
+        known: Vec<String>,
+    },
+    /// An `[agent.env.<key>]` entry collides with an env var an active kit
+    /// also sets.
+    #[error("[agent.env.{key}] is also set by kit {kit}; drop one of them")]
+    AgentEnvSetByKit {
+        /// The colliding env var name.
+        key: String,
+        /// The kit that sets it too.
+        kit: String,
+    },
+
     /// `[secrets.<label>] from = "<value>"` where `<value>` is not
     /// `"global"` — the only link a layer file may express without its own
     /// `source`.
@@ -534,6 +641,40 @@ pub struct RawConfig {
     /// [`ConfigError::AllowHomeRootInRepo`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allow_home_root: Option<bool>,
+
+    /// `[kits.<name>]` tables: options for a built-in kit, or the
+    /// read/write/env lists of a user-defined one. A launcher-only concept
+    /// (see [`crate::kits`]) — never present on the wire sent to the daemon,
+    /// and a config error in the repo layer (see
+    /// [`ConfigError::KitsInRepo`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub kits: Option<HashMap<String, RawKitConfig>>,
+}
+
+/// Raw deserialized `[kits.<name>]` entry.
+///
+/// Which fields are legal depends on whether `name` is one of the built-in
+/// kits (`rust`, `node`, `python`, `go`) — see [`crate::kits`], which also
+/// does all expansion. A flat, fully-optional struct for the same reason as
+/// [`RawSecretSpec`]: parsing has to accept any legal shape unambiguously,
+/// and [`crate::kits::validate_all`] decides which shape applies to which
+/// kit.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawKitConfig {
+    /// Built-in kits only: `"isolated"` (the default) or `"shared"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
+    /// User-defined kits only: additional read-only paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read: Vec<String>,
+    /// User-defined kits only: additional read-write paths.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub write: Vec<String>,
+    /// User-defined kits only: environment variables set on the agent.
+    /// Static strings only (no secret refs) — may use `{kit_state}`.
+    #[serde(default, skip_serializing_if = "HashMap::is_empty")]
+    pub env: HashMap<String, String>,
 }
 
 /// Raw deserialized `[filesystem]` section.
@@ -580,6 +721,12 @@ pub struct RawAgentConfig {
     /// Additional filesystem paths for the agent sandbox.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filesystem: Option<RawAgentFilesystem>,
+    /// Kits (built-in or user-defined) to add to the agent sandbox — see
+    /// [`crate::kits`]. Unioned across layers; rides on the wire unused by
+    /// the daemon, only so it contributes to the agent hash
+    /// ([`crate::launcher::prepare`]).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub kits: Vec<String>,
 }
 
 /// Raw deserialized `[secrets.<label>]` entry.
@@ -1626,6 +1773,12 @@ pub fn default_config_template() -> &'static str {
 # # Environment variable names inherited from the host process.
 # passthrough_env = ["COLORTERM", "NO_COLOR"]
 #
+# # Kits: language toolchain/package-cache access for `airlock run`'s agent
+# # sandbox — see the global config template for what they are and the
+# # built-in names. [kits.*] tables themselves may only live in your global
+# # config or airlock.local.toml, never here.
+# # kits = ["rust", "node"]
+#
 # [agent.env]
 # # Static value injected into the agent's environment.
 # LOG_LEVEL = "info"
@@ -1674,8 +1827,29 @@ pub fn global_config_template() -> &'static str {
 # [tools.aws.env]
 # AWS_PROFILE = "personal"
 
+# Kits add a language toolchain's cache access to `airlock run`'s agent
+# sandbox, on top of whatever harness profile you use. Built-in kits: rust,
+# node, python, go, elixir. List the ones you want on [agent] below (any
+# config layer; unioned across them), and optionally set a built-in kit's
+# mode here or in airlock.local.toml (never in a project's own airlock.toml):
+# "isolated" (the default) points the toolchain's cache env vars at a
+# directory private to this project, so the agent never touches your real
+# caches; "shared" instead grants write to the real ones. Prefer isolated —
+# shared lets the agent poison a cache (e.g. ~/.cargo/registry/src) that an
+# unsandboxed build later trusts without re-verifying.
+# [kits.rust]
+# mode = "isolated"
+
+# A user-defined kit works like a built-in one but you supply its own
+# read/write paths and env (no mode — always the paths/env you give it):
+# [kits.bazel]
+# read  = ["~/.bazelrc"]
+# write = ["~/.cache/bazel"]
+# env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+
 # [agent]
 # passthrough_env = ["COLORTERM"]
+# kits = ["rust"]
 "#
 }
 
@@ -1696,6 +1870,14 @@ pub fn local_config_template_standalone() -> &'static str {
 # [tools.example]
 # [tools.example.env]
 # API_KEY = { secret = "API_KEY" }
+
+# [agent]
+# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir
+
+# A built-in kit's mode ("isolated", the default, or "shared") may be set
+# here or in your global config, never in a project's own airlock.toml.
+# [kits.rust]
+# mode = "isolated"
 "#
 }
 
@@ -3398,6 +3580,51 @@ X = { secret = "x", type = "string" }
             "default config template should be valid TOML: {:?}",
             parsed.err()
         );
+    }
+
+    #[test]
+    fn global_config_template_is_valid_toml() {
+        let parsed: Result<RawConfig, _> = toml::from_str(global_config_template());
+        assert!(
+            parsed.is_ok(),
+            "global config template should be valid TOML: {:?}",
+            parsed.err()
+        );
+    }
+
+    #[test]
+    fn local_config_template_standalone_is_valid_toml() {
+        let parsed: Result<RawConfig, _> = toml::from_str(local_config_template_standalone());
+        assert!(
+            parsed.is_ok(),
+            "local standalone template should be valid TOML: {:?}",
+            parsed.err()
+        );
+    }
+
+    /// Uncommenting the global template's kits section (`[agent] kits =
+    /// [...]`, `[kits.rust] mode = "..."`, the `[kits.bazel]` example) must
+    /// still parse — a quick guard against the example drifting from the
+    /// real schema.
+    #[test]
+    fn global_config_template_kits_section_still_parses_uncommented() {
+        let uncommented = r#"
+[kits.rust]
+mode = "isolated"
+
+[kits.bazel]
+read  = ["~/.bazelrc"]
+write = ["~/.cache/bazel"]
+env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+
+[agent]
+passthrough_env = ["COLORTERM"]
+kits = ["rust"]
+"#;
+        let parsed: RawConfig =
+            toml::from_str(uncommented).expect("uncommented kits section parses");
+        assert_eq!(parsed.agent.unwrap().kits, vec!["rust".to_string()]);
+        assert_eq!(parsed.kits.unwrap().len(), 2);
     }
 
     #[test]
