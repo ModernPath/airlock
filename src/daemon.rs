@@ -1621,8 +1621,10 @@ async fn handle_register(
         state.end_session(&id, EndedReason::LeaseClosed);
         return;
     }
-    drop(writer);
 
+    // `writer` stays alive until this function returns: dropping an
+    // `OwnedWriteHalf` shuts down the write side, and the launcher reads
+    // that EOF as the lease ending.
     if is_lease {
         let lease_closer = session.lease_closer.clone();
         tokio::select! {
