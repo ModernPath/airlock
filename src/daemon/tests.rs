@@ -20,6 +20,30 @@ struct TestDaemon {
     _tmp: tempfile::TempDir,
 }
 
+impl TestDaemon {
+    async fn client(&self) -> TestClient {
+        TestClient::connect(&self.state.runtime.socket_path()).await
+    }
+}
+
+fn assert_error(reply: &DaemonMessage, kind: ErrorKind) {
+    assert!(
+        matches!(reply, DaemonMessage::Error { kind: k, .. } if *k == kind),
+        "expected a {kind:?} error, got {reply:?}"
+    );
+}
+
+/// Polls `done` until it holds, failing with `what` after `timeout`.
+async fn wait_until(timeout: Duration, mut done: impl FnMut() -> bool, what: &str) {
+    let deadline = std::time::Instant::now() + timeout;
+    while !done() {
+        if std::time::Instant::now() > deadline {
+            panic!("{what}");
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 async fn start_test_daemon(mode: DaemonMode) -> TestDaemon {
     start_test_daemon_with_idle(mode, Some(Duration::from_millis(150))).await
 }
@@ -157,6 +181,14 @@ fn test_payload(root: &Path, toml_src: &str) -> RegisterPayload {
     }
 }
 
+fn with_secret(mut payload: RegisterPayload, label: &str, value: &str) -> RegisterPayload {
+    payload.secrets = vec![crate::protocol::WireSecret {
+        label: label.to_string(),
+        value: zeroize::Zeroizing::new(value.to_string()),
+    }];
+    payload
+}
+
 async fn register(
     client: &mut TestClient,
     admin_token: &AdminToken,
@@ -186,7 +218,7 @@ async fn register(
 #[tokio::test]
 async fn handshake_version_mismatch_gives_incompatible_protocol() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
 
     let hello = client
         .hello_with_protocol(protocol::PROTOCOL_VERSION + 1)
@@ -194,16 +226,7 @@ async fn handshake_version_mismatch_gives_incompatible_protocol() {
     assert!(matches!(hello, DaemonMessage::Hello { .. }));
 
     let err = client.read().await;
-    assert!(
-        matches!(
-            err,
-            DaemonMessage::Error {
-                kind: ErrorKind::IncompatibleProtocol,
-                ..
-            }
-        ),
-        "{err:?}"
-    );
+    assert_error(&err, ErrorKind::IncompatibleProtocol);
 }
 
 // ─── Admin auth ──────────────────────────────────────────────────────────────
@@ -211,28 +234,19 @@ async fn handshake_version_mismatch_gives_incompatible_protocol() {
 #[tokio::test]
 async fn admin_auth_wrong_token_is_unauthorized() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
 
     let bad_token = AdminToken::generate();
     let reply = client
         .request(admin_request(&bad_token, AdminRequest::ListSessions))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::Unauthorized,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::Unauthorized);
 }
 
 #[tokio::test]
 async fn admin_auth_correct_token_succeeds() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
 
     let reply = client
         .request(admin_request(
@@ -246,7 +260,7 @@ async fn admin_auth_correct_token_succeeds() {
 #[tokio::test]
 async fn family_mismatch_is_unauthorized() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
 
     // An admin token presented with a session-family body.
     let req = Request {
@@ -256,16 +270,7 @@ async fn family_mismatch_is_unauthorized() {
         body: RequestBody::Session(SessionRequest::List),
     };
     let reply = client.request(req).await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::Unauthorized,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::Unauthorized);
 }
 
 // ─── Session auth ────────────────────────────────────────────────────────────
@@ -273,22 +278,13 @@ async fn family_mismatch_is_unauthorized() {
 #[tokio::test]
 async fn session_auth_unknown_token_gives_no_session() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
 
     let bogus = crate::protocol::SessionToken::generate(crate::protocol::SessionId::generate());
     let reply = client
         .request(session_request(bogus, SessionRequest::List))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::NoSession,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::NoSession);
 }
 
 #[tokio::test]
@@ -296,7 +292,7 @@ async fn revoke_then_use_gives_session_ended() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -307,7 +303,7 @@ async fn revoke_then_use_gives_session_ended() {
     )
     .await;
 
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let reply = admin2
         .request(admin_request(
             &daemon.admin_token,
@@ -318,20 +314,11 @@ async fn revoke_then_use_gives_session_ended() {
         .await;
     assert!(matches!(reply, DaemonMessage::Ok), "{reply:?}");
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(token, SessionRequest::List))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::SessionEnded,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::SessionEnded);
 }
 
 #[tokio::test]
@@ -339,7 +326,7 @@ async fn expired_ttl_gives_session_expired() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (_id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -360,20 +347,11 @@ async fn expired_ttl_gives_session_expired() {
         };
     }
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(token, SessionRequest::List))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::SessionExpired,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::SessionExpired);
 }
 
 #[tokio::test]
@@ -401,20 +379,11 @@ async fn process_tree_binding_refuses_a_non_descendant() {
     let token = session.token.clone();
     daemon.state.sessions.insert(session);
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(token, SessionRequest::List))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::OutsideProcessTree,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::OutsideProcessTree);
 
     let _ = child.kill().await;
 }
@@ -426,7 +395,7 @@ async fn register_then_list_tools_and_check() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -438,7 +407,7 @@ async fn register_then_list_tools_and_check() {
     .await;
 
     let _ = admin;
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let reply = admin2
         .request(admin_request(
             &daemon.admin_token,
@@ -452,7 +421,7 @@ async fn register_then_list_tools_and_check() {
     assert_eq!(sessions[0].id, id);
     assert_eq!(sessions[0].name, "claude");
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(token.clone(), SessionRequest::List))
         .await;
@@ -463,7 +432,7 @@ async fn register_then_list_tools_and_check() {
     assert_eq!(tools[0].name, "sh");
     assert_eq!(tools[0].description, Some("a shell".to_string()));
 
-    let mut client2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client2 = daemon.client().await;
     let reply = client2
         .request(session_request(token, SessionRequest::Check))
         .await;
@@ -478,7 +447,7 @@ async fn reload_swaps_tools_and_reports_changes() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -492,7 +461,7 @@ async fn reload_swaps_tools_and_reports_changes() {
     let session = daemon.state.sessions.get(&id).unwrap();
     let old_policy = session.current_policy();
 
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let payload = test_payload(tmp.path(), "[tools.psql]\n");
     let reply = admin2
         .request(admin_request(
@@ -513,7 +482,7 @@ async fn reload_swaps_tools_and_reports_changes() {
     // snapshot of the pre-reload policy.
     assert!(old_policy.config.tools.contains_key("gh"));
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(token, SessionRequest::List))
         .await;
@@ -534,7 +503,7 @@ async fn reload_never_drops_a_write_grant() {
 
     let mut register_payload = test_payload(root.path(), "[tools.gh]\n");
     register_payload.write_grants = vec![grant.path().to_path_buf()];
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let reply = admin
         .request(admin_request(
             &daemon.admin_token,
@@ -554,7 +523,7 @@ async fn reload_never_drops_a_write_grant() {
     // inside it on `PATH`.
     let mut reload_payload = test_payload(root.path(), "[tools.gh]\n");
     reload_payload.path.insert(0, grant_bin.clone());
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let reply = admin2
         .request(admin_request(
             &daemon.admin_token,
@@ -600,7 +569,7 @@ async fn reload_keeps_the_same_ca_when_routes_are_unchanged() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -616,7 +585,7 @@ async fn reload_keeps_the_same_ca_when_routes_are_unchanged() {
 
     // Reload with the same route (a static tool added alongside it is
     // enough to make this a real reload, not a no-op).
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let mut toml = proxy_config("example.com");
     toml.push_str("[tools.sh]\n");
     let payload = test_payload(tmp.path(), &toml);
@@ -643,7 +612,7 @@ async fn reload_regenerates_the_ca_when_routes_change() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -657,7 +626,7 @@ async fn reload_regenerates_the_ca_when_routes_change() {
     let ca_path = daemon.state.runtime.ca_path(id.as_str());
     let cert_before = std::fs::read(&ca_path).expect("CA file written at register");
 
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let payload = test_payload(tmp.path(), &proxy_config("other.example"));
     let reply = admin2
         .request(admin_request(
@@ -682,7 +651,7 @@ async fn reload_removes_the_ca_file_when_the_last_proxy_tool_is_dropped() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -696,7 +665,7 @@ async fn reload_removes_the_ca_file_when_the_last_proxy_tool_is_dropped() {
     let ca_path = daemon.state.runtime.ca_path(id.as_str());
     assert!(ca_path.exists(), "CA file should exist after register");
 
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let payload = test_payload(tmp.path(), "[tools.sh]\n");
     let reply = admin2
         .request(admin_request(
@@ -720,7 +689,7 @@ async fn end_session_removes_a_leftover_ca_file_even_without_a_proxy_tool() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -750,7 +719,7 @@ async fn revoke_by_unique_prefix_and_name() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -763,7 +732,7 @@ async fn revoke_by_unique_prefix_and_name() {
 
     let _ = admin;
     let prefix = &id.as_str()[..4];
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let reply = admin2
         .request(admin_request(
             &daemon.admin_token,
@@ -781,7 +750,7 @@ async fn revoke_ambiguous_ref_errors_and_revokes_nothing() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id_a, _) = register(
         &mut admin,
         &daemon.admin_token,
@@ -791,7 +760,7 @@ async fn revoke_ambiguous_ref_errors_and_revokes_nothing() {
         SessionEnds::Ttl { secs: 3600 },
     )
     .await;
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let (id_b, _) = register(
         &mut admin2,
         &daemon.admin_token,
@@ -805,7 +774,7 @@ async fn revoke_ambiguous_ref_errors_and_revokes_nothing() {
     // Find a common prefix length that matches both (there always is one:
     // the empty string), long enough to still be ambiguous — the empty
     // string itself always works since it prefixes every id.
-    let mut admin3 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin3 = daemon.client().await;
     let reply = admin3
         .request(admin_request(
             &daemon.admin_token,
@@ -814,16 +783,7 @@ async fn revoke_ambiguous_ref_errors_and_revokes_nothing() {
             },
         ))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::Malformed,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::Malformed);
     assert!(daemon.state.sessions.get(&id_a).is_some());
     assert!(daemon.state.sessions.get(&id_b).is_some());
 }
@@ -835,7 +795,7 @@ async fn renew_restarts_the_ttl() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -847,7 +807,7 @@ async fn renew_restarts_the_ttl() {
     .await;
 
     let _ = admin;
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let reply = admin2
         .request(admin_request(
             &daemon.admin_token,
@@ -877,7 +837,7 @@ async fn renew_refuses_a_lease_session() {
     // background task and keep the handle alive for the duration of this
     // test.
     let payload = test_payload(tmp.path(), "[tools.sh]\n");
-    let mut lease_conn = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut lease_conn = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -891,7 +851,7 @@ async fn renew_refuses_a_lease_session() {
         panic!("expected Registered")
     };
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let reply = admin
         .request(admin_request(
             &daemon.admin_token,
@@ -901,16 +861,7 @@ async fn renew_refuses_a_lease_session() {
             },
         ))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::Malformed,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::Malformed);
 }
 
 // ─── Lease lifecycle ─────────────────────────────────────────────────────────
@@ -921,7 +872,7 @@ async fn lease_eof_revokes_the_session() {
     let tmp = tempfile::tempdir().unwrap();
 
     let payload = test_payload(tmp.path(), "[tools.sh]\n");
-    let mut lease_conn = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut lease_conn = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -939,13 +890,12 @@ async fn lease_eof_revokes_the_session() {
     drop(lease_conn);
 
     // The daemon learns about the EOF asynchronously; poll briefly.
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while daemon.state.sessions.get(&id).is_some() {
-        if std::time::Instant::now() > deadline {
-            panic!("lease EOF did not revoke the session in time");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until(
+        Duration::from_secs(2),
+        || !daemon.state.sessions.get(&id).is_some(),
+        "lease EOF did not revoke the session in time",
+    )
+    .await;
     assert_eq!(
         daemon.state.sessions.ended_reason(&id),
         Some(crate::session::EndedReason::LeaseClosed)
@@ -960,7 +910,7 @@ async fn lease_stays_open_from_the_daemon_side_while_the_session_lives() {
     let tmp = tempfile::tempdir().unwrap();
 
     let payload = test_payload(tmp.path(), "[tools.sh]\n");
-    let mut lease_conn = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut lease_conn = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -993,7 +943,7 @@ async fn logs_filtered_by_session() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id_a, _) = register(
         &mut admin,
         &daemon.admin_token,
@@ -1003,7 +953,7 @@ async fn logs_filtered_by_session() {
         SessionEnds::Ttl { secs: 3600 },
     )
     .await;
-    let mut admin2 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin2 = daemon.client().await;
     let (id_b, _) = register(
         &mut admin2,
         &daemon.admin_token,
@@ -1014,7 +964,7 @@ async fn logs_filtered_by_session() {
     )
     .await;
 
-    let mut admin3 = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin3 = daemon.client().await;
     let reply = admin3
         .request(admin_request(
             &daemon.admin_token,
@@ -1055,13 +1005,12 @@ async fn stop_shuts_down_and_removes_files() {
         .await;
     assert!(matches!(reply, DaemonMessage::Ok));
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while socket_path.exists() {
-        if std::time::Instant::now() > deadline {
-            panic!("socket was not removed after Stop");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until(
+        Duration::from_secs(2),
+        || !socket_path.exists(),
+        "socket was not removed after Stop",
+    )
+    .await;
     assert!(!pid_path.exists());
     assert!(!daemon.state.runtime.admin_token_path().exists());
 }
@@ -1098,13 +1047,12 @@ async fn automatic_daemon_idle_exits_with_no_sessions() {
         start_test_daemon_with_idle(DaemonMode::Automatic, Some(Duration::from_millis(100))).await;
     let socket_path = daemon.state.runtime.socket_path();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(3);
-    while !daemon.state.shutdown.is_cancelled() {
-        if std::time::Instant::now() > deadline {
-            panic!("automatic daemon did not idle-exit");
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
+    wait_until(
+        Duration::from_secs(3),
+        || daemon.state.shutdown.is_cancelled(),
+        "automatic daemon did not idle-exit",
+    )
+    .await;
     let _ = socket_path;
 }
 
@@ -1186,13 +1134,12 @@ async fn registration_in_flight_blocks_idle_exit_with_zero_sessions() {
         .fetch_sub(1, Ordering::SeqCst);
     daemon.state.note_activity();
 
-    let deadline = std::time::Instant::now() + Duration::from_secs(2);
-    while !daemon.state.shutdown.is_cancelled() {
-        if std::time::Instant::now() > deadline {
-            panic!("daemon did not idle-exit once the registration finished");
-        }
-        tokio::time::sleep(Duration::from_millis(10)).await;
-    }
+    wait_until(
+        Duration::from_secs(2),
+        || daemon.state.shutdown.is_cancelled(),
+        "daemon did not idle-exit once the registration finished",
+    )
+    .await;
 }
 
 // ─── Global redactor ─────────────────────────────────────────────────────────
@@ -1202,28 +1149,12 @@ async fn global_redactor_masks_another_sessions_secret() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let raw: crate::config::RawConfig = toml::from_str("[tools.sh]\n").unwrap();
-    let payload = RegisterPayload {
-        root: tmp.path().to_path_buf(),
-        mode: WireMode::Default,
-        layers: Vec::new(),
-        config: raw,
-        secrets: vec![crate::protocol::WireSecret {
-            label: "TOK".to_string(),
-            value: zeroize::Zeroizing::new("s3cr3t-value".to_string()),
-        }],
-        env_snapshot: Default::default(),
-        path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-        dropped_path: Vec::new(),
-        write_grants: Vec::new(),
-        anchors: WireAnchors {
-            runtime_base: PathBuf::from("/tmp/a"),
-            trust_store: PathBuf::from("/tmp/b"),
-            global_config: PathBuf::from("/tmp/c"),
-        },
-        agent_hash: "deadbeef".to_string(),
-    };
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let payload = with_secret(
+        test_payload(tmp.path(), "[tools.sh]\n"),
+        "TOK",
+        "s3cr3t-value",
+    );
+    let mut admin = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -1248,12 +1179,12 @@ async fn global_redactor_masks_another_sessions_previous_value() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut payload = test_payload(tmp.path(), "[tools.sh]\n");
-    payload.secrets = vec![crate::protocol::WireSecret {
-        label: "TOK".to_string(),
-        value: zeroize::Zeroizing::new("new-s3cr3t-value".to_string()),
-    }];
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let payload = with_secret(
+        test_payload(tmp.path(), "[tools.sh]\n"),
+        "TOK",
+        "new-s3cr3t-value",
+    );
+    let mut admin = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -1338,32 +1269,16 @@ async fn stale_secret_reason_is_redacted_in_the_error_message() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let raw: crate::config::RawConfig = toml::from_str(
-        "[secrets.TOK]\nsource = \"env\"\n\n[tools.sh.env]\nTOK = { secret = \"TOK\" }\n",
-    )
-    .unwrap();
-    let payload = RegisterPayload {
-        root: tmp.path().to_path_buf(),
-        mode: WireMode::Default,
-        layers: Vec::new(),
-        config: raw,
-        secrets: vec![crate::protocol::WireSecret {
-            label: "TOK".to_string(),
-            value: zeroize::Zeroizing::new("s3cr3t-value".to_string()),
-        }],
-        env_snapshot: Default::default(),
-        path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
-        dropped_path: Vec::new(),
-        write_grants: Vec::new(),
-        anchors: WireAnchors {
-            runtime_base: PathBuf::from("/tmp/a"),
-            trust_store: PathBuf::from("/tmp/b"),
-            global_config: PathBuf::from("/tmp/c"),
-        },
-        agent_hash: "deadbeef".to_string(),
-    };
+    let payload = with_secret(
+        test_payload(
+            tmp.path(),
+            "[secrets.TOK]\nsource = \"env\"\n\n[tools.sh.env]\nTOK = { secret = \"TOK\" }\n",
+        ),
+        "TOK",
+        "s3cr3t-value",
+    );
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let req = admin_request(
         &daemon.admin_token,
         AdminRequest::Register(Box::new(RegisterRequest {
@@ -1396,7 +1311,7 @@ async fn stale_secret_reason_is_redacted_in_the_error_message() {
         };
     }
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(
             token,
@@ -1427,7 +1342,7 @@ async fn exec_unknown_tool_is_refused() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (_id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -1438,7 +1353,7 @@ async fn exec_unknown_tool_is_refused() {
     )
     .await;
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(
             token,
@@ -1449,16 +1364,7 @@ async fn exec_unknown_tool_is_refused() {
             },
         ))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::UnknownTool,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::UnknownTool);
 }
 
 #[tokio::test]
@@ -1467,7 +1373,7 @@ async fn exec_outside_root_is_refused() {
     let tmp = tempfile::tempdir().unwrap();
     let outside = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (_id, token) = register(
         &mut admin,
         &daemon.admin_token,
@@ -1478,7 +1384,7 @@ async fn exec_outside_root_is_refused() {
     )
     .await;
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(
             token,
@@ -1489,16 +1395,7 @@ async fn exec_outside_root_is_refused() {
             },
         ))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::OutsideRoot,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::OutsideRoot);
 }
 
 #[tokio::test]
@@ -1506,7 +1403,7 @@ async fn exec_binary_unusable_when_tool_not_on_filtered_path() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     // `[tools.doesnotexistanywhere]` is declared but nothing by that name
     // is on the session's (narrow) filtered PATH.
     let (_id, token) = register(
@@ -1519,7 +1416,7 @@ async fn exec_binary_unusable_when_tool_not_on_filtered_path() {
     )
     .await;
 
-    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut client = daemon.client().await;
     let reply = client
         .request(session_request(
             token,
@@ -1530,16 +1427,7 @@ async fn exec_binary_unusable_when_tool_not_on_filtered_path() {
             },
         ))
         .await;
-    assert!(
-        matches!(
-            reply,
-            DaemonMessage::Error {
-                kind: ErrorKind::BinaryUnusable,
-                ..
-            }
-        ),
-        "{reply:?}"
-    );
+    assert_error(&reply, ErrorKind::BinaryUnusable);
 }
 
 #[tokio::test]
@@ -1547,7 +1435,7 @@ async fn exec_cap_refuses_the_seventeenth_concurrent_exec() {
     let daemon = start_test_daemon(DaemonMode::Manual).await;
     let tmp = tempfile::tempdir().unwrap();
 
-    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let mut admin = daemon.client().await;
     let (id, _token) = register(
         &mut admin,
         &daemon.admin_token,
