@@ -346,27 +346,26 @@ fn check_not_granted(
     Ok(())
 }
 
-/// Creates the trust store directory if it does not exist, with mode 0700
-/// on the final component. Intermediate directories (e.g. a missing
-/// `$XDG_STATE_HOME/airlock`) are created with the default mode; only the
-/// trust store's own directory needs to be unreadable by anyone else.
+/// Creates the trust store directory if nothing is at that path yet. What
+/// is already there, symlink or not, is left for validation to judge.
 pub fn create_trust_store_dir(dir: &Path) -> Result<(), AnchorError> {
     if std::fs::symlink_metadata(dir).is_ok() {
         return Ok(());
     }
-    if let Some(parent) = dir.parent() {
-        std::fs::create_dir_all(parent).map_err(|source| AnchorError::Create {
-            path: parent.to_path_buf(),
-            source,
-        })?;
-    }
+    create_private_dir_all(dir).map_err(|source| AnchorError::Create {
+        path: dir.to_path_buf(),
+        source,
+    })
+}
+
+/// Creates `dir` and any missing parents, each mode 0700 from the moment it
+/// exists rather than created and narrowed afterwards. An existing
+/// directory is left as it is.
+pub(crate) fn create_private_dir_all(dir: &Path) -> std::io::Result<()> {
     std::fs::DirBuilder::new()
+        .recursive(true)
         .mode(0o700)
         .create(dir)
-        .map_err(|source| AnchorError::Create {
-            path: dir.to_path_buf(),
-            source,
-        })
 }
 
 /// True when `a` and `b` overlap: one is equal to, or inside, the other.
@@ -673,14 +672,16 @@ mod tests {
     // ─── create_trust_store_dir ─────────────────────────────────────────
 
     #[test]
-    fn create_trust_store_dir_sets_mode_0700_on_leaf_only() {
+    fn create_trust_store_dir_creates_it_and_its_parents_mode_0700() {
         let dir = tempdir();
         let trust = dir.path().join("state").join("airlock").join("trust");
 
         create_trust_store_dir(&trust).unwrap();
 
-        let leaf_mode = std::fs::metadata(&trust).unwrap().mode() & 0o777;
-        assert_eq!(leaf_mode, 0o700);
+        for created in [&trust, trust.parent().unwrap()] {
+            let mode = std::fs::metadata(created).unwrap().mode() & 0o777;
+            assert_eq!(mode, 0o700, "{}", created.display());
+        }
     }
 
     #[test]
