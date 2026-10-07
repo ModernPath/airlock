@@ -656,6 +656,7 @@ pub fn reload(
             changes,
             agent_changed,
         } => Ok((id, changes, agent_changed)),
+        DaemonMessage::Error { message, .. } => Err(LauncherError::Message(message)),
         _ => Err(LauncherError::Message(
             "unexpected response from the daemon".to_string(),
         )),
