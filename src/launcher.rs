@@ -19,7 +19,7 @@ use crate::admin::{self, AdminError};
 use crate::anchors::{self, AnchorError, Anchors};
 use crate::config::{self, ConfigError, RawConfig};
 use crate::exec::{self, FilteredPath};
-use crate::layers::{self, DiscoveryMode, LoadedLayers, MergeContext, Provenance};
+use crate::layers::{self, ApprovableFile, DiscoveryMode, LoadedLayers, MergeContext, Provenance};
 use crate::protocol::{
     AdminRequest, AdminToken, DaemonMessage, DroppedPath, RegisterPayload, RegisterRequest,
     SandboxKind, SessionEnds, SessionId, SessionToken, WireAnchors, WireLayer, WireSecret,
@@ -273,7 +273,7 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
         print_verbose_project_line(&anchors, &loaded, &root, &home)?;
     }
 
-    review_and_trust(&anchors, &loaded, &root, &raw_config, &merged)?;
+    review_and_trust(&anchors, &loaded, &raw_config, &merged)?;
 
     for dir in merged.tool_state_dirs() {
         anchors::validate_tool_state_dir(&anchors, &root, dir)?;
@@ -396,11 +396,16 @@ fn wire_mode(mode: &DiscoveryMode) -> crate::protocol::WireMode {
 }
 
 fn wire_layers(loaded: &LoadedLayers) -> Vec<WireLayer> {
-    [&loaded.global, &loaded.repo, &loaded.local]
+    let global = loaded.global.as_ref().map(|f| (f.kind, f));
+    let approvable = loaded
+        .approvable_files()
         .into_iter()
-        .filter_map(|f| f.as_ref())
-        .map(|f| WireLayer {
-            kind: f.kind,
+        .map(|a| (a.kind, a.file));
+    global
+        .into_iter()
+        .chain(approvable)
+        .map(|(kind, f)| WireLayer {
+            kind,
             path: f.path.clone(),
             sha256: f.sha256.clone(),
         })
@@ -464,8 +469,8 @@ fn resolve_secrets(
 }
 
 /// Builds the verbose first line's text (UX "First run", `-v`): `project
-/// <path> (repo: trusted)`, one `<layer>: <state>` entry per repo/local
-/// layer actually present, in the state each had when checked here —
+/// <path> (repo: trusted)`, one `<layer>: <state>` entry per parent, repo
+/// and local file actually present, in the state each had when checked here —
 /// before `review_and_trust` runs, so a file this same invocation ends up
 /// prompting for still shows the state that triggered the prompt, not the
 /// approval it's about to get. Split from [`print_verbose_project_line`]
@@ -489,15 +494,15 @@ fn print_verbose_project_line(
 ) -> Result<(), LauncherError> {
     let store = TrustStore::open(&anchors.trust_store)?;
     let mut layers = Vec::new();
-    for file in [&loaded.repo, &loaded.local].into_iter().flatten() {
-        let file_name = trust_file_name(file.kind, &file.path);
-        let approval = store.state(root, &file_name, &file.bytes)?;
+    for a in loaded.approvable_files() {
+        let file_name = trust_file_name(a.file.kind, &a.file.path);
+        let approval = store.state(a.dir, &file_name, &a.file.bytes)?;
         let state = match approval {
             Approval::Approved => "trusted",
             Approval::Changed { .. } => "changed since trusted",
             Approval::New => "not trusted yet",
         };
-        layers.push((file.kind, state));
+        layers.push((a.kind, state));
     }
     eprintln!(
         "{}",
@@ -516,33 +521,34 @@ fn trust_file_name(kind: crate::protocol::LayerKind, path: &Path) -> String {
             .file_name()
             .map(|n| n.to_string_lossy().into_owned())
             .unwrap_or_else(|| "config".to_string()),
-        crate::protocol::LayerKind::Global => unreachable!("the global layer is never approved"),
+        crate::protocol::LayerKind::Global | crate::protocol::LayerKind::Parent => {
+            unreachable!("a file's own kind is never global or parent here")
+        }
     }
 }
 
-/// Reviews and, on a terminal, prompts for approval of every repo/local/
-/// config-file layer that isn't already approved (U1). The global layer is
-/// never reviewed — it is the user's own file, protected by the anchor
-/// checks instead.
+/// Reviews and, on a terminal, prompts for approval of every parent/repo/
+/// local/config-file layer that isn't already approved (U1). The global
+/// layer is never reviewed — it is the user's own file, protected by the
+/// anchor checks instead.
 fn review_and_trust(
     anchors: &Anchors,
     loaded: &LoadedLayers,
-    root: &Path,
     raw_config: &RawConfig,
     merged: &layers::MergedConfig,
 ) -> Result<(), LauncherError> {
     let store = TrustStore::open(&anchors.trust_store)?;
     let interactive = trust::is_interactive();
 
-    for file in [&loaded.repo, &loaded.local].into_iter().flatten() {
+    for ApprovableFile { dir, file, .. } in loaded.approvable_files() {
         let file_name = trust_file_name(file.kind, &file.path);
-        let approval = store.state(root, &file_name, &file.bytes)?;
+        let approval = store.state(dir, &file_name, &file.bytes)?;
         if matches!(approval, Approval::Approved) {
             continue;
         }
 
         let path_display = file.path.display().to_string();
-        let annotate = global_link_annotator(merged.provenance(), raw_config);
+        let annotate = link_annotator(merged.provenance(), raw_config);
         let review = trust::render_review(&path_display, &approval, &file.bytes, &annotate);
         eprint!("{review}");
         eprintln!();
@@ -551,7 +557,7 @@ fn review_and_trust(
             let question = trust::prompt_question(PromptKind::Launcher, &approval);
             let approved = trust::prompt_yes_no(question).unwrap_or(false);
             if approved {
-                store.approve(root, &file_name, &file.bytes)?;
+                store.approve(dir, &file_name, &file.bytes)?;
                 eprintln!("trusted {path_display}");
             } else {
                 eprintln!("not trusted; nothing started");
@@ -566,9 +572,10 @@ fn review_and_trust(
 }
 
 /// Builds the `annotate` closure `render_review` calls per line: for a
-/// `from = "global"` line inside a `[secrets.<label>]` block, shows what it
-/// resolves to right now. Display only — not part of the approved bytes.
-fn global_link_annotator<'a>(
+/// `from = "global"` or `from = "parent"` line inside a `[secrets.<label>]`
+/// block, shows what it resolves to right now. Display only — not part of
+/// the approved bytes.
+fn link_annotator<'a>(
     provenance: &'a Provenance,
     raw_config: &'a RawConfig,
 ) -> impl Fn(&str) -> Option<String> + 'a {
@@ -581,30 +588,29 @@ fn global_link_annotator<'a>(
             }
             return None;
         }
-        if trimmed != "from = \"global\"" {
-            return None;
-        }
+        let (from, link) = match trimmed {
+            "from = \"global\"" => ("global", layers::SecretProvenance::GlobalLink),
+            "from = \"parent\"" => ("parent", layers::SecretProvenance::ParentLink),
+            _ => return None,
+        };
         let label = current_label.borrow().clone()?;
-        if !matches!(
-            provenance.secrets.get(&label).copied(),
-            Some(layers::SecretProvenance::GlobalLink)
-        ) {
+        if provenance.secrets.get(&label).copied() != Some(link) {
             return None;
         }
         let spec = raw_config.secrets.as_ref()?.get(&label)?;
-        describe_secret_source(spec)
+        describe_secret_source(from, spec)
     }
 }
 
-fn describe_secret_source(spec: &config::RawSecretSpec) -> Option<String> {
+fn describe_secret_source(from: &str, spec: &config::RawSecretSpec) -> Option<String> {
     match spec.source.as_deref() {
         Some("command") => {
             let argv = spec.command.as_ref()?;
-            Some(format!("global: command {}", argv.join(" ")))
+            Some(format!("{from}: command {}", argv.join(" ")))
         }
         Some("env") => {
             let var = spec.from.as_deref().unwrap_or_default();
-            Some(format!("global: env {var}"))
+            Some(format!("{from}: env {var}"))
         }
         _ => None,
     }
@@ -781,6 +787,7 @@ pub fn reload(
 /// One file awaiting a decision, with everything [`run_trust`] needs to
 /// review and (maybe) approve it.
 struct PendingFile<'a> {
+    dir: &'a Path,
     file: &'a layers::LayerFile,
     file_name: String,
     approval: Approval,
@@ -788,7 +795,8 @@ struct PendingFile<'a> {
 
 /// Runs `airlock trust`: discovers and validates the project exactly like
 /// `session start` (refusing before anything is shown), then reviews and
-/// approves every repo/local/config-file layer that isn't already approved.
+/// approves every parent/repo/local/config-file layer that isn't already
+/// approved.
 pub fn run_trust(
     cwd: &Path,
     config_path: Option<PathBuf>,
@@ -813,11 +821,12 @@ pub fn run_trust(
     let interactive = trust::is_interactive();
 
     let mut pending = Vec::new();
-    for file in [&loaded.repo, &loaded.local].into_iter().flatten() {
+    for ApprovableFile { dir, file, .. } in loaded.approvable_files() {
         let file_name = trust_file_name(file.kind, &file.path);
-        let approval = store.state(&root, &file_name, &file.bytes)?;
+        let approval = store.state(dir, &file_name, &file.bytes)?;
         if !matches!(approval, Approval::Approved) {
             pending.push(PendingFile {
+                dir,
                 file,
                 file_name,
                 approval,
@@ -837,16 +846,16 @@ pub fn run_trust(
             sha256_current: p.file.sha256.clone(),
         })
         .collect();
-    let annotate = global_link_annotator(merged.provenance(), &raw_config);
+    let annotate = link_annotator(merged.provenance(), &raw_config);
 
-    let mut any_approved = false;
+    let mut approved: Vec<&Path> = Vec::new();
     match trust::decide(&unapproved, interactive, yes, expect_sha256) {
         trust::Decision::Approve => {
             for p in &pending {
                 print_review(&p.file.path, &p.approval, &p.file.bytes, &annotate);
-                store.approve(&root, &p.file_name, &p.file.bytes)?;
+                store.approve(p.dir, &p.file_name, &p.file.bytes)?;
                 println!("trusted {}", p.file.path.display());
-                any_approved = true;
+                approved.push(&p.file.path);
             }
         }
         trust::Decision::Prompt => {
@@ -854,9 +863,9 @@ pub fn run_trust(
                 print_review(&p.file.path, &p.approval, &p.file.bytes, &annotate);
                 let question = trust::prompt_question(PromptKind::TrustCommand, &p.approval);
                 if trust::prompt_yes_no(question).unwrap_or(false) {
-                    store.approve(&root, &p.file_name, &p.file.bytes)?;
+                    store.approve(p.dir, &p.file_name, &p.file.bytes)?;
                     println!("trusted {}", p.file.path.display());
-                    any_approved = true;
+                    approved.push(&p.file.path);
                 } else {
                     println!("not trusted: {}", p.file.path.display());
                 }
@@ -871,8 +880,8 @@ pub fn run_trust(
         }
     }
 
-    if any_approved {
-        notify_sessions_using_previous_config(&root);
+    if !approved.is_empty() {
+        notify_sessions_using_previous_config(&root, &approved);
     }
 
     Ok(())
@@ -891,8 +900,9 @@ fn print_review(
 }
 
 /// Best-effort: if the daemon is running and already has sessions for
-/// `root`, tells the user to `airlock session reload` them.
-fn notify_sessions_using_previous_config(root: &Path) {
+/// `root`, or for a project below a parent whose file was just `approved`,
+/// tells the user to `airlock session reload` them.
+fn notify_sessions_using_previous_config(root: &Path, approved: &[&Path]) {
     let Ok(runtime) = RuntimeDir::locate() else {
         return;
     };
@@ -904,7 +914,15 @@ fn notify_sessions_using_previous_config(root: &Path) {
     else {
         return;
     };
-    let matching: Vec<_> = sessions.iter().filter(|s| s.root == root).collect();
+    let matching: Vec<_> = sessions
+        .iter()
+        .filter(|s| {
+            s.root == root
+                || s.layers
+                    .iter()
+                    .any(|l| approved.contains(&l.path.as_path()))
+        })
+        .collect();
     if matching.is_empty() {
         return;
     }
@@ -912,14 +930,25 @@ fn notify_sessions_using_previous_config(root: &Path) {
         .iter()
         .map(|s| format!("{} {:?}", s.id, s.name))
         .collect();
+    // A parent's file reaches sessions of other projects too, which a bare
+    // `session reload` here would not select.
+    let all_here = matching.iter().all(|s| s.root == root);
+    let place = if all_here {
+        format!(" for {}", root.display())
+    } else {
+        String::new()
+    };
     println!(
-        "{} session{} for {} use the previous config: {}",
+        "{} session{}{place} use the previous config: {}",
         matching.len(),
         if matching.len() == 1 { "" } else { "s" },
-        root.display(),
         names.join(", ")
     );
-    println!("run `airlock session reload` to apply it to them");
+    if all_here {
+        println!("run `airlock session reload` to apply it to them");
+    } else {
+        println!("run `airlock session reload <ID>...` to apply it to them");
+    }
 }
 
 // ─── Name defaults ────────────────────────────────────────────────────────────

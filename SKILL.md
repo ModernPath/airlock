@@ -157,6 +157,11 @@ approves and reloads it. Never run `airlock trust`, `airlock session reload`,
 or any other launcher command yourself: those commands refuse to run inside
 your sandbox, because approval has to happen in the user's own terminal.
 
+Some tools may come from a parent config: an `airlock.toml` with
+`cascade = true` in a directory above your project root. That file is
+outside your sandbox, so you cannot edit it; ask the user to. `airlock tools
+list` shows every tool your session serves, wherever it was declared.
+
 So after an edit, tell the user what you changed and ask them to run:
 
 ```

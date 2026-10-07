@@ -1,0 +1,25 @@
+# ~/work/api/airlock.toml — the api team's config, checked into the repo.
+# The team doesn't know about anyone's ~/work/airlock.toml; it declares
+# what the repo needs and leaves the bindings to each user.
+
+[secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+description = "GCP token with deploy access to acme-api"
+
+[secrets.GH_TOKEN]
+description = "GitHub token with read access to acme/api"
+
+# Replaces the parent's gcloud for this repo: same tool name, pinned to the
+# api project. `airlock config` shows it as `repo (replaces parent)`.
+[tools.gcloud]
+description = "Google Cloud CLI, acme-api project"
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
+CLOUDSDK_CONFIG            = "{tool_state}"
+CLOUDSDK_CORE_PROJECT      = "acme-api"
+
+[tools.gh]
+description = "GitHub CLI"
+
+[tools.gh.env]
+GH_TOKEN = { secret = "GH_TOKEN" }
