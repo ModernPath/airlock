@@ -125,6 +125,20 @@ fn run_no_command_and_no_profile_errors() {
     assert!(String::from_utf8_lossy(&output.stderr).contains("no command specified"));
 }
 
+#[test]
+fn trust_refuses_a_config_the_launch_would_refuse() {
+    let fx = Fixture::new();
+    fx.write_config(
+        "[tools.echo]\n\n[agent]\nkits = [\"rust\"]\n\n[agent.env]\nCARGO_HOME = \"/x\"\n",
+    );
+    let output = fx.cmd().args(["trust", "-y"]).output().unwrap();
+    assert_eq!(output.status.code(), Some(125));
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("CARGO_HOME"), "{stderr}");
+    assert!(!stdout.contains("trusted"), "{stdout}");
+}
+
 // ─── Trust, then run (reaches the sandbox — needs a nestable sandbox) ───────
 
 #[test]

@@ -149,28 +149,49 @@ impl Prepared {
     }
 }
 
-// ─── prepare: discovery, trust, secrets ──────────────────────────────────────
+// ─── Discovery and validation ────────────────────────────────────────────────
 
-/// Runs discovery, cross-layer merge validation, anchor validation, trust
-/// review/approval and secret resolution — steps 1 through 5 of the
-/// launcher pipeline in the phase-2 contract. `cwd` is the directory the
-/// command was invoked from (not necessarily the project root).
+/// What discovery and validation produce, before any trust review: shared
+/// by [`prepare`] and [`run_trust`], so `airlock trust` refuses exactly what
+/// a launch would rather than approve a config the launch then rejects.
+struct Discovered {
+    home: PathBuf,
+    runtime: RuntimeDir,
+    anchors: Anchors,
+    /// The launcher's whole environment.
+    full_snapshot: BTreeMap<String, String>,
+    loaded: LoadedLayers,
+    root: PathBuf,
+    merged: layers::MergedConfig,
+    raw_config: RawConfig,
+    config: config::Config,
+    kits_expanded: crate::kits::Expanded,
+    /// The config's, `extra_write_grants` and the active kits' write paths,
+    /// already checked against the anchors.
+    write_grants: Vec<PathBuf>,
+}
+
+/// Discovers, merges and resolves the config, expands its kits plus
+/// `cli_kits`, and validates the resulting write grants against the
+/// anchors.
 #[allow(
     clippy::disallowed_methods,
-    reason = "launcher-side: runs once in the user's terminal before Register, building the snapshot the daemon will use instead of its own environment"
+    reason = "launcher-side: runs once in the user's terminal, resolving anchors and kit overrides from its own environment"
 )]
-pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherError> {
+fn discover(
+    cwd: &Path,
+    mode: &DiscoveryMode,
+    extra_write_grants: &[PathBuf],
+    cli_kits: &[String],
+) -> Result<Discovered, LauncherError> {
     let home = home_dir()?;
     let runtime = RuntimeDir::locate()?;
     let anchors = anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
-    // Collected up front, not just before secret resolution, so kit
-    // expansion below — which needs it for shared-mode override lookups
-    // (`CARGO_HOME`, `GOPATH`, ...) — can run before `write_grants` is
-    // finalized and validated.
+    // Kit expansion needs it for shared-mode override lookups (`CARGO_HOME`,
+    // `GOPATH`, ...) before `write_grants` can be finalized and validated.
     let full_snapshot: BTreeMap<String, String> = std::env::vars().collect();
 
-    let mode = opts.discover.mode();
-    let loaded = layers::load_layers(&mode, cwd, &home, &anchors.global_config)?;
+    let loaded = layers::load_layers(mode, cwd, &home, &anchors.global_config)?;
     let root = loaded.root.clone();
 
     let merge_ctx = MergeContext {
@@ -184,7 +205,7 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     let config = config::resolve_wire_config(raw_config.clone(), &root)?;
 
     crate::kits::validate_all(merged.kits())?;
-    let active_kits = crate::kits::resolve_active(&raw_config, &opts.cli_kits, merged.kits())?;
+    let active_kits = crate::kits::resolve_active(&raw_config, cli_kits, merged.kits())?;
     crate::kits::check_env_collision(raw_config.agent.as_ref(), &active_kits, merged.kits())?;
     let project_id = config::project_id(&root);
     let kits_expanded = crate::kits::expand_all(
@@ -201,11 +222,52 @@ pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherEr
     )?;
 
     let mut write_grants = config::write_grants(&config);
-    write_grants.extend(opts.extra_write_grants.iter().cloned());
+    write_grants.extend(extra_write_grants.iter().cloned());
     write_grants.extend(kits_expanded.write.iter().cloned());
     write_grants.extend(kits_expanded.write_files.iter().cloned());
 
     anchors::validate(&anchors, Some(&root), &write_grants)?;
+
+    Ok(Discovered {
+        home,
+        runtime,
+        anchors,
+        full_snapshot,
+        loaded,
+        root,
+        merged,
+        raw_config,
+        config,
+        kits_expanded,
+        write_grants,
+    })
+}
+
+// ─── prepare: discovery, trust, secrets ──────────────────────────────────────
+
+/// Runs discovery, cross-layer merge validation, anchor validation, trust
+/// review/approval and secret resolution — steps 1 through 5 of the
+/// launcher pipeline in the phase-2 contract. `cwd` is the directory the
+/// command was invoked from (not necessarily the project root).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "launcher-side: runs once in the user's terminal before Register, building the snapshot the daemon will use instead of its own environment"
+)]
+pub fn prepare(cwd: &Path, opts: &PrepareOptions) -> Result<Prepared, LauncherError> {
+    let mode = opts.discover.mode();
+    let Discovered {
+        home,
+        runtime,
+        anchors,
+        full_snapshot,
+        loaded,
+        root,
+        merged,
+        raw_config,
+        config,
+        kits_expanded,
+        write_grants,
+    } = discover(cwd, &mode, &opts.extra_write_grants, &opts.cli_kits)?;
 
     if opts.verbose {
         print_verbose_project_line(&anchors, &loaded, &root, &home)?;
@@ -740,41 +802,28 @@ struct PendingFile<'a> {
     approval: Approval,
 }
 
-/// Runs `airlock trust`: discovers the project exactly like `session
-/// start`, validates and merges (refusing before anything is shown, same as
-/// the launcher), then reviews and approves every repo/local/config-file
-/// layer that isn't already approved.
-#[allow(
-    clippy::disallowed_methods,
-    reason = "launcher-side: `airlock trust` runs in the user's terminal, resolving anchors from its own environment"
-)]
+/// Runs `airlock trust`: discovers and validates the project exactly like
+/// `session start` (refusing before anything is shown), then reviews and
+/// approves every repo/local/config-file layer that isn't already approved.
 pub fn run_trust(
     cwd: &Path,
     config_path: Option<PathBuf>,
     yes: bool,
     expect_sha256: &[String],
 ) -> Result<(), LauncherError> {
-    let home = home_dir()?;
-    let runtime = RuntimeDir::locate()?;
-    let anchors = anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
-
-    let mode = match &config_path {
-        Some(path) => DiscoveryMode::ConfigFile(path.clone()),
-        None => DiscoveryMode::Default,
-    };
-    let loaded = layers::load_layers(&mode, cwd, &home, &anchors.global_config)?;
-    let root = loaded.root.clone();
-
-    let merge_ctx = MergeContext {
-        root: root.clone(),
-        home: home.clone(),
-        tool_state_base: anchors.tool_state_base.clone(),
-    };
-    let merged = layers::merge(&loaded, &merge_ctx)?;
-    let raw_config = merged.to_wire();
-    let resolved = config::resolve_wire_config(raw_config.clone(), &root)?;
-    let write_grants = config::write_grants(&resolved);
-    anchors::validate(&anchors, Some(&root), &write_grants)?;
+    let mode = DiscoverOpts {
+        config: config_path,
+        no_project_config: false,
+    }
+    .mode();
+    let Discovered {
+        anchors,
+        loaded,
+        root,
+        merged,
+        raw_config,
+        ..
+    } = discover(cwd, &mode, &[], &[])?;
 
     let store = TrustStore::open(&anchors.trust_store)?;
     let interactive = trust::is_interactive();
