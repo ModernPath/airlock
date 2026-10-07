@@ -1,6 +1,6 @@
-//! Config layering for Airlock v2: discovery of the global/repo/local
-//! files, merging them into one config, and the cross-layer rules that
-//! decide which tool or secret binding wins.
+//! Config layering for Airlock v2: discovery of the global, parent, repo
+//! and local files, merging them into one config, and the cross-layer rules
+//! that decide which tool or secret binding wins.
 //!
 //! This module reads no environment variables and creates nothing on disk:
 //! every input that would otherwise come from the process environment (the
@@ -29,11 +29,12 @@ use crate::config::{
 #[derive(Debug, Clone)]
 pub enum DiscoveryMode {
     /// Walk up from the working directory to `$HOME` (inclusive) looking for
-    /// `airlock.toml` or `airlock.local.toml`.
+    /// `airlock.toml` or `airlock.local.toml`, then on up from the root for
+    /// parent configs that set `cascade = true`.
     Default,
     /// Use exactly this file as the project's only (repo-position) layer.
-    /// No global layer, no local layer. The project root is its parent
-    /// directory.
+    /// No global layer, no local layer, no parent configs. The project root
+    /// is its parent directory.
     ConfigFile(PathBuf),
     /// Ignore `airlock.toml` and `airlock.local.toml` even if present. The
     /// project root is the canonical working directory; the config is the
@@ -85,18 +86,71 @@ impl LayerFile {
     }
 }
 
+/// A directory above the project root whose config sets `cascade = true`,
+/// and so applies to the project as a parent config.
+#[derive(Debug)]
+pub struct ParentLayers {
+    /// The canonical directory. Relative paths in its files resolve against
+    /// it, and its files' trust-store slots are keyed by it.
+    pub dir: PathBuf,
+    /// Its `airlock.toml`, with [`LayerKind::Repo`] as its kind: within its
+    /// own directory it follows the repo layer's rules.
+    pub repo: Option<LayerFile>,
+    /// Its `airlock.local.toml`, with [`LayerKind::Local`] as its kind.
+    pub local: Option<LayerFile>,
+}
+
 /// The layers found for one project, before merging.
 #[derive(Debug)]
 pub struct LoadedLayers {
     /// The project root, which is also the sandbox root.
     pub root: PathBuf,
     pub global: Option<LayerFile>,
+    /// Parent configs that cascade to this project, outermost first. Always
+    /// empty under `--config` and `--no-project-config`.
+    pub parents: Vec<ParentLayers>,
     /// The project-declared layer: `airlock.toml`, or (in
     /// [`DiscoveryMode::ConfigFile`]) the `--config` file, in which case its
     /// [`LayerFile::kind`] is [`LayerKind::ConfigFile`] rather than
     /// [`LayerKind::Repo`].
     pub repo: Option<LayerFile>,
     pub local: Option<LayerFile>,
+}
+
+/// One file that must be approved before a session uses it.
+pub struct ApprovableFile<'a> {
+    /// The directory its trust-store slot is keyed by: the project root, or
+    /// the parent directory the file sits in.
+    pub dir: &'a Path,
+    /// How it is shown and sent on the wire: [`LayerKind::Parent`] for
+    /// either of a parent's files, the file's own kind otherwise.
+    pub kind: LayerKind,
+    pub file: &'a LayerFile,
+}
+
+impl LoadedLayers {
+    /// Every file that needs approval: each parent's, outermost first, then
+    /// the project's own. The global file is never approved.
+    pub fn approvable_files(&self) -> Vec<ApprovableFile<'_>> {
+        let mut out = Vec::new();
+        for parent in &self.parents {
+            for file in [&parent.repo, &parent.local].into_iter().flatten() {
+                out.push(ApprovableFile {
+                    dir: &parent.dir,
+                    kind: LayerKind::Parent,
+                    file,
+                });
+            }
+        }
+        for file in [&self.repo, &self.local].into_iter().flatten() {
+            out.push(ApprovableFile {
+                dir: &self.root,
+                kind: file.kind,
+                file,
+            });
+        }
+        out
+    }
 }
 
 /// Read the project's config layers.
@@ -120,6 +174,7 @@ pub fn load_layers(
             Ok(LoadedLayers {
                 root,
                 global,
+                parents: Vec::new(),
                 repo: None,
                 local: None,
             })
@@ -137,6 +192,7 @@ pub fn load_layers(
             Ok(LoadedLayers {
                 root,
                 global,
+                parents: Vec::new(),
                 repo: Some(repo),
                 local: None,
             })
@@ -149,9 +205,19 @@ pub fn load_layers(
             let local = local_path
                 .map(|p| LayerFile::read(LayerKind::Local, &p, euid))
                 .transpose()?;
+            // A project file that does not parse fails in `merge` instead,
+            // after `airlock config` has shown which layers were found.
+            let inherit = inheritance_flags(repo.as_ref(), local.as_ref())
+                .map_or(true, |(_, inherit)| inherit);
+            let parents = if inherit {
+                discover_parents(&root, home, euid)?
+            } else {
+                Vec::new()
+            };
             Ok(LoadedLayers {
                 root,
                 global,
+                parents,
                 repo,
                 local,
             })
@@ -220,13 +286,89 @@ fn discover_project_root(
     })
 }
 
+/// A directory's `cascade` and `inherit`, its local file's over its repo
+/// file's: whether its config applies to projects below it (default no),
+/// and whether it takes parent configs itself (default yes).
+fn inheritance_flags(
+    repo: Option<&LayerFile>,
+    local: Option<&LayerFile>,
+) -> Result<(bool, bool), ConfigError> {
+    let repo = repo.map(LayerFile::parse).transpose()?;
+    let local = local.map(LayerFile::parse).transpose()?;
+    let flag = |get: fn(&RawConfig) -> Option<bool>| {
+        local
+            .as_ref()
+            .and_then(get)
+            .or_else(|| repo.as_ref().and_then(get))
+    };
+    Ok((
+        flag(|c| c.cascade).unwrap_or(false),
+        flag(|c| c.inherit).unwrap_or(true),
+    ))
+}
+
+/// Walk up from just above `root` to just below `home`, collecting each
+/// directory whose config sets `cascade = true`, until one of them sets
+/// `inherit = false`. A directory whose config does not cascade is skipped,
+/// not a stop. `$HOME` itself is never a parent — the global config already
+/// covers everything under it — and a root outside `$HOME` has none.
+/// Outermost first.
+fn discover_parents(root: &Path, home: &Path, euid: u32) -> Result<Vec<ParentLayers>, ConfigError> {
+    let home = std::fs::canonicalize(home).unwrap_or_else(|_| home.to_path_buf());
+    let mut parents = Vec::new();
+    let mut dir = root;
+    while let Some(above) = dir.parent() {
+        if above == home || !above.starts_with(&home) {
+            break;
+        }
+        dir = above;
+        let repo = load_owned_layer(&dir.join(config::config_filename()), LayerKind::Repo, euid)?;
+        let local = load_owned_layer(
+            &dir.join(config::local_config_filename()),
+            LayerKind::Local,
+            euid,
+        )?;
+        if repo.is_none() && local.is_none() {
+            continue;
+        }
+        let (cascade, inherit) = inheritance_flags(repo.as_ref(), local.as_ref())?;
+        if !cascade {
+            continue;
+        }
+        parents.push(ParentLayers {
+            dir: dir.to_path_buf(),
+            repo,
+            local,
+        });
+        if !inherit {
+            break;
+        }
+    }
+    parents.reverse();
+    Ok(parents)
+}
+
+/// Reads `path` if it exists and is owned by `euid` — the same test
+/// [`discover_project_root`] applies to a candidate project file.
+fn load_owned_layer(
+    path: &Path,
+    kind: LayerKind,
+    euid: u32,
+) -> Result<Option<LayerFile>, ConfigError> {
+    if !config::is_owned_by(path, euid) {
+        return Ok(None);
+    }
+    LayerFile::read(kind, path, euid).map(Some)
+}
+
 pub use crate::config::project_id;
 
 // ─── Merge ──────────────────────────────────────────────────────────────────
 
 /// Inputs to [`merge`] that would otherwise come from the environment.
 pub struct MergeContext {
-    /// The project root, as found by [`load_layers`].
+    /// The project root, as found by [`load_layers`]. `{sandbox_root}` and
+    /// `{tool_state}` resolve against it in every layer, parents included.
     pub root: PathBuf,
     /// The user's home directory, for `~` expansion.
     pub home: PathBuf,
@@ -253,6 +395,9 @@ pub enum SecretProvenance {
     LocalOverride,
     /// A local `from = "global"` link, resolved to the global binding.
     GlobalLink,
+    /// A local `from = "parent"` link, resolved to the parent configs'
+    /// binding.
+    ParentLink,
 }
 
 /// Where a merged `[agent.env.<key>]` entry's value came from, and which
@@ -345,6 +490,8 @@ enum ClassifiedSecret {
     Unbound { description: Option<String> },
     /// The local layer wrote `from = "global"`.
     GlobalLink { description: Option<String> },
+    /// The local layer wrote `from = "parent"`.
+    ParentLink { description: Option<String> },
     /// A concrete, resolved source.
     Bound {
         description: Option<String>,
@@ -357,8 +504,22 @@ impl ClassifiedSecret {
         match self {
             ClassifiedSecret::Unbound { description }
             | ClassifiedSecret::GlobalLink { description }
+            | ClassifiedSecret::ParentLink { description }
             | ClassifiedSecret::Bound { description, .. } => description.clone(),
         }
+    }
+
+    /// This entry, keeping `fallback` as its description if it has none of
+    /// its own — a local binding of a repo label inherits the repo's.
+    fn with_description_or(mut self, fallback: Option<String>) -> Self {
+        let (ClassifiedSecret::Unbound { description }
+        | ClassifiedSecret::GlobalLink { description }
+        | ClassifiedSecret::ParentLink { description }
+        | ClassifiedSecret::Bound { description, .. }) = &mut self;
+        if description.is_none() {
+            *description = fallback;
+        }
+        self
     }
 }
 
@@ -382,7 +543,7 @@ fn classify_secret(
             }
         }
         (None, Some(value)) => {
-            if value != "global" {
+            if value != "global" && value != "parent" {
                 return Err(ConfigError::InvalidFromValue {
                     file: file.to_path_buf(),
                     label: label.to_string(),
@@ -390,13 +551,17 @@ fn classify_secret(
                 });
             }
             if kind != LayerKind::Local {
-                return Err(ConfigError::FromGlobalOutsideLocal {
+                return Err(ConfigError::FromOutsideLocal {
                     file: file.to_path_buf(),
                     label: label.to_string(),
+                    from: value.clone(),
                 });
             }
-            Ok(ClassifiedSecret::GlobalLink {
-                description: spec.description.clone(),
+            let description = spec.description.clone();
+            Ok(if value == "global" {
+                ClassifiedSecret::GlobalLink { description }
+            } else {
+                ClassifiedSecret::ParentLink { description }
             })
         }
         (Some(_), _) => {
@@ -412,9 +577,9 @@ fn classify_secret(
 /// Classify every `[secrets.<label>]` entry of one layer, applying the
 /// layer-wide rules [`classify_secret`] cannot see on its own: the global
 /// layer's labels must all be `Bound` (nothing else makes sense for your
-/// own file), the repo/config layer's must not be `GlobalLink` (`from =
-/// "global"` is local-only — already enforced by `classify_secret`, kept
-/// here as the single place that owns "what can a layer contain").
+/// own file), the repo/config layer's must not be links (`from` is
+/// local-only — already enforced by `classify_secret`, kept here as the
+/// single place that owns "what can a layer contain").
 fn classify_layer_secrets(
     file: Option<&Path>,
     raw: Option<&RawConfig>,
@@ -441,29 +606,45 @@ fn classify_layer_secrets(
     Ok(out)
 }
 
+/// The bindings a local `from` link resolves against.
+struct LinkTargets<'a> {
+    /// The global file's own labels, for `from = "global"`.
+    global: &'a HashMap<String, ClassifiedSecret>,
+    /// Every label the parent configs bind, for `from = "parent"`; `None`
+    /// when no parent config cascades to this directory.
+    parent: Option<&'a HashMap<String, ClassifiedSecret>>,
+}
+
 /// Resolve one `HashMap` of classified secrets into concrete sources,
-/// looking up `from = "global"` links in `global` as needed.
+/// following `from` links into `links` as needed.
 fn resolve_pool(
     file: &Path,
     classified: &HashMap<String, ClassifiedSecret>,
-    global: &HashMap<String, ClassifiedSecret>,
+    links: &LinkTargets<'_>,
 ) -> Result<HashMap<String, SecretSource>, ConfigError> {
     let mut out = HashMap::with_capacity(classified.len());
     for (label, c) in classified {
-        let source = match c {
-            ClassifiedSecret::Bound { source, .. } => source.clone(),
-            ClassifiedSecret::GlobalLink { .. } => match global.get(label) {
-                Some(ClassifiedSecret::Bound { source, .. }) => source.clone(),
-                _ => {
-                    return Err(ConfigError::FromGlobalOutsideLocal {
-                        file: file.to_path_buf(),
-                        label: label.clone(),
-                    });
-                }
-            },
+        let (target, from) = match c {
+            ClassifiedSecret::Bound { source, .. } => {
+                out.insert(label.clone(), source.clone());
+                continue;
+            }
             ClassifiedSecret::Unbound { .. } => continue,
+            ClassifiedSecret::GlobalLink { .. } => (Some(links.global), "global"),
+            ClassifiedSecret::ParentLink { .. } => (links.parent, "parent"),
         };
-        out.insert(label.clone(), source);
+        match target.and_then(|t| t.get(label)) {
+            Some(ClassifiedSecret::Bound { source, .. }) => {
+                out.insert(label.clone(), source.clone());
+            }
+            _ => {
+                return Err(ConfigError::UnboundLink {
+                    file: file.to_path_buf(),
+                    label: label.clone(),
+                    from: from.to_string(),
+                });
+            }
+        }
     }
     Ok(out)
 }
@@ -528,9 +709,10 @@ enum RefScope<'a> {
 }
 
 /// Resolve one `env` table (a tool's or the agent's), rendering `{sandbox_root}`
-/// / `{tool_state}` in static values and checking every secret reference
-/// against the scope-appropriate pool. Returns the rendered env (ready for
-/// the wire) and any new `{tool_state}` directories it introduced.
+/// / `{tool_state}` in static values (unless `render` is off) and checking
+/// every secret reference against the scope-appropriate pool. Returns the
+/// rendered env (ready for the wire) and any new `{tool_state}` directories
+/// it introduced.
 #[allow(clippy::too_many_arguments)]
 fn resolve_env_table(
     owner: EnvOwner<'_>,
@@ -541,6 +723,7 @@ fn resolve_env_table(
     pool: &HashMap<String, SecretSource>,
     global_pool: &HashMap<String, SecretSource>,
     is_proxy_tool: bool,
+    render: bool,
     tool_state_dirs: &mut Vec<PathBuf>,
     referenced_global_labels: &mut std::collections::HashSet<String>,
     undeclared_refs: &mut Vec<(String, String, String)>,
@@ -550,6 +733,7 @@ fn resolve_env_table(
     for (var_name, raw_value) in raw_env {
         config::check_env_entry(owner, &var_name, &raw_value, is_proxy_tool)?;
         let value = match raw_value {
+            RawEnvValue::Static(s) if !render => RawEnvValue::Static(s),
             RawEnvValue::Static(s) => {
                 let tool_state_dir = if config::uses_tool_state_placeholder(&s) {
                     Some(config::resolve_tool_state_path(
@@ -613,8 +797,8 @@ fn resolve_env_table(
     Ok(out)
 }
 
-fn resolve_path_list(raw: &[String], ctx: &MergeContext) -> Vec<String> {
-    config::resolve_paths_with_home(raw, &ctx.root, &ctx.home)
+fn resolve_path_list(raw: &[String], dir: &Path, home: &Path) -> Vec<String> {
+    config::resolve_paths_with_home(raw, dir, home)
         .into_iter()
         .map(|p| p.display().to_string())
         .collect()
@@ -654,25 +838,25 @@ fn reject_override(
 /// The secret pool an item owned by each layer resolves its references
 /// against, and the scope that decides what an unresolved one means.
 struct LayerPools<'a> {
-    global_file: Option<&'a Path>,
+    base_file: Option<&'a Path>,
     repo_file: Option<&'a Path>,
-    global: &'a HashMap<String, SecretSource>,
+    base: &'a HashMap<String, SecretSource>,
     repo: &'a HashMap<String, SecretSource>,
-    /// Global, repo and local-only labels together: a local item may use
-    /// any of them.
+    /// Base, repo and local-only labels together: a local item may use any
+    /// of them.
     local: &'a HashMap<String, SecretSource>,
 }
 
 impl<'a> LayerPools<'a> {
     fn for_layer(&self, kind: LayerKind) -> (RefScope<'a>, &'a HashMap<String, SecretSource>) {
         match kind {
-            LayerKind::Global => (
+            LayerKind::Global | LayerKind::Parent => (
                 RefScope::Global {
                     file: self
-                        .global_file
-                        .expect("an item owned by the global layer has a file"),
+                        .base_file
+                        .expect("an item owned by the base has a file"),
                 },
-                self.global,
+                self.base,
             ),
             LayerKind::Local => (RefScope::Local, self.local),
             LayerKind::Repo | LayerKind::ConfigFile => (
@@ -718,28 +902,368 @@ fn items_of(acc: &[(String, LayerKind)]) -> Vec<String> {
     acc.iter().map(|(item, _)| item.clone()).collect()
 }
 
+/// The layer the first `(item, layer)` pair for `item` in `list` names.
+fn layer_of(list: &[(String, LayerKind)], item: &str) -> Option<LayerKind> {
+    list.iter().find(|(i, _)| i == item).map(|(_, kind)| *kind)
+}
+
+/// What one directory's own files merge on top of: the global file alone,
+/// or the global file with every cascading parent above that directory
+/// already merged in. A directory's files treat it exactly as they treat
+/// the global layer: a repo or local tool replaces a base tool, a repo item
+/// cannot reference a base label, and a local file links one with `from`.
+struct Base {
+    /// The global file, or the nearest parent's file — what an error about
+    /// a base item names.
+    file: Option<PathBuf>,
+    /// Shaped like a global file: every path absolute, static env values
+    /// not yet rendered, no `override`. Its secrets are in `secrets`.
+    raw: Option<RawConfig>,
+    /// Every label an item owned by the base resolves against, all bound.
+    secrets: HashMap<String, ClassifiedSecret>,
+    /// The global file's own labels, which `from = "global"` links to.
+    global_secrets: HashMap<String, ClassifiedSecret>,
+    /// Whether a parent config is merged in, so `from = "parent"` has
+    /// something to link to.
+    has_parent: bool,
+    /// Where the base got each item. An item with no entry came from the
+    /// global file.
+    provenance: Provenance,
+}
+
+impl Base {
+    /// The global file on its own, after the rules only it has: no
+    /// `override`, absolute paths, no `cascade` or `inherit`.
+    fn global(file: Option<&LayerFile>) -> Result<Base, ConfigError> {
+        let raw = file.map(LayerFile::parse).transpose()?;
+        let path = file.map(|f| f.path.clone());
+        if let (Some(global), Some(file)) = (&raw, &path) {
+            reject_override(file, global.tools.as_ref())?;
+            if let Some(fs) = &global.filesystem {
+                check_global_paths_absolute(file, &fs.read)?;
+                check_global_paths_absolute(file, &fs.write)?;
+            }
+            if let Some(tools) = &global.tools {
+                for t in tools.values() {
+                    check_global_paths_absolute(file, &t.extra_read)?;
+                    check_global_paths_absolute(file, &t.extra_write)?;
+                }
+            }
+            if let Some(agent) = &global.agent
+                && let Some(fs) = &agent.filesystem
+            {
+                check_global_paths_absolute(file, &fs.read)?;
+                check_global_paths_absolute(file, &fs.write)?;
+            }
+            if let Some(kits) = &global.kits {
+                for def in kits.values() {
+                    check_global_paths_absolute(file, &def.read)?;
+                    check_global_paths_absolute(file, &def.write)?;
+                }
+            }
+            for (key, set) in [
+                ("cascade", global.cascade.is_some()),
+                ("inherit", global.inherit.is_some()),
+            ] {
+                if set {
+                    return Err(ConfigError::InheritanceKeyInGlobal {
+                        file: file.clone(),
+                        key,
+                    });
+                }
+            }
+        }
+        let secrets = classify_layer_secrets(path.as_deref(), raw.as_ref(), LayerKind::Global)?;
+        Ok(Base {
+            file: path,
+            raw,
+            global_secrets: secrets.clone(),
+            secrets,
+            has_parent: false,
+            provenance: Provenance::default(),
+        })
+    }
+
+    /// The base for the directories below a parent: that parent's files,
+    /// merged on top of `self` as `level`, with everything they contributed
+    /// attributed to [`LayerKind::Parent`].
+    fn with_parent(self, level: Level, file: PathBuf) -> Base {
+        let Level {
+            raw,
+            mut provenance,
+            kits,
+            pool,
+            ..
+        } = level;
+        inherit_provenance(&mut provenance, &self.provenance);
+        relabel_as_parent(&mut provenance);
+        for label in pool.keys() {
+            if !provenance.secrets.contains_key(label) {
+                let from_base = self
+                    .provenance
+                    .secrets
+                    .get(label)
+                    .copied()
+                    .unwrap_or(SecretProvenance::Direct(LayerKind::Global));
+                provenance.secrets.insert(label.clone(), from_base);
+            }
+        }
+        let allow_home_root = self.raw.as_ref().and_then(|c| c.allow_home_root);
+        Base {
+            file: Some(file),
+            raw: Some(RawConfig {
+                secrets: None,
+                allow_home_root,
+                kits: Some(kits.into_iter().collect()),
+                ..raw
+            }),
+            secrets: pool,
+            global_secrets: self.global_secrets,
+            has_parent: true,
+            provenance,
+        }
+    }
+}
+
+/// Which directory a [`merge_level`] call merges.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Stage {
+    /// A parent: its result becomes the next [`Base`], so its static env
+    /// values stay unrendered until the project merges them.
+    Parent,
+    /// The project root itself.
+    Project,
+}
+
+/// One directory's files merged on top of a [`Base`]. Its provenance still
+/// says [`LayerKind::Global`] for everything that came from the base.
+struct Level {
+    raw: RawConfig,
+    tool_state_dirs: Vec<PathBuf>,
+    provenance: Provenance,
+    kits: BTreeMap<String, RawKitConfig>,
+    /// Every label a local item in this directory could use — the base's,
+    /// the repo's as bound and the local file's own — all bound. The next
+    /// [`Base`]'s secrets.
+    pool: HashMap<String, ClassifiedSecret>,
+}
+
 /// Merge a project's loaded layers into one normalized, wire-ready config.
 ///
-/// Parses each layer, applies the per-layer structural rules (repo cannot
-/// set `allow_home_root` or `override`, global paths must be absolute),
-/// then the cross-layer rules ("Tools across layers", "Secret labels across
-/// layers" in the v2 design), then the existing merged-config validation
-/// (proxy tools, undeclared refs) that already lived in `config.rs`.
+/// Folds the layers from lowest to highest precedence: the global file is
+/// the first [`Base`], each cascading parent's own files merge on top of it
+/// and become the next one, and the project's files merge last. Every step
+/// applies the same rules ("Tools across layers", "Secret labels across
+/// layers" in the v2 design), with the base in the global layer's place.
 pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, ConfigError> {
-    let global_raw = layers.global.as_ref().map(|f| f.parse()).transpose()?;
-    let repo_raw = layers.repo.as_ref().map(|f| f.parse()).transpose()?;
-    let local_raw = layers.local.as_ref().map(|f| f.parse()).transpose()?;
+    let base = fold_parents(layers, ctx)?;
+    let Level {
+        raw,
+        tool_state_dirs,
+        mut provenance,
+        kits,
+        ..
+    } = merge_level(
+        &base,
+        layers.repo.as_ref(),
+        layers.local.as_ref(),
+        &ctx.root,
+        Stage::Project,
+        ctx,
+    )?;
+    inherit_provenance(&mut provenance, &base.provenance);
+    Ok(MergedConfig {
+        raw,
+        root: ctx.root.clone(),
+        tool_state_dirs,
+        provenance,
+        kits,
+    })
+}
 
-    let global_file = layers.global.as_ref().map(|f| f.path.as_path());
-    let repo_file = layers.repo.as_ref().map(|f| f.path.as_path());
-    let local_file = layers.local.as_ref().map(|f| f.path.as_path());
-    let repo_kind = layers.repo.as_ref().map_or(LayerKind::Repo, |f| f.kind);
-    // Lowest to highest precedence.
+/// The global file with every cascading parent merged on top of it: the
+/// base the project's own files merge onto.
+fn fold_parents(layers: &LoadedLayers, ctx: &MergeContext) -> Result<Base, ConfigError> {
+    let mut base = Base::global(layers.global.as_ref())?;
+    for parent in &layers.parents {
+        let level = merge_level(
+            &base,
+            parent.repo.as_ref(),
+            parent.local.as_ref(),
+            &parent.dir,
+            Stage::Parent,
+            ctx,
+        )?;
+        let file = parent
+            .local
+            .as_ref()
+            .or(parent.repo.as_ref())
+            .expect("a parent has at least one file")
+            .path
+            .clone();
+        base = base.with_parent(level, file);
+    }
+    Ok(base)
+}
+
+/// The labels the parent configs themselves bind for the project in
+/// `layers`, sorted — what `airlock init --local` stubs with
+/// `from = "parent"`. A label a parent only passes through from the global
+/// file is left out: `from = "global"` says that more plainly.
+pub fn parent_bound_labels(layers: &LoadedLayers, home: &Path) -> Result<Vec<String>, ConfigError> {
+    let ctx = MergeContext {
+        root: layers.root.clone(),
+        home: home.to_path_buf(),
+        // Parent stages never render `{tool_state}`.
+        tool_state_base: PathBuf::new(),
+    };
+    let base = fold_parents(layers, &ctx)?;
+    let mut labels: Vec<String> = base
+        .secrets
+        .keys()
+        .filter(|label| {
+            matches!(
+                base.provenance.secrets.get(*label),
+                Some(SecretProvenance::Direct(LayerKind::Parent) | SecretProvenance::ParentLink)
+            )
+        })
+        .cloned()
+        .collect();
+    labels.sort();
+    Ok(labels)
+}
+
+/// Replaces each [`LayerKind::Global`] attribution in `prov` — which, from
+/// one [`merge_level`] call, means "from the base" — with where the base
+/// itself got that item.
+fn inherit_provenance(prov: &mut Provenance, base: &Provenance) {
+    let from_base = |kind: LayerKind, found: Option<LayerKind>| match kind {
+        LayerKind::Global => found.unwrap_or(LayerKind::Global),
+        other => other,
+    };
+
+    for (name, p) in prov.tools.iter_mut() {
+        let Some(b) = base.tools.get(name) else {
+            continue;
+        };
+        if p.layer == LayerKind::Global {
+            *p = *b;
+        } else if p.replaced == Some(LayerKind::Global) {
+            p.replaced = Some(b.layer);
+        }
+    }
+    for (label, p) in prov.secrets.iter_mut() {
+        if *p == SecretProvenance::Direct(LayerKind::Global)
+            && let Some(b) = base.secrets.get(label)
+        {
+            *p = *b;
+        }
+    }
+
+    let s = &mut prov.settings;
+    let b = &base.settings;
+    s.timeout = s.timeout.map(|k| from_base(k, b.timeout));
+    s.access = s.access.map(|k| from_base(k, b.access));
+    for (list, base_list) in [
+        (&mut s.filesystem_read, &b.filesystem_read),
+        (&mut s.filesystem_write, &b.filesystem_write),
+        (&mut s.agent_passthrough_env, &b.agent_passthrough_env),
+        (&mut s.agent_kits, &b.agent_kits),
+    ] {
+        for (item, kind) in list.iter_mut() {
+            *kind = from_base(*kind, layer_of(base_list, item));
+        }
+    }
+    for (key, p) in s.agent_env.iter_mut() {
+        let Some(found) = b.agent_env.get(key) else {
+            continue;
+        };
+        if p.layer == LayerKind::Global {
+            *p = *found;
+        } else if p.overrides == Some(LayerKind::Global) {
+            p.overrides = Some(found.layer);
+        }
+    }
+    for (name, kind) in prov.kits.iter_mut() {
+        *kind = from_base(*kind, base.kits.get(name).copied());
+    }
+}
+
+/// Attributes everything a parent's own files contributed to
+/// [`LayerKind::Parent`]: below that parent, its repo and local files are
+/// one layer.
+fn relabel_as_parent(prov: &mut Provenance) {
+    let parent = |kind: LayerKind| match kind {
+        LayerKind::Repo | LayerKind::Local | LayerKind::ConfigFile => LayerKind::Parent,
+        other => other,
+    };
+    for p in prov.tools.values_mut() {
+        p.layer = parent(p.layer);
+        p.replaced = p.replaced.map(parent);
+    }
+    for p in prov.secrets.values_mut() {
+        *p = match *p {
+            SecretProvenance::Direct(kind) => SecretProvenance::Direct(parent(kind)),
+            SecretProvenance::LocalOverride => SecretProvenance::Direct(LayerKind::Parent),
+            link @ (SecretProvenance::GlobalLink | SecretProvenance::ParentLink) => link,
+        };
+    }
+    let s = &mut prov.settings;
+    s.timeout = s.timeout.map(parent);
+    s.access = s.access.map(parent);
+    for list in [
+        &mut s.filesystem_read,
+        &mut s.filesystem_write,
+        &mut s.agent_passthrough_env,
+        &mut s.agent_kits,
+    ] {
+        for (_, kind) in list.iter_mut() {
+            *kind = parent(*kind);
+        }
+    }
+    for p in s.agent_env.values_mut() {
+        p.layer = parent(p.layer);
+        p.overrides = p.overrides.map(parent);
+    }
+    for kind in prov.kits.values_mut() {
+        *kind = parent(*kind);
+    }
+}
+
+/// Merge one directory's repo and local files on top of `base`.
+///
+/// Parses each file, applies the per-layer structural rules (repo cannot
+/// set `allow_home_root`, `[kits.*]` or `override`), then the cross-layer
+/// rules against the base, then the existing merged-config validation
+/// (proxy tools, undeclared refs) that already lived in `config.rs`.
+/// Relative paths resolve against `dir`.
+fn merge_level(
+    base: &Base,
+    repo: Option<&LayerFile>,
+    local: Option<&LayerFile>,
+    dir: &Path,
+    stage: Stage,
+    ctx: &MergeContext,
+) -> Result<Level, ConfigError> {
+    let base_raw = base.raw.as_ref();
+    let repo_raw = repo.map(LayerFile::parse).transpose()?;
+    let local_raw = local.map(LayerFile::parse).transpose()?;
+
+    let base_file = base.file.as_deref();
+    let repo_file = repo.map(|f| f.path.as_path());
+    let local_file = local.map(|f| f.path.as_path());
+    let repo_kind = repo.map_or(LayerKind::Repo, |f| f.kind);
+    // Lowest to highest precedence. The base sits in the global layer's
+    // place; `merge` maps what came from it back to where the base got it.
     let ordered: [(LayerKind, Option<&RawConfig>); 3] = [
-        (LayerKind::Global, global_raw.as_ref()),
+        (LayerKind::Global, base_raw),
         (repo_kind, repo_raw.as_ref()),
         (LayerKind::Local, local_raw.as_ref()),
     ];
+    // Static env values are rendered once, when the project merges them:
+    // `{sandbox_root}` and `{tool_state}` mean the project root even in a
+    // parent's file, and rendering twice would undo a `\{` escape.
+    let render = stage == Stage::Project;
 
     // ── Per-layer structural rules ──────────────────────────────────────
 
@@ -756,47 +1280,26 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         }
         reject_override(file, repo.tools.as_ref())?;
     }
-    if let (Some(global), Some(file)) = (&global_raw, global_file) {
-        reject_override(file, global.tools.as_ref())?;
-        if let Some(fs) = &global.filesystem {
-            check_global_paths_absolute(file, &fs.read)?;
-            check_global_paths_absolute(file, &fs.write)?;
-        }
-        if let Some(tools) = &global.tools {
-            for t in tools.values() {
-                check_global_paths_absolute(file, &t.extra_read)?;
-                check_global_paths_absolute(file, &t.extra_write)?;
-            }
-        }
-        if let Some(agent) = &global.agent
-            && let Some(fs) = &agent.filesystem
-        {
-            check_global_paths_absolute(file, &fs.read)?;
-            check_global_paths_absolute(file, &fs.write)?;
-        }
-        if let Some(kits) = &global.kits {
-            for def in kits.values() {
-                check_global_paths_absolute(file, &def.read)?;
-                check_global_paths_absolute(file, &def.write)?;
-            }
-        }
-    }
 
     // ── Home-root guard ──────────────────────────────────────────────────
 
-    let merged_allow_home_root = global_raw.as_ref().and_then(|c| c.allow_home_root) == Some(true)
-        || local_raw.as_ref().and_then(|c| c.allow_home_root) == Some(true);
-    // Canonical on both sides: the root is canonical already, and a home
-    // reached through a symlink must not slip past the guard.
-    let home = std::fs::canonicalize(&ctx.home).unwrap_or_else(|_| ctx.home.clone());
-    if ctx.root == home && !merged_allow_home_root {
-        return Err(ConfigError::HomeRootNotAllowed {
-            home: ctx.root.clone(),
-        });
+    // A parent is always strictly below $HOME, so only the project root can
+    // be $HOME itself.
+    if stage == Stage::Project {
+        let merged_allow_home_root = base_raw.and_then(|c| c.allow_home_root) == Some(true)
+            || local_raw.as_ref().and_then(|c| c.allow_home_root) == Some(true);
+        // Canonical on both sides: the root is canonical already, and a home
+        // reached through a symlink must not slip past the guard.
+        let home = std::fs::canonicalize(&ctx.home).unwrap_or_else(|_| ctx.home.clone());
+        if ctx.root == home && !merged_allow_home_root {
+            return Err(ConfigError::HomeRootNotAllowed {
+                home: ctx.root.clone(),
+            });
+        }
     }
 
-    // ── Kits: global/local `[kits.<name>]` tables, local overriding global
-    //    whole, by name ────────────────────────────────────────────────────
+    // ── Kits: base and local `[kits.<name>]` tables, local overriding the
+    //    base's whole, by name ─────────────────────────────────────────────
     // (The repo layer is already refused above.) Table-shape validation
     // (built-in vs. user-defined field restrictions, {tool_state}, env var
     // names) and resolving `agent.kits` into an active list happen later, in
@@ -804,23 +1307,28 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     // to merge the raw tables and record which layer each came from.
     let mut kits: BTreeMap<String, RawKitConfig> = BTreeMap::new();
     let mut kit_provenance: HashMap<String, LayerKind> = HashMap::new();
-    if let Some(global) = global_raw.as_ref().and_then(|c| c.kits.as_ref()) {
-        for (name, def) in global {
+    if let Some(from_base) = base_raw.and_then(|c| c.kits.as_ref()) {
+        for (name, def) in from_base {
             kits.insert(name.clone(), def.clone());
             kit_provenance.insert(name.clone(), LayerKind::Global);
         }
     }
     if let Some(local) = local_raw.as_ref().and_then(|c| c.kits.as_ref()) {
         for (name, def) in local {
-            kits.insert(name.clone(), def.clone());
+            let mut def = def.clone();
+            if stage == Stage::Parent {
+                // crate::kits resolves a relative path against the project
+                // root, not the parent directory this file sits in.
+                def.read = resolve_path_list(&def.read, dir, &ctx.home);
+                def.write = resolve_path_list(&def.write, dir, &ctx.home);
+            }
+            kits.insert(name.clone(), def);
             kit_provenance.insert(name.clone(), LayerKind::Local);
         }
     }
 
     // ── Secret classification and the unbound-labels check ──────────────
 
-    let global_secrets =
-        classify_layer_secrets(global_file, global_raw.as_ref(), LayerKind::Global)?;
     let repo_secrets = classify_layer_secrets(repo_file, repo_raw.as_ref(), repo_kind)?;
     let local_secrets = classify_layer_secrets(local_file, local_raw.as_ref(), LayerKind::Local)?;
 
@@ -837,56 +1345,36 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         return Err(ConfigError::UnboundSecretLabels {
             repo_file: repo_file
                 .map(Path::to_path_buf)
-                .unwrap_or_else(|| ctx.root.join(config::config_filename())),
+                .unwrap_or_else(|| dir.join(config::config_filename())),
             labels: unbound,
         });
     }
 
     // ── Resolve the three pools of concrete secret sources ──────────────
 
-    let global_pool = resolve_pool(
-        global_file.unwrap_or(&ctx.root),
-        &global_secrets,
-        &global_secrets,
-    )?;
+    let links = LinkTargets {
+        global: &base.global_secrets,
+        parent: base.has_parent.then_some(&base.secrets),
+    };
+    let base_pool = resolve_pool(base_file.unwrap_or(dir), &base.secrets, &links)?;
 
     // repo_secrets, with any local override applied in place.
-    let mut repo_effective: HashMap<String, ClassifiedSecret> = HashMap::new();
-    for (label, classified) in &repo_secrets {
-        if let Some(local_classified) = local_secrets.get(label) {
-            match local_classified {
-                ClassifiedSecret::Bound {
-                    description,
-                    source,
-                } => {
-                    repo_effective.insert(
-                        label.clone(),
-                        ClassifiedSecret::Bound {
-                            description: description.clone().or_else(|| classified.description()),
-                            source: source.clone(),
-                        },
-                    );
-                }
-                ClassifiedSecret::GlobalLink { description } => {
-                    repo_effective.insert(
-                        label.clone(),
-                        ClassifiedSecret::GlobalLink {
-                            description: description.clone().or_else(|| classified.description()),
-                        },
-                    );
-                }
-                ClassifiedSecret::Unbound { .. } => unreachable!(
-                    "classify_layer_secrets never produces Unbound for the local layer"
-                ),
-            }
-        } else {
-            repo_effective.insert(label.clone(), classified.clone());
-        }
-    }
+    let repo_effective: HashMap<String, ClassifiedSecret> = repo_secrets
+        .iter()
+        .map(|(label, classified)| {
+            let effective = match local_secrets.get(label) {
+                Some(local_classified) => local_classified
+                    .clone()
+                    .with_description_or(classified.description()),
+                None => classified.clone(),
+            };
+            (label.clone(), effective)
+        })
+        .collect();
     let repo_pool = resolve_pool(
-        local_file.or(repo_file).unwrap_or(&ctx.root),
+        local_file.or(repo_file).unwrap_or(dir),
         &repo_effective,
-        &global_secrets,
+        &links,
     )?;
 
     let local_only: HashMap<String, ClassifiedSecret> = local_secrets
@@ -894,22 +1382,18 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         .filter(|(label, _)| !repo_secrets.contains_key(*label))
         .map(|(label, c)| (label.clone(), c.clone()))
         .collect();
-    let local_only_pool = resolve_pool(
-        local_file.unwrap_or(&ctx.root),
-        &local_only,
-        &global_secrets,
-    )?;
+    let local_only_pool = resolve_pool(local_file.unwrap_or(dir), &local_only, &links)?;
 
-    let combined_for_local: HashMap<String, SecretSource> = global_pool
+    let combined_for_local: HashMap<String, SecretSource> = base_pool
         .iter()
         .chain(repo_pool.iter())
         .chain(local_only_pool.iter())
         .map(|(k, v)| (k.clone(), v.clone()))
         .collect();
     let pools = LayerPools {
-        global_file,
+        base_file,
         repo_file,
-        global: &global_pool,
+        base: &base_pool,
         repo: &repo_pool,
         local: &combined_for_local,
     };
@@ -917,8 +1401,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     // ── Tool merge ───────────────────────────────────────────────────────
 
     let empty_tools: HashMap<String, RawToolConfig> = HashMap::new();
-    let global_tools = global_raw
-        .as_ref()
+    let base_tools = base_raw
         .and_then(|c| c.tools.as_ref())
         .unwrap_or(&empty_tools);
     let repo_tools = repo_raw
@@ -930,7 +1413,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         .and_then(|c| c.tools.as_ref())
         .unwrap_or(&empty_tools);
 
-    let mut tool_names: Vec<&String> = global_tools
+    let mut tool_names: Vec<&String> = base_tools
         .keys()
         .chain(repo_tools.keys())
         .chain(local_tools.keys())
@@ -942,7 +1425,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     let mut final_tools: HashMap<String, RawToolConfig> = HashMap::new();
     let mut tool_provenance: HashMap<String, ToolProvenance> = HashMap::new();
     let mut tool_state_dirs: Vec<PathBuf> = Vec::new();
-    let mut referenced_global_labels: std::collections::HashSet<String> =
+    let mut referenced_base_labels: std::collections::HashSet<String> =
         std::collections::HashSet::new();
     let mut undeclared_refs: Vec<(String, String, String)> = Vec::new();
 
@@ -953,7 +1436,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
         let in_repo = repo_tools.contains_key(name);
         let in_local = local_tools.contains_key(name);
-        let in_global = global_tools.contains_key(name);
+        let in_base = base_tools.contains_key(name);
 
         let (winning, owning_layer): (&RawToolConfig, LayerKind) = if in_local {
             let local_tool = &local_tools[name];
@@ -977,10 +1460,10 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         } else if in_repo {
             (&repo_tools[name], repo_kind)
         } else {
-            (&global_tools[name], LayerKind::Global)
+            (&base_tools[name], LayerKind::Global)
         };
 
-        let replaced = if in_global && owning_layer != LayerKind::Global {
+        let replaced = if in_base && owning_layer != LayerKind::Global {
             Some(LayerKind::Global)
         } else {
             None
@@ -1003,10 +1486,11 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             ctx,
             &project_id,
             pool,
-            &global_pool,
+            &base_pool,
             winning.proxy,
+            render,
             &mut tool_state_dirs,
-            &mut referenced_global_labels,
+            &mut referenced_base_labels,
             &mut undeclared_refs,
         )?;
 
@@ -1021,7 +1505,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             &visible_secrets,
         )?;
 
-        let mut extra_write = resolve_path_list(&winning.extra_write, ctx);
+        let mut extra_write = resolve_path_list(&winning.extra_write, dir, &ctx.home);
         // {tool_state} dirs used by this tool's env were pushed onto
         // tool_state_dirs by resolve_env_table already; also grant them to
         // this tool specifically.
@@ -1038,7 +1522,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             name.clone(),
             RawToolConfig {
                 env: Some(env),
-                extra_read: resolve_path_list(&winning.extra_read, ctx),
+                extra_read: resolve_path_list(&winning.extra_read, dir, &ctx.home),
                 extra_write,
                 timeout: winning.timeout,
                 access: winning.access.clone(),
@@ -1095,8 +1579,16 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                     env_history.entry(k.clone()).or_default().push(*kind);
                 }
                 if let Some(fs) = &a.filesystem {
-                    union_with_layer(&mut fs_read, *kind, resolve_path_list(&fs.read, ctx));
-                    union_with_layer(&mut fs_write, *kind, resolve_path_list(&fs.write, ctx));
+                    union_with_layer(
+                        &mut fs_read,
+                        *kind,
+                        resolve_path_list(&fs.read, dir, &ctx.home),
+                    );
+                    union_with_layer(
+                        &mut fs_write,
+                        *kind,
+                        resolve_path_list(&fs.write, dir, &ctx.home),
+                    );
                 }
                 // Any layer; union across layers (same rule as
                 // passthrough_env) — see "Merge rules" in the v2 design.
@@ -1132,10 +1624,11 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                     ctx,
                     &project_id,
                     pool,
-                    &global_pool,
+                    &base_pool,
                     false,
+                    render,
                     &mut tool_state_dirs,
-                    &mut referenced_global_labels,
+                    &mut referenced_base_labels,
                     &mut undeclared_refs,
                 )?;
                 final_env.extend(resolved);
@@ -1169,8 +1662,13 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     }
 
     // ── Final secrets table: every repo/local label, plus referenced
-    //    global ones ───────────────────────────────────────────────────
+    //    base ones ─────────────────────────────────────────────────────
 
+    let link_provenance = |label: &str| match local_secrets.get(label) {
+        Some(ClassifiedSecret::GlobalLink { .. }) => Some(SecretProvenance::GlobalLink),
+        Some(ClassifiedSecret::ParentLink { .. }) => Some(SecretProvenance::ParentLink),
+        _ => None,
+    };
     let mut secret_provenance: HashMap<String, SecretProvenance> = HashMap::new();
     let mut final_secrets: HashMap<String, RawSecretSpec> = HashMap::new();
 
@@ -1180,28 +1678,25 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             .and_then(|c| c.description())
             .or_else(|| repo_secrets.get(label).and_then(|c| c.description()));
         final_secrets.insert(label.clone(), source_to_raw(source, description));
-        let provenance = match local_secrets.get(label) {
+        let provenance = link_provenance(label).unwrap_or(match local_secrets.get(label) {
             Some(ClassifiedSecret::Bound { .. }) => SecretProvenance::LocalOverride,
-            Some(ClassifiedSecret::GlobalLink { .. }) => SecretProvenance::GlobalLink,
             _ => SecretProvenance::Direct(repo_kind),
-        };
+        });
         secret_provenance.insert(label.clone(), provenance);
     }
     for (label, source) in &local_only_pool {
         let description = local_only.get(label).and_then(|c| c.description());
         final_secrets.insert(label.clone(), source_to_raw(source, description));
-        let provenance = match local_secrets.get(label) {
-            Some(ClassifiedSecret::GlobalLink { .. }) => SecretProvenance::GlobalLink,
-            _ => SecretProvenance::Direct(LayerKind::Local),
-        };
+        let provenance =
+            link_provenance(label).unwrap_or(SecretProvenance::Direct(LayerKind::Local));
         secret_provenance.insert(label.clone(), provenance);
     }
-    for label in &referenced_global_labels {
+    for label in &referenced_base_labels {
         if final_secrets.contains_key(label) {
             continue;
         }
-        if let Some(source) = global_pool.get(label) {
-            let description = global_secrets.get(label).and_then(|c| c.description());
+        if let Some(source) = base_pool.get(label) {
+            let description = base.secrets.get(label).and_then(|c| c.description());
             final_secrets.insert(label.clone(), source_to_raw(source, description));
             secret_provenance.insert(label.clone(), SecretProvenance::Direct(LayerKind::Global));
         }
@@ -1216,8 +1711,16 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
     let mut fs_write_prov: Vec<(String, LayerKind)> = Vec::new();
     for (kind, raw) in ordered {
         if let Some(fs) = raw.and_then(|r| r.filesystem.as_ref()) {
-            union_with_layer(&mut fs_read_prov, kind, resolve_path_list(&fs.read, ctx));
-            union_with_layer(&mut fs_write_prov, kind, resolve_path_list(&fs.write, ctx));
+            union_with_layer(
+                &mut fs_read_prov,
+                kind,
+                resolve_path_list(&fs.read, dir, &ctx.home),
+            );
+            union_with_layer(
+                &mut fs_write_prov,
+                kind,
+                resolve_path_list(&fs.write, dir, &ctx.home),
+            );
         }
     }
     let fs_read = items_of(&fs_read_prov);
@@ -1246,13 +1749,43 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         },
         agent,
         allow_home_root: None,
-        // Launcher-only (crate::kits); never sent to the daemon.
+        // Launcher-only (crate::kits and discovery); never sent to the
+        // daemon.
         kits: None,
+        cascade: None,
+        inherit: None,
     };
 
-    Ok(MergedConfig {
+    // What the next directory down may link to or use: every label a local
+    // item here could.
+    let pool = combined_for_local
+        .into_iter()
+        .map(|(label, source)| {
+            let description = local_secrets
+                .get(&label)
+                .and_then(ClassifiedSecret::description)
+                .or_else(|| {
+                    repo_secrets
+                        .get(&label)
+                        .and_then(ClassifiedSecret::description)
+                })
+                .or_else(|| {
+                    base.secrets
+                        .get(&label)
+                        .and_then(ClassifiedSecret::description)
+                });
+            (
+                label,
+                ClassifiedSecret::Bound {
+                    description,
+                    source,
+                },
+            )
+        })
+        .collect();
+
+    Ok(Level {
         raw,
-        root: ctx.root.clone(),
         tool_state_dirs,
         provenance: Provenance {
             tools: tool_provenance,
@@ -1269,6 +1802,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             kits: kit_provenance,
         },
         kits,
+        pool,
     })
 }
 
@@ -2033,5 +2567,362 @@ LOG_LEVEL = "debug"
         let toml_text = toml::to_string(&wire).unwrap();
         let reparsed: RawConfig = toml::from_str(&toml_text).unwrap();
         assert!(reparsed.tools.unwrap().contains_key("t"));
+    }
+
+    // ── Parent configs ────────────────────────────────────────────────
+
+    /// `<tmp>/ws` (the parent, with `parent_toml` as its `airlock.toml`)
+    /// and `<tmp>/ws/proj` (the project, with `proj_toml`), `<tmp>` standing
+    /// in for home. Returns the temp dir and the canonical project root.
+    fn workspace(parent_toml: &str, proj_toml: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let proj = ws.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write(&ws, "airlock.toml", parent_toml);
+        write(&proj, "airlock.toml", proj_toml);
+        let root = std::fs::canonicalize(&proj).unwrap();
+        (tmp, root)
+    }
+
+    fn load_and_merge(cwd: &Path, home: &Path) -> Result<MergedConfig, ConfigError> {
+        let layers = load_default(cwd, home)?;
+        merge(&layers, &ctx(&layers.root.clone(), home))
+    }
+
+    #[test]
+    fn discover_cascading_parent_is_loaded_and_root_stays_the_project() {
+        let (tmp, root) = workspace("cascade = true\n", "");
+        let layers = load_default(&root, tmp.path()).unwrap();
+        assert_eq!(layers.root, root);
+        assert_eq!(layers.parents.len(), 1);
+        assert_eq!(layers.parents[0].dir, root.parent().unwrap());
+        let files = layers.approvable_files();
+        let kinds: Vec<_> = files
+            .iter()
+            .map(|a| (a.kind, a.dir.to_path_buf()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (LayerKind::Parent, root.parent().unwrap().to_path_buf()),
+                (LayerKind::Repo, root.clone()),
+            ]
+        );
+    }
+
+    #[test]
+    fn discover_parent_without_cascade_is_ignored() {
+        let (tmp, root) = workspace("[tools.kubectl]\n", "");
+        let layers = load_default(&root, tmp.path()).unwrap();
+        assert!(layers.parents.is_empty());
+    }
+
+    #[test]
+    fn discover_inherit_false_in_the_project_ignores_parents() {
+        let (tmp, root) = workspace("cascade = true\n", "inherit = false\n");
+        let layers = load_default(&root, tmp.path()).unwrap();
+        assert!(layers.parents.is_empty());
+    }
+
+    #[test]
+    fn discover_local_inherit_overrides_repo() {
+        let (tmp, root) = workspace("cascade = true\n", "inherit = false\n");
+        write(&root, "airlock.local.toml", "inherit = true\n");
+        let layers = load_default(&root, tmp.path()).unwrap();
+        assert_eq!(layers.parents.len(), 1);
+    }
+
+    #[test]
+    fn discover_skips_a_non_cascading_dir_and_stops_at_inherit_false() {
+        // <tmp>/a (cascades) > <tmp>/a/b (cascades, inherit = false) >
+        // <tmp>/a/b/c (no cascade) > <tmp>/a/b/c/proj.
+        let tmp = tempdir().unwrap();
+        let a = tmp.path().join("a");
+        let b = a.join("b");
+        let c = b.join("c");
+        let proj = c.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write(&a, "airlock.toml", "cascade = true\n");
+        write(
+            &b,
+            "airlock.local.toml",
+            "cascade = true\ninherit = false\n",
+        );
+        write(&c, "airlock.toml", "");
+        write(&proj, "airlock.toml", "");
+        let layers = load_default(&proj, tmp.path()).unwrap();
+        let dirs: Vec<_> = layers.parents.iter().map(|p| p.dir.clone()).collect();
+        assert_eq!(dirs, vec![std::fs::canonicalize(&b).unwrap()]);
+    }
+
+    #[test]
+    fn discover_home_is_never_a_parent() {
+        let tmp = tempdir().unwrap();
+        let proj = tmp.path().join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write(tmp.path(), "airlock.toml", "cascade = true\n");
+        write(&proj, "airlock.toml", "");
+        let layers = load_default(&proj, tmp.path()).unwrap();
+        assert!(layers.parents.is_empty());
+    }
+
+    #[test]
+    fn discover_config_file_mode_has_no_parents() {
+        let (_tmp, root) = workspace("cascade = true\n", "");
+        let layers = load_layers(
+            &DiscoveryMode::ConfigFile(root.join("airlock.toml")),
+            &root,
+            root.parent().unwrap().parent().unwrap(),
+            Path::new("/nonexistent-airlock-global.toml"),
+        )
+        .unwrap();
+        assert!(layers.parents.is_empty());
+    }
+
+    #[test]
+    fn merge_parent_tool_is_inherited_with_parent_provenance() {
+        let (tmp, root) = workspace(
+            "cascade = true\n[secrets.KUBE]\nsource = \"env\"\n[tools.kubectl.env]\nKUBECONFIG = { secret = \"KUBE\" }\n",
+            "",
+        );
+        let merged = load_and_merge(&root, tmp.path()).unwrap();
+        let wire = merged.to_wire();
+        assert!(wire.tools.as_ref().unwrap().contains_key("kubectl"));
+        assert!(wire.secrets.as_ref().unwrap().contains_key("KUBE"));
+        let prov = merged.provenance();
+        assert_eq!(prov.tools["kubectl"].layer, LayerKind::Parent);
+        assert_eq!(
+            prov.secrets["KUBE"],
+            SecretProvenance::Direct(LayerKind::Parent)
+        );
+        assert!(wire.cascade.is_none() && wire.inherit.is_none());
+    }
+
+    #[test]
+    fn merge_project_tool_replaces_parent_tool() {
+        let (tmp, root) = workspace("cascade = true\n[tools.gh]\n", "[tools.gh]\n");
+        let merged = load_and_merge(&root, tmp.path()).unwrap();
+        assert_eq!(
+            merged.provenance().tools["gh"],
+            ToolProvenance {
+                layer: LayerKind::Repo,
+                replaced: Some(LayerKind::Parent),
+            }
+        );
+    }
+
+    #[test]
+    fn merge_project_repo_item_cannot_use_a_parent_label() {
+        let (tmp, root) = workspace(
+            "cascade = true\n[secrets.GCP]\nsource = \"env\"\n",
+            "[tools.gcloud.env]\nTOKEN = { secret = \"GCP\" }\n",
+        );
+        let err = load_and_merge(&root, tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::RepoItemUsesNonRepoLabel { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_local_from_parent_binds_a_repo_label() {
+        let (tmp, root) = workspace(
+            "cascade = true\n[secrets.GCP]\nsource = \"command\"\ncommand = [\"gcp-token\"]\n",
+            "[secrets.GCP]\n[tools.gcloud.env]\nTOKEN = { secret = \"GCP\" }\n",
+        );
+        write(
+            &root,
+            "airlock.local.toml",
+            "[secrets.GCP]\nfrom = \"parent\"\n",
+        );
+        let merged = load_and_merge(&root, tmp.path()).unwrap();
+        let spec = &merged.to_wire().secrets.unwrap()["GCP"];
+        assert_eq!(
+            spec.command.as_deref(),
+            Some(&["gcp-token".to_string()][..])
+        );
+        assert_eq!(
+            merged.provenance().secrets["GCP"],
+            SecretProvenance::ParentLink
+        );
+    }
+
+    #[test]
+    fn merge_from_parent_without_a_parent_errors() {
+        let tmp = tempdir().unwrap();
+        write(tmp.path(), "airlock.toml", "[secrets.GCP]\n");
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[secrets.GCP]\nfrom = \"parent\"\n",
+        );
+        let err = merge_default(tmp.path()).unwrap_err();
+        assert!(
+            matches!(&err, ConfigError::UnboundLink { from, .. } if from == "parent"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_from_global_skips_the_parent_binding() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(
+            &global,
+            "[secrets.GH]\nsource = \"env\"\nfrom = \"GLOBAL_GH\"\n",
+        )
+        .unwrap();
+        let ws = tmp.path().join("ws");
+        let proj = ws.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        write(
+            &ws,
+            "airlock.toml",
+            "cascade = true\n[secrets.GH]\nsource = \"env\"\nfrom = \"WORK_GH\"\n",
+        );
+        write(
+            &proj,
+            "airlock.toml",
+            "[secrets.GH]\n[tools.gh.env]\nGH_TOKEN = { secret = \"GH\" }\n",
+        );
+        write(
+            &proj,
+            "airlock.local.toml",
+            "[secrets.GH]\nfrom = \"global\"\n",
+        );
+        let layers = load_layers(&DiscoveryMode::Default, &proj, tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let spec = &merged.to_wire().secrets.unwrap()["GH"];
+        assert_eq!(spec.from.as_deref(), Some("GLOBAL_GH"));
+    }
+
+    #[test]
+    fn merge_global_parent_and_project_keep_their_own_provenance() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(
+            &global,
+            "[secrets.GH]\nsource = \"env\"\n[tools.gh.env]\nGH_TOKEN = { secret = \"GH\" }\n[agent]\npassthrough_env = [\"TERM\"]\n",
+        )
+        .unwrap();
+        let ws = tmp.path().join("ws");
+        let proj = ws.join("proj");
+        std::fs::create_dir_all(&proj).unwrap();
+        // The parent's own tool uses a global label: a parent's local file
+        // may, like any local file.
+        write(
+            &ws,
+            "airlock.toml",
+            "cascade = true\n[agent]\npassthrough_env = [\"LANG\"]\n",
+        );
+        write(
+            &ws,
+            "airlock.local.toml",
+            "[tools.argocd.env]\nT = { secret = \"GH\" }\n",
+        );
+        write(&proj, "airlock.toml", "[tools.make]\n");
+        let layers = load_layers(&DiscoveryMode::Default, &proj, tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let prov = merged.provenance();
+        assert_eq!(prov.tools["gh"].layer, LayerKind::Global);
+        assert_eq!(prov.tools["argocd"].layer, LayerKind::Parent);
+        assert_eq!(prov.tools["make"].layer, LayerKind::Repo);
+        assert_eq!(
+            prov.secrets["GH"],
+            SecretProvenance::Direct(LayerKind::Global)
+        );
+        assert_eq!(
+            prov.settings.agent_passthrough_env,
+            vec![
+                ("TERM".to_string(), LayerKind::Global),
+                ("LANG".to_string(), LayerKind::Parent),
+            ]
+        );
+    }
+
+    #[test]
+    fn merge_parent_relative_paths_resolve_against_the_parent_dir() {
+        let (tmp, root) = workspace(
+            "cascade = true\n[filesystem]\nread = [\"shared\"]\n[tools.t]\nextra_read = [\"bin\"]\n",
+            "[filesystem]\nread = [\"own\"]\n",
+        );
+        let ws = root.parent().unwrap();
+        let wire = load_and_merge(&root, tmp.path()).unwrap().to_wire();
+        let fs = wire.filesystem.unwrap();
+        assert!(
+            fs.read.contains(&ws.join("shared").display().to_string()),
+            "{fs:?}"
+        );
+        assert!(
+            fs.read.contains(&root.join("own").display().to_string()),
+            "{fs:?}"
+        );
+        let tool = &wire.tools.unwrap()["t"];
+        assert_eq!(tool.extra_read, vec![ws.join("bin").display().to_string()]);
+    }
+
+    #[test]
+    fn merge_parent_placeholders_render_against_the_project_root() {
+        let (tmp, root) = workspace(
+            "cascade = true\n[tools.t.env]\nA = \"{sandbox_root}/x\"\nB = \"{tool_state}\"\nC = \"\\\\{literal\\\\}\"\n",
+            "",
+        );
+        let layers = load_default(&root, tmp.path()).unwrap();
+        let c = ctx(&layers.root.clone(), tmp.path());
+        let merged = merge(&layers, &c).unwrap();
+        let state = c.tool_state_base.join(project_id(&root)).join("t");
+        assert_eq!(merged.tool_state_dirs(), std::slice::from_ref(&state));
+        let wire = merged.to_wire();
+        let tool = &wire.tools.unwrap()["t"];
+        let env = tool.env.as_ref().unwrap();
+        let text = |k: &str| match &env[k] {
+            RawEnvValue::Static(s) => s.clone(),
+            other => panic!("expected Static, got {other:?}"),
+        };
+        assert_eq!(text("A"), format!("{}/x", root.display()));
+        assert_eq!(text("B"), state.display().to_string());
+        assert_eq!(text("C"), "{literal}");
+        assert!(tool.extra_write.contains(&state.display().to_string()));
+    }
+
+    #[test]
+    fn merge_parent_local_kit_paths_resolve_against_the_parent_dir() {
+        let (tmp, root) = workspace("cascade = true\n", "");
+        let ws = root.parent().unwrap();
+        write(ws, "airlock.local.toml", "[kits.tools]\nread = [\"opt\"]\n");
+        let merged = load_and_merge(&root, tmp.path()).unwrap();
+        assert_eq!(
+            merged.kits()["tools"].read,
+            vec![ws.join("opt").display().to_string()]
+        );
+        assert_eq!(merged.provenance().kits["tools"], LayerKind::Parent);
+    }
+
+    #[test]
+    fn merge_parent_repo_file_keeps_the_repo_rules() {
+        let (tmp, root) = workspace("cascade = true\nallow_home_root = true\n", "");
+        let err = load_and_merge(&root, tmp.path()).unwrap_err();
+        assert!(
+            matches!(err, ConfigError::AllowHomeRootInRepo { .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn merge_cascade_in_global_errors() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "cascade = true\n").unwrap();
+        write(tmp.path(), "airlock.toml", "");
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                ConfigError::InheritanceKeyInGlobal { key: "cascade", .. }
+            ),
+            "{err}"
+        );
     }
 }

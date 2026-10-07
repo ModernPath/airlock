@@ -47,7 +47,7 @@ use zeroize::Zeroizing;
 /// value interoperate; the launcher's "incompatible daemon" error compares
 /// this, not the binary version (docs/airlock-v2-technical-guidance.md,
 /// "One protocol version, separate from the binary version").
-pub const PROTOCOL_VERSION: u32 = 3;
+pub const PROTOCOL_VERSION: u32 = 4;
 
 /// NDJSON line cap for the session family, which comes from a sandboxed,
 /// untrusted client.
@@ -580,6 +580,9 @@ pub enum LayerKind {
     Local,
     /// An explicit `--config <path>` file.
     ConfigFile,
+    /// `airlock.toml` or `airlock.local.toml` in a directory above the
+    /// project root that sets `cascade = true`.
+    Parent,
 }
 
 /// One config file contributing to a session, identified by content hash so
@@ -1045,7 +1048,7 @@ mod tests {
 
     #[test]
     fn constants_match_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 3);
+        assert_eq!(PROTOCOL_VERSION, 4);
         assert_eq!(MAX_SESSION_LINE_BYTES, 1024 * 1024);
         assert_eq!(MAX_ADMIN_LINE_BYTES, 16 * 1024 * 1024);
     }
@@ -1559,6 +1562,7 @@ mod tests {
             LayerKind::Repo,
             LayerKind::Local,
             LayerKind::ConfigFile,
+            LayerKind::Parent,
         ] {
             round_trip(&kind);
         }

@@ -473,12 +473,12 @@ pub enum ConfigError {
         kit: String,
     },
 
-    /// `[secrets.<label>] from = "<value>"` where `<value>` is not
-    /// `"global"` — the only link a layer file may express without its own
-    /// `source`.
+    /// `[secrets.<label>] from = "<value>"` where `<value>` is neither
+    /// `"global"` nor `"parent"` — the only links a layer file may express
+    /// without its own `source`.
     #[error(
-        "{file}: [secrets.{label}] from = {value:?} is invalid; the only value a label without \
-         its own source can take is \"global\""
+        "{file}: [secrets.{label}] from = {value:?} is invalid; a label without its own source \
+         can only take \"global\" or \"parent\""
     )]
     InvalidFromValue {
         /// The file that set it.
@@ -489,20 +489,48 @@ pub enum ConfigError {
         value: String,
     },
 
-    /// `[secrets.<label>] from = "global"` appeared outside the local layer.
-    #[error("{file}: [secrets.{label}] from = \"global\" is only allowed in airlock.local.toml")]
-    FromGlobalOutsideLocal {
+    /// `[secrets.<label>] from = "global"` or `"parent"` appeared outside
+    /// the local layer.
+    #[error("{file}: [secrets.{label}] from = {from:?} is only allowed in airlock.local.toml")]
+    FromOutsideLocal {
         /// The file that set it.
         file: PathBuf,
         /// The secret label.
         label: String,
+        /// `"global"` or `"parent"`.
+        from: String,
     },
 
-    /// A local `[secrets.<label>]` has neither its own `source` nor
-    /// `from = "global"`, so it binds nothing.
+    /// A local `from = "global"` or `from = "parent"` link names a label
+    /// that layer does not bind.
+    #[error("{file}: [secrets.{label}] from = {from:?}, but {}", match from.as_str() {
+        "parent" => "no parent config with cascade = true binds it",
+        _ => "the global config does not bind it",
+    })]
+    UnboundLink {
+        /// The local file that set it.
+        file: PathBuf,
+        /// The secret label.
+        label: String,
+        /// `"global"` or `"parent"`.
+        from: String,
+    },
+
+    /// `cascade` or `inherit` in the global file, which already applies to
+    /// every project.
+    #[error("{file}: {key} has no meaning in the global config, which applies to every project")]
+    InheritanceKeyInGlobal {
+        /// The global config file.
+        file: PathBuf,
+        /// `"cascade"` or `"inherit"`.
+        key: &'static str,
+    },
+
+    /// A local `[secrets.<label>]` has neither its own `source` nor a
+    /// `from` link, so it binds nothing.
     #[error(
-        "{file}: [secrets.{label}] needs a source or from = \"global\"; a local secret must bind \
-         to something"
+        "{file}: [secrets.{label}] needs a source, from = \"global\" or from = \"parent\"; a local \
+         secret must bind to something"
     )]
     LocalSecretUnbound {
         /// The local config file.
@@ -658,6 +686,18 @@ pub struct RawConfig {
     /// [`ConfigError::KitsInRepo`]).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub kits: Option<HashMap<String, RawKitConfig>>,
+
+    /// `true` applies this directory's config to projects in its
+    /// subdirectories too, as a parent config. Read only where the file is
+    /// a parent of the project root; a config error in the global file. A
+    /// launcher-only concept, never on the wire.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cascade: Option<bool>,
+
+    /// `false` ignores every parent config, even one with `cascade = true`.
+    /// A config error in the global file. Launcher-only, like `cascade`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inherit: Option<bool>,
 }
 
 /// Raw deserialized `[kits.<name>]` entry.
@@ -760,8 +800,8 @@ pub struct RawSecretSpec {
     pub source: Option<String>,
     /// Two unrelated meanings depending on `source`: with
     /// `source = "env"`, the env var name to read (defaults to the label).
-    /// With no `source` at all, the only legal value is `"global"` — a
-    /// local-layer link to the global binding of the same label.
+    /// With no `source` at all, `"global"` or `"parent"` — a local-layer
+    /// link to the global or parent binding of the same label.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub from: Option<String>,
     /// Argv list for `source = "command"`. The first element is the
@@ -1989,11 +2029,17 @@ pub fn local_config_template_standalone() -> &'static str {
 /// Build the `airlock.local.toml` stub `airlock init --local` writes in a
 /// repo whose `airlock.toml` leaves one or more secret labels unbound.
 ///
-/// `global_bound` are labels the global layer binds — each gets
-/// `from = "global"`. The rest of `repo_labels` get a commented `command` /
-/// `env` example under their description. Both lists carry `(label,
-/// description)` pairs in the order they should appear.
-pub fn local_stub(repo_labels: &[(String, Option<String>)], global_bound: &[String]) -> String {
+/// `parent_bound` are labels a parent config binds — each gets
+/// `from = "parent"`. `global_bound` are labels the global layer binds —
+/// each of the rest gets `from = "global"`. The remaining `repo_labels` get
+/// a commented `command` / `env` example under their description.
+/// `repo_labels` carries `(label, description)` pairs in the order they
+/// should appear.
+pub fn local_stub(
+    repo_labels: &[(String, Option<String>)],
+    parent_bound: &[String],
+    global_bound: &[String],
+) -> String {
     let mut out = String::from(
         "# Your bindings for this project. Keep it out of git.\n\
          # Run `airlock config` to see the merged result.\n",
@@ -2003,7 +2049,9 @@ pub fn local_stub(repo_labels: &[(String, Option<String>)], global_bound: &[Stri
         if let Some(d) = description {
             out.push_str(&format!("# {d}\n"));
         }
-        if global_bound.iter().any(|g| g == label) {
+        if parent_bound.contains(label) {
+            out.push_str(&format!("[secrets.{label}]\nfrom = \"parent\"\n"));
+        } else if global_bound.contains(label) {
             out.push_str(&format!("[secrets.{label}]\nfrom = \"global\"\n"));
         } else {
             out.push_str(&format!(

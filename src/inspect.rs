@@ -76,6 +76,7 @@ pub(crate) fn layer_label(kind: LayerKind) -> &'static str {
         LayerKind::Repo => "repo",
         LayerKind::Local => "local",
         LayerKind::ConfigFile => "config",
+        LayerKind::Parent => "parent",
     }
 }
 
@@ -142,7 +143,7 @@ fn is_layer_approved(kind: LayerKind, approvals: &HashMap<LayerKind, ApprovalSta
     approvals.get(&kind).is_none_or(|s| s.is_approved())
 }
 
-/// Reads the approval state of the repo/local/config-file layers that were
+/// Reads the approval state of the parent/repo/local/config-file layers that were
 /// actually loaded (the global layer is never checked: it is always
 /// [`ApprovalState::UserFile`], or [`ApprovalState::NotReadable`] when
 /// `in_sandbox` is set and no global file could be read).
@@ -167,16 +168,17 @@ fn build_layer_rows(
         }),
         None => {}
     }
-    for file in [&loaded.repo, &loaded.local].into_iter().flatten() {
+    for a in loaded.approvable_files() {
+        let file = a.file;
         let name = file.path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-        let approval = trust_store.state(&loaded.root, name, &file.bytes)?;
+        let approval = trust_store.state(a.dir, name, &file.bytes)?;
         let state = match approval {
             Approval::Approved => ApprovalState::Trusted,
             Approval::Changed { .. } => ApprovalState::ChangedSinceTrusted,
             Approval::New => ApprovalState::NotTrustedYet,
         };
         rows.push(LayerRow {
-            kind: file.kind,
+            kind: a.kind,
             path_display: display_path(&file.path, home),
             state,
         });
@@ -219,7 +221,8 @@ pub struct ToolRow {
     /// default some layer set), or `"none (repo)"` (the tool's own
     /// override).
     pub access_text: String,
-    pub replaces_global: bool,
+    /// The lower layer whose tool of the same name this one replaces.
+    pub replaces: Option<LayerKind>,
     pub unapproved: bool,
 }
 
@@ -330,12 +333,15 @@ pub fn render_config(report: &ConfigReport) -> String {
                     .map(|(var, label)| format!("{} = <secret \"{}\">", esc(var), esc(label)))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let marker = match (t.replaces_global, t.unapproved) {
-                    (true, true) => "(replaces global) (unapproved)".to_string(),
-                    (true, false) => "(replaces global)".to_string(),
-                    (false, true) => "(unapproved)".to_string(),
-                    (false, false) => String::new(),
-                };
+                let replaces = t
+                    .replaces
+                    .map(|kind| format!("(replaces {})", layer_label(kind)));
+                let unapproved = t.unapproved.then(|| "(unapproved)".to_string());
+                let marker = replaces
+                    .into_iter()
+                    .chain(unapproved)
+                    .collect::<Vec<_>>()
+                    .join(" ");
                 vec![
                     format!("  {}", esc(&t.name)),
                     t.layer_text.clone(),
@@ -484,6 +490,8 @@ fn render_settings_rows(settings: &[SettingRow]) -> String {
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct PathsReport {
     pub global_config: String,
+    /// Each parent config file, outermost first.
+    pub parents: Vec<String>,
     pub repo: Option<String>,
     pub local: Option<String>,
     pub trust_store: String,
@@ -497,6 +505,9 @@ pub fn render_paths(report: &PathsReport) -> String {
         "global config".to_string(),
         esc(&report.global_config),
     ]];
+    for parent in &report.parents {
+        rows.push(vec!["parent config".to_string(), esc(parent)]);
+    }
     if let Some(repo) = &report.repo {
         rows.push(vec!["repo config".to_string(), esc(repo)]);
     }
@@ -546,6 +557,9 @@ fn secret_layer_text(provenance: Option<SecretProvenance>) -> (String, Option<La
         Some(SecretProvenance::GlobalLink) => {
             ("local → global".to_string(), Some(LayerKind::Local))
         }
+        Some(SecretProvenance::ParentLink) => {
+            ("local → parent".to_string(), Some(LayerKind::Local))
+        }
         None => (String::new(), None),
     }
 }
@@ -572,8 +586,15 @@ fn agent_env_value_display(value: &RawEnvValue) -> String {
 /// tools and settings, each annotated with the layer it came from and
 /// whether that layer is still unapproved.
 fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> ConfigReport {
-    let approvals: HashMap<LayerKind, ApprovalState> =
-        layer_rows.iter().map(|r| (r.kind, r.state)).collect();
+    // Several parent files share one kind: any unapproved one marks the
+    // items attributed to `parent`.
+    let mut approvals: HashMap<LayerKind, ApprovalState> = HashMap::new();
+    for row in layer_rows {
+        let state = approvals.entry(row.kind).or_insert(row.state);
+        if state.is_approved() {
+            *state = row.state;
+        }
+    }
     let wire = merged.to_wire();
     let prov = merged.provenance();
 
@@ -602,7 +623,7 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
             let tool = &raw_tools[name];
             let provenance = prov.tools.get(name).copied();
             let layer = provenance.map_or(LayerKind::Global, |p| p.layer);
-            let replaces_global = provenance.is_some_and(|p| p.replaced.is_some());
+            let replaces = provenance.and_then(|p| p.replaced);
             let unapproved = !is_layer_approved(layer, &approvals);
             let mut secret_env = Vec::new();
             if let Some(env) = &tool.env {
@@ -628,7 +649,7 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
                 description: tool.description.clone().unwrap_or_default(),
                 secret_env,
                 access_text,
-                replaces_global,
+                replaces,
                 unapproved,
             });
         }
@@ -690,7 +711,13 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
         if row.kind == LayerKind::Global {
             continue;
         }
-        let name = file_name_only(&row.path_display);
+        // The project's own files are named by file name alone; a parent's
+        // needs its directory to tell it apart.
+        let name = if row.kind == LayerKind::Parent {
+            row.path_display.clone()
+        } else {
+            file_name_only(&row.path_display)
+        };
         match row.state {
             ApprovalState::ChangedSinceTrusted => notes.push(format!(
                 "{name} changed since you trusted it; the next session start asks about it."
@@ -768,6 +795,12 @@ pub fn config_cmd(
     if opts.paths {
         let report = PathsReport {
             global_config: display_path(global_config_path, home),
+            parents: loaded
+                .approvable_files()
+                .iter()
+                .filter(|a| a.kind == LayerKind::Parent)
+                .map(|a| display_path(&a.file.path, home))
+                .collect(),
             repo: loaded.repo.as_ref().map(|f| display_path(&f.path, home)),
             local: loaded.local.as_ref().map(|f| display_path(&f.path, home)),
             trust_store: display_path(&paths.trust_store, home),
@@ -1202,17 +1235,35 @@ fn bound_global_labels(global: Option<&config::RawConfig>) -> Vec<String> {
     out
 }
 
+/// Labels the parent configs above `cwd` bind themselves, when `cwd` is a
+/// project root (it has an `airlock.toml` of the user's own).
+fn parent_bound_labels(
+    cwd: &Path,
+    home: &Path,
+    global_config: &Path,
+) -> Result<Vec<String>, config::ConfigError> {
+    let loaded = layers::load_layers(&DiscoveryMode::Default, cwd, home, global_config)?;
+    if std::fs::canonicalize(cwd).ok().as_ref() != Some(&loaded.root) {
+        return Ok(Vec::new());
+    }
+    layers::parent_bound_labels(&loaded, home)
+}
+
 /// The per-label summary `init --local` prints under `created <path>` when
 /// the repo has unbound labels, e.g. `GH_TOKEN  from = "global" (your
-/// global config binds it)`.
+/// global config binds it)`. The labels are chosen as in
+/// [`config::local_stub`].
 pub fn render_local_bindings_summary(
     repo_labels: &[(String, Option<String>)],
+    parent_bound: &[String],
     global_bound: &[String],
 ) -> String {
     let rows: Vec<Vec<String>> = repo_labels
         .iter()
         .map(|(label, _description)| {
-            let binding = if global_bound.iter().any(|g| g == label) {
+            let binding = if parent_bound.contains(label) {
+                "from = \"parent\" (a parent config binds it)".to_string()
+            } else if global_bound.contains(label) {
                 "from = \"global\" (your global config binds it)".to_string()
             } else {
                 "not bound: edit airlock.local.toml".to_string()
@@ -1338,10 +1389,18 @@ fn init_local(
             None
         };
 
+        let bound_by_parent = match parent_bound_labels(cwd, home, global_config) {
+            Ok(labels) => labels,
+            Err(e) => {
+                writeln!(out, "error: {e}").ok();
+                return ExitCode::from(125);
+            }
+        };
+
         let unbound = unbound_repo_labels(&repo_raw);
         let bound_globally = bound_global_labels(global_raw.as_ref());
-        let content = config::local_stub(&unbound, &bound_globally);
-        let summary = render_local_bindings_summary(&unbound, &bound_globally);
+        let content = config::local_stub(&unbound, &bound_by_parent, &bound_globally);
+        let summary = render_local_bindings_summary(&unbound, &bound_by_parent, &bound_globally);
         (content, summary, false)
     } else {
         (
@@ -1493,7 +1552,7 @@ mod tests {
                     description: "AWS CLI".to_string(),
                     secret_env: vec![],
                     access_text: "default".to_string(),
-                    replaces_global: false,
+                    replaces: None,
                     unapproved: false,
                 },
                 ToolRow {
@@ -1502,7 +1561,7 @@ mod tests {
                     description: "GitHub CLI".to_string(),
                     secret_env: vec![("GH_TOKEN".to_string(), "GH_TOKEN".to_string())],
                     access_text: "default".to_string(),
-                    replaces_global: false,
+                    replaces: None,
                     unapproved: false,
                 },
                 ToolRow {
@@ -1511,7 +1570,7 @@ mod tests {
                     description: "Postgres shell".to_string(),
                     secret_env: vec![],
                     access_text: "none (local)".to_string(),
-                    replaces_global: false,
+                    replaces: None,
                     unapproved: true,
                 },
             ],
@@ -1599,6 +1658,64 @@ mod tests {
         };
         let out = render_config(&report);
         assert_eq!(out, "layers\n  repo  airlock.toml  trusted\n");
+    }
+
+    // ── build_config_report: parent configs ──────────────────────────────
+
+    #[test]
+    fn build_config_report_shows_parent_layers_and_replacements() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path();
+        let ws = home.join("ws");
+        let root = ws.join("project");
+        std::fs::create_dir_all(&root).unwrap();
+        let global = home.join("global.toml");
+        std::fs::write(&global, "").unwrap();
+        std::fs::write(
+            ws.join("airlock.toml"),
+            "cascade = true\n[tools.gh]\n[tools.kubectl]\n",
+        )
+        .unwrap();
+        std::fs::write(root.join("airlock.toml"), "[tools.gh]\n").unwrap();
+
+        let loaded = layers::load_layers(&DiscoveryMode::Default, &root, home, &global).unwrap();
+        let store = TrustStore::open(&home.join("trust")).unwrap();
+        let ws_canonical = std::fs::canonicalize(&ws).unwrap();
+        store
+            .approve(
+                &ws_canonical,
+                "airlock.toml",
+                &std::fs::read(ws.join("airlock.toml")).unwrap(),
+            )
+            .unwrap();
+        let rows = build_layer_rows(&loaded, home, &store, false, &global).unwrap();
+        let kinds: Vec<_> = rows.iter().map(|r| (r.kind, r.state)).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (LayerKind::Global, ApprovalState::UserFile),
+                (LayerKind::Parent, ApprovalState::Trusted),
+                (LayerKind::Repo, ApprovalState::NotTrustedYet),
+            ]
+        );
+
+        let ctx = MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: home.to_path_buf(),
+        };
+        let merged = layers::merge(&loaded, &ctx).unwrap();
+        let report = build_config_report(&merged, &rows);
+        let gh = report.tools.iter().find(|t| t.name == "gh").unwrap();
+        assert_eq!(
+            (gh.layer_text.as_str(), gh.replaces),
+            ("repo", Some(LayerKind::Parent))
+        );
+        let kubectl = report.tools.iter().find(|t| t.name == "kubectl").unwrap();
+        assert_eq!(kubectl.layer_text, "parent");
+        assert!(!kubectl.unapproved);
+        let out = render_config(&report);
+        assert!(out.contains("(replaces parent) (unapproved)"), "{out}");
     }
 
     // ── build_config_report: access level provenance ─────────────────────
@@ -1699,7 +1816,7 @@ access = "none"
                 description: "GitHub CLI".to_string(),
                 secret_env: vec![],
                 access_text: "default".to_string(),
-                replaces_global: true,
+                replaces: Some(LayerKind::Global),
                 unapproved: false,
             }],
             ..Default::default()
@@ -1728,7 +1845,7 @@ access = "none"
                 description: "evil\u{202e}desc\x1b[31m".to_string(),
                 secret_env: vec![],
                 access_text: "default".to_string(),
-                replaces_global: false,
+                replaces: None,
                 unapproved: true,
             }],
             ..Default::default()
@@ -1746,6 +1863,7 @@ access = "none"
     fn render_paths_lists_one_per_line() {
         let report = PathsReport {
             global_config: "~/.config/airlock/airlock.toml".to_string(),
+            parents: Vec::new(),
             repo: Some("~/src/app/airlock.toml".to_string()),
             local: None,
             trust_store: "~/.local/state/airlock/trust".to_string(),
@@ -2102,6 +2220,41 @@ access = "none"
     }
 
     #[test]
+    fn init_local_links_labels_a_parent_binds_to_the_parent() {
+        let tmp = tempdir().unwrap();
+        let ws = tmp.path().join("ws");
+        let proj = ws.join("app");
+        std::fs::create_dir_all(&proj).unwrap();
+        std::fs::write(
+            ws.join("airlock.toml"),
+            "cascade = true\n[secrets.GCP_TOKEN]\nsource = \"env\"\n",
+        )
+        .unwrap();
+        std::fs::write(proj.join("airlock.toml"), "[secrets.GCP_TOKEN]\n").unwrap();
+
+        let mut out = Vec::new();
+        let code = init_cmd(
+            InitKind::Local,
+            &proj,
+            tmp.path(),
+            &tmp.path().join("no-global.toml"),
+            &fake_git(None),
+            &mut out,
+        );
+        assert_eq!(code, ExitCode::SUCCESS);
+        let content = std::fs::read_to_string(proj.join("airlock.local.toml")).unwrap();
+        assert!(
+            content.contains("[secrets.GCP_TOKEN]\nfrom = \"parent\"\n"),
+            "{content}"
+        );
+        let text = String::from_utf8(out).unwrap();
+        assert!(
+            text.contains("from = \"parent\" (a parent config binds it)"),
+            "{text}"
+        );
+    }
+
+    #[test]
     fn init_local_fails_if_file_exists() {
         let tmp = tempdir().unwrap();
         std::fs::write(tmp.path().join("airlock.local.toml"), "x").unwrap();
@@ -2144,7 +2297,7 @@ access = "none"
             ("GH_TOKEN".to_string(), None),
             ("CLOUDFLARE_API_TOKEN".to_string(), None),
         ];
-        let out = render_local_bindings_summary(&labels, &["GH_TOKEN".to_string()]);
+        let out = render_local_bindings_summary(&labels, &[], &["GH_TOKEN".to_string()]);
         assert_eq!(
             out,
             "  GH_TOKEN              from = \"global\" (your global config binds it)\n  CLOUDFLARE_API_TOKEN  not bound: edit airlock.local.toml\n"

@@ -236,6 +236,24 @@ echo airlock.local.toml >> ~/.config/git/ignore
 
 A tool defined in both the repo and local files is a config error unless the local tool sets `override = true` — the user approves that line along with the file. A personal tool in your global config quietly gives way to a project tool of the same name; `airlock config` shows the layer each tool and secret comes from.
 
+### Parent configs
+
+A directory above your projects can share its config with all of them, the way `mise.toml` files stack. Set `cascade = true` in it:
+
+```toml
+# ~/work/airlock.toml — applies to ~/work/api, ~/work/web, ...
+cascade = true
+
+[secrets.GCP_TOKEN]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token"]
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "GCP_TOKEN" }
+```
+
+Each project's own directory stays its sandbox root, so the agent in `~/work/api` cannot write the parent file or the sibling repos. The parent's files sit between the global and repo layers and are approved like any project file, once for every project below them. A project tool replaces a parent tool of the same name. A repo label reaches a parent's binding only through `from = "parent"` in the local file, just as `from = "global"` reaches the global one. Relative paths in a parent file resolve against the parent's own directory. A project that should not inherit sets `inherit = false`. A directory without `cascade = true` never applies below itself, and `$HOME` is never a parent: that is what the global config is for. A worked example with two projects is in [`examples/workspace/`](examples/workspace/).
+
 ## Approving config
 
 The daemon never acts on a project config file you haven't approved — including one the agent edited. `airlock.toml` and `airlock.local.toml` are each approved on their own, by the exact bytes.
@@ -379,6 +397,8 @@ A project needs `airlock.toml` or `airlock.local.toml` somewhere between the cur
 
 > Don't put `airlock.toml` directly in `$HOME` — that makes your entire home directory the sandbox root. Airlock refuses to start unless the config sets `allow_home_root = true` (only honored in the global or local layer).
 
+Two top-level keys control [parent configs](#parent-configs): `cascade = true` applies a directory's config to projects below it, and `inherit = false` ignores every parent. Both are a config error in the global file.
+
 ```toml
 timeout = 120                  # global tool timeout in seconds (default: 300)
 access  = "default"            # default sandbox filesystem baseline for every tool (see below)
@@ -417,7 +437,7 @@ Unknown keys are a config error at every level, in every layer — a typo fails 
 | Field                 | Applies to | Description |
 |-----------------------|------------|-------------|
 | `source`              | all        | `"env"` or `"command"`. Optional in the repo layer only: a label with no `source` says "this project needs this secret" and leaves the binding to each user — see [Team and personal config](#team-and-personal-config). |
-| `from`                | `env`; or any layer as `from = "global"` | For `source = "env"`, the launcher env var to read; defaults to the label. In the local layer only, `from = "global"` instead reuses the global config's binding of the same label, and is mutually exclusive with `source`. |
+| `from`                | `env`; or the local layer as `from = "global"` / `"parent"` | For `source = "env"`, the launcher env var to read; defaults to the label. In the local layer only, `from = "global"` instead reuses the global config's binding of the same label, and `from = "parent"` the parent configs' binding; both are mutually exclusive with `source`. |
 | `command`             | `command`  | Argv list to spawn; trimmed stdout becomes the value. No shell. |
 | `timeout`             | `command`  | Seconds to wait for the command. Default 10. |
 | `refresh`             | `command`  | Seconds between background re-runs. Omit to fetch once at session start. |

@@ -11,7 +11,7 @@
 
 use std::path::{Path, PathBuf};
 
-use airlock::layers::{self, DiscoveryMode, LayerKind, MergeContext};
+use airlock::layers::{self, DiscoveryMode, LayerKind, MergeContext, SecretProvenance};
 
 /// `examples/` relative to the crate root, regardless of the test binary's
 /// own working directory.
@@ -143,4 +143,61 @@ fn team_example_trio_merges_successfully() {
             tools.keys().collect::<Vec<_>>()
         );
     }
+}
+
+/// `examples/workspace/` is the worked "parent configs" example, read as
+/// `~/work` with `examples/` standing in for home: a parent with
+/// `cascade = true`, a repo below it that links a label to the parent and
+/// replaces one of its tools, and a fork that opts out with
+/// `inherit = false`.
+#[test]
+fn workspace_example_stacks_the_parent_onto_its_projects() {
+    let home = examples_dir();
+    let workspace = home.join("workspace");
+    let no_global = workspace.join("no-global.toml");
+    let tool_state = tempfile::tempdir().expect("tempdir");
+
+    let load = |project: &str| {
+        let layers = layers::load_layers(
+            &DiscoveryMode::Default,
+            &workspace.join(project),
+            &home,
+            &no_global,
+        )
+        .unwrap_or_else(|e| panic!("workspace/{project}: load_layers failed: {e}"));
+        let ctx = MergeContext {
+            root: layers.root.clone(),
+            home: home.clone(),
+            tool_state_base: tool_state.path().to_path_buf(),
+        };
+        let merged = layers::merge(&layers, &ctx)
+            .unwrap_or_else(|e| panic!("workspace/{project}: merge failed: {e}"));
+        (layers, merged)
+    };
+
+    let (api_layers, api) = load("api");
+    let parent_dirs: Vec<_> = api_layers.parents.iter().map(|p| p.dir.clone()).collect();
+    assert_eq!(
+        parent_dirs,
+        vec![std::fs::canonicalize(&workspace).unwrap()]
+    );
+    let prov = api.provenance();
+    assert_eq!(prov.tools["gcloud"].layer, LayerKind::Repo);
+    assert_eq!(prov.tools["gcloud"].replaced, Some(LayerKind::Parent));
+    assert_eq!(prov.tools["kubectl"].layer, LayerKind::Parent);
+    assert_eq!(prov.tools["argocd"].layer, LayerKind::Parent);
+    assert_eq!(
+        prov.secrets["CLOUDSDK_AUTH_ACCESS_TOKEN"],
+        SecretProvenance::ParentLink
+    );
+    let read = api.to_wire().filesystem.expect("filesystem").read;
+    let schemas = std::fs::canonicalize(&workspace)
+        .unwrap()
+        .join("platform/schemas");
+    assert!(read.contains(&schemas.display().to_string()), "{read:?}");
+
+    let (fork_layers, fork) = load("oss-fork");
+    assert!(fork_layers.parents.is_empty());
+    let tools = fork.to_wire().tools.unwrap_or_default();
+    assert_eq!(tools.keys().collect::<Vec<_>>(), vec!["gh"]);
 }

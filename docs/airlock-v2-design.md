@@ -218,16 +218,18 @@ any more. Users delete leftover `airlock.sock`, `airlock.pid` and
 
 ## Config layers
 
-### The three files
+### The files
 
 | Layer | Path | Approved? | Who writes it |
 |---|---|---|---|
 | global | `$XDG_CONFIG_HOME/airlock/airlock.toml` (default `~/.config/airlock/airlock.toml`, on macOS too) | no | the user |
+| parent | `airlock.toml` / `airlock.local.toml` in a directory above `<root>` that sets `cascade = true` | yes | the user, a monorepo's team |
 | repo | `<root>/airlock.toml` | yes | the team, PR authors, the agent |
 | local | `<root>/airlock.local.toml` | yes | the user, the agent |
 
 The local file sits in the project directory, where the agent can write, so
-it is approved exactly like the repo file.
+it is approved exactly like the repo file. Parent configs are optional; see
+[Parent configs](#parent-configs).
 
 ### Discovery
 
@@ -239,7 +241,8 @@ adopted it. The project root is the sandbox root, with the same meaning as
 now.
 
 With no project file found, Airlock fails as today, however much global
-config exists.
+config exists. A parent config never makes a directory a project on its
+own: it applies only once discovery has found a root below it.
 
 ### `--config <path>`
 
@@ -266,6 +269,61 @@ empty-config mode those provided is removed.
 - The agent finds the daemon through its [session](#sessions), as in every
   other mode, so a working directory that moves does not matter.
 
+### Parent configs
+
+A directory above the project root can apply its config to every project
+below it, the way `mise.toml` files stack. This is for a workspace of
+repos that share work tools and credentials (`~/work/airlock.toml` with
+`kubectl`, `gcloud` and their secrets) without copying them into each repo,
+and without making the workspace the sandbox root of every agent.
+
+```toml
+# ~/work/airlock.toml
+cascade = true        # also applies to projects in subdirectories
+
+[secrets.GCP_TOKEN]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token"]
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "GCP_TOKEN" }
+```
+
+- **Opt-in by the parent.** A directory's files apply below it only if
+  they set `cascade = true` (the local file's value over the repo file's).
+  The flag is part of the approved bytes, so "this applies to every project
+  below" is itself something the user approved. An existing file that was
+  approved as a project root does not start reaching other projects on its
+  own.
+- **Opt-out by the child.** `inherit = false` in a project's files ignores
+  every parent config. In a parent's files it stops the walk there: the
+  parent applies, nothing above it does. Either file may set it, since it
+  only takes access away.
+- **Discovery.** After the root is found, the launcher keeps walking up
+  from the root's parent to just below `$HOME`, reading each directory's
+  files owned by the effective uid. A directory without `cascade = true` is
+  skipped, not a stop. `$HOME` itself is never a parent, since the global
+  file already covers it; a root outside `$HOME` has no parents. A parent's
+  file that fails to read or parse is an error, as for any layer.
+- **The root does not move.** The project root, and so the sandbox root,
+  is still the nearest directory with a config. A parent's files sit
+  outside it, so the agent cannot write them.
+- **Merging is a fold.** The global file is the first base. Each parent's
+  own files merge on top of it by the rules below, with the base in the
+  global layer's place, and the result is the base for the next directory
+  down. The project merges last. So a project tool replaces a parent tool
+  (shown as `replaces parent`), a repo item cannot reference a parent's
+  label, and a parent's own repo and local files follow the repo and local
+  rules among themselves.
+- **Paths.** A relative path in a parent's file resolves against that
+  parent's directory, the way a reader expects. `{sandbox_root}` and
+  `{tool_state}` mean the project's root, in every layer. A parent's
+  `filesystem.write = ["."]` would grant every project below it write access
+  to all of its siblings; `airlock config` shows the resolved path and the
+  layer it came from.
+- **Not with `--config` or `--no-project-config`.** Those name exactly
+  which files apply.
+
 ### Merge rules
 
 Each layer is parsed on its own, then the layers are merged, then the
@@ -285,6 +343,7 @@ must not hold a secret" is checked against the merged tools.
 | `allow_home_root` | Honored in global or local. In the repo layer it is a config error. |
 | `agent.kits` | union across layers (see [Kits](#kits)) |
 | `[kits.<name>]` | Honored in global or local, local wins whole by name. In the repo layer it is a config error. Launcher-only — never part of the wire config. |
+| `cascade`, `inherit` | Read during discovery (see [Parent configs](#parent-configs)), the local file's over the repo file's. A config error in the global file. Never on the wire. |
 
 ### Tools across layers
 
@@ -323,6 +382,11 @@ approved file.
 - **The global layer never serves a repo label on its own.** A global
   `[secrets.GH_TOKEN]` and a repo `[secrets.GH_TOKEN]` are two separate
   bindings until the local file links them.
+- **Neither does a parent.** `from = "parent"` in the local file links a
+  repo label to the binding the parent configs give it. `from = "global"`
+  still means the global file's own binding, even when a parent binds the
+  same label. A local item may also reference a parent's label directly,
+  as it may a global one.
 - A repo label with no source and no local binding is a startup error that
   lists each such label and points to `airlock init --local`.
 - `[secrets.<label>]` takes an optional `description` in every layer. A
@@ -331,8 +395,8 @@ approved file.
   `init --local` show it.
 
 `airlock init --local` writes `airlock.local.toml` with a stub per repo
-label that has no source. A label the global layer binds gets
-`from = "global"`; any other gets commented `command` and `env` examples
+label that has no source. A label a parent config binds gets
+`from = "parent"`; one the global layer binds gets `from = "global"`; any other gets commented `command` and `env` examples
 under its description. In a repo without an `airlock.toml`, whose team has
 not adopted Airlock, it writes a standalone skeleton instead: a commented
 secret and tool, as `init` writes for `airlock.toml`. The stub is an
@@ -390,6 +454,8 @@ GH_CONFIG_DIR = "{tool_state}"
 - **The repo and local files, each on its own.** A file is approved when its
   current bytes equal the copy recorded by `airlock trust`. This is the
   whole file: an edited comment needs approval again too.
+- **Each parent's files.** Same rule, approved once for every project below
+  them.
 - **The `--config` file.** Same rule.
 - **Not the global file.** It is the user's own file, outside every
   project. It is protected by the [anchor checks](#protecting-the-anchors)
@@ -405,9 +471,12 @@ $XDG_STATE_HOME/airlock/trust/<id>/     (default ~/.local/state/airlock/trust/<i
     <name>.toml           approved copy of a --config file named <name>.toml, mode 0600
 ```
 
-Each copy is stored under the approved file's name. Every approved file sits
-in the project root, since `--config` makes the file's parent the root, so
-`<id>` plus the name identify the file's canonical path. A `--config` file
+Each copy is stored under the approved file's name, in the slot of the
+directory it sits in: the project root, or a parent's directory for a
+parent config. `--config` makes the file's parent the root, so `<id>` plus
+the name always identify the file's canonical path. A parent's files keep
+one slot for every project below them, and a parent directory that is
+also a project root of its own shares it. A `--config` file
 that is itself named `airlock.toml` in a project root is the repo file and
 shares its slot.
 
@@ -1358,7 +1427,8 @@ whole config.
 | What approved repo config may do | Everything, as today | No secret sources; suggested sources only | Keeps a single-file setup working. The local layer covers personal bindings. |
 | Personal config location | Global and per-project local | Global only; local only | Global for bindings shared across projects, local for per-project overrides. |
 | Local file location | In the project, approved | Outside the project (`~/.config/airlock/projects/<id>.toml`); in the project with sandbox write denied | Kept next to the repo file where users expect it. Approval handles the agent being able to write it. |
-| Precedence | global < repo < local | repo < global < local | Same order as git config. |
+| Precedence | global < parents (outermost first) < repo < local | repo < global < local | Same order as git config. |
+| Stacking configs up the tree | Parent directories apply below them only with `cascade = true`; the sandbox root stays the nearest config; `inherit = false` opts out | Always stack, as mise does; nearest file only | Shares workspace tools without making the workspace every agent's sandbox root. The opt-in is in the approved bytes, so an existing approval never starts reaching other projects by itself. |
 | Tool collision | A project tool replaces a global one, shown in `config`; repo against local is an error unless the local tool says `override = true` | Always an error; highest layer wins; field merge | A silently shadowed team tool is a security surprise, but an error with no way out breaks every repo that declares the user's global `gh`. Each replacement is either the user's own default giving way, or an approved line. |
 | Secret collision | Local replaces a repo label's spec whole; global reaches a repo label only through local `from = "global"` | Highest layer wins; global rebinds repo labels automatically; approve the cross-layer binding map | A repo label must not resolve to a personal secret without an approved opt-in. Rebinding stays one line per label. |
 | Everything else | Lists union, maps per key, scalars highest | Whole-section replace; additive only | Predictable, and a personal layer can still override a value. |

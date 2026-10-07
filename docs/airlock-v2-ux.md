@@ -301,6 +301,50 @@ secret and tool. The user fills it in and runs `airlock run` as usual. It
 is approved like any local file, and nothing lands in the team's
 `.gitignore`.
 
+### A workspace of repos
+
+The user keeps work repos under `~/work` and wants the work tools in each
+of them, with each repo as its own sandbox root.
+
+```
+$ cat ~/work/airlock.toml
+cascade = true
+
+[secrets.GCP_TOKEN]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token"]
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "GCP_TOKEN" }
+
+$ cd ~/work/api && airlock run --profile claude
+~/work/airlock.toml (new):
+    cascade = true
+    ...
+Trust this version and continue? [y/N] y
+trusted ~/work/airlock.toml
+~/work/api/airlock.toml (new):
+    ...
+```
+
+The parent file is approved once; the next repo under `~/work` asks only
+about its own files. `airlock config` lists the parent in `layers` and
+marks what it contributes:
+
+```
+layers
+  global  ~/.config/airlock/airlock.toml  user file
+  parent  ~/work/airlock.toml             trusted
+  repo    ~/work/api/airlock.toml         trusted
+
+tools
+  gcloud  parent  ...
+  gh      repo    ...  (replaces global)
+```
+
+A repo that should not get the work tools sets `inherit = false`, usually
+in its `airlock.local.toml`.
+
 ### Every day
 
 ```
@@ -916,6 +960,8 @@ action, so the agent can relay it without interpreting it.
 | `override = true` on a tool the repo does not define | `error: <local>: tool "gh" sets override, but the repo defines no "gh"` | 125 |
 | Repo label without a binding | lists labels with descriptions + `airlock init --local` hint | 125 |
 | Global item uses a repo label | `error: <global>: tool "x" uses secret "Y", which your global config does not declare` | 125 |
+| `from = "parent"` with nothing to link to | `error: <local>: [secrets.GCP_TOKEN] from = "parent", but no parent config with cascade = true binds it` | 125 |
+| `cascade` or `inherit` in the global file | `error: <global>: cascade has no meaning in the global config, which applies to every project` | 125 |
 | Unapproved file, terminal | diff or full file, `Trust this version and continue? [y/N]` (U1); on `n`, `not trusted; nothing started` | 125 on `n` |
 | Unapproved file, no terminal | diff or full file + `run \`airlock trust\` in a terminal to approve it` | 125 |
 | Anchor redirected | `error: trust store <path> is inside the project root <root> (from XDG_STATE_HOME=…); refusing to use it` | 125 |
