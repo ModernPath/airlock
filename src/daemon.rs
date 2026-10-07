@@ -1915,12 +1915,130 @@ fn start_tool(
 }
 
 /// The reason the concurrent I/O loop terminated.
+/// A spawned tool's entry in the daemon's child registry and its slot in
+/// the session's exec cap, both released however the exec ends — including
+/// a panic or an early return that a trailing cleanup line would miss.
+struct RunningChild<'a> {
+    state: &'a DaemonState,
+    pid: u32,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl Drop for RunningChild<'_> {
+    fn drop(&mut self) {
+        self.state.child_registry.remove(self.pid);
+    }
+}
+
 enum TermReason {
     ChildExited(std::process::ExitStatus),
     ChildWaitError(std::io::Error),
     Timeout,
     ClientDisconnect,
     ClientLineOverflow,
+}
+
+/// Relay a running tool's I/O until something ends the exec: its stdout and
+/// stderr out to the client as they arrive, the client's stdin frames in.
+/// Returns why it stopped; the tool's stdin is closed either way.
+async fn pump_io(
+    child: &mut tokio::process::Child,
+    stdin: tokio::process::ChildStdin,
+    stdout_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    stderr_rx: &mut tokio::sync::mpsc::UnboundedReceiver<Vec<u8>>,
+    framed: &mut Reader,
+    responder: &mut Responder,
+    timeout: Duration,
+) -> TermReason {
+    use tokio::io::AsyncWriteExt;
+    use tokio_stream::StreamExt;
+    use tokio_util::codec::LinesCodecError;
+
+    let mut child_stdin: Option<tokio::process::ChildStdin> = Some(stdin);
+    let mut stdin_received = false;
+    let mut stdout_done = false;
+    let mut stderr_done = false;
+
+    let timeout_timer = tokio::time::sleep(timeout);
+    tokio::pin!(timeout_timer);
+    let stdin_timer = tokio::time::sleep(STDIN_TIMEOUT);
+    tokio::pin!(stdin_timer);
+
+    let term_reason: TermReason;
+
+    loop {
+        tokio::select! {
+            status = child.wait() => {
+                term_reason = match status {
+                    Ok(s) => TermReason::ChildExited(s),
+                    Err(e) => TermReason::ChildWaitError(e),
+                };
+                break;
+            }
+
+            data = stdout_rx.recv(), if !stdout_done => {
+                match data {
+                    Some(bytes) => send_output(responder, &bytes, stdout_message).await,
+                    None => stdout_done = true,
+                }
+            }
+
+            data = stderr_rx.recv(), if !stderr_done => {
+                match data {
+                    Some(bytes) => send_output(responder, &bytes, stderr_message).await,
+                    None => stderr_done = true,
+                }
+            }
+
+            result = framed.next() => {
+                match result {
+                    None => {
+                        term_reason = TermReason::ClientDisconnect;
+                        break;
+                    }
+                    Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
+                        term_reason = TermReason::ClientLineOverflow;
+                        break;
+                    }
+                    Some(Err(LinesCodecError::Io(e))) => {
+                        if e.kind() == std::io::ErrorKind::InvalidData {
+                            continue;
+                        }
+                        term_reason = TermReason::ClientDisconnect;
+                        break;
+                    }
+                    Some(Ok(line)) => {
+                        if let Ok(frame) = serde_json::from_str::<protocol::StdinFrame>(line.trim()) {
+                            match frame {
+                                protocol::StdinFrame::Stdin { data } => {
+                                    stdin_received = true;
+                                    if let Some(ref mut stdin) = child_stdin {
+                                        let _ = stdin.write_all(data.as_bytes()).await;
+                                    }
+                                }
+                                protocol::StdinFrame::StdinEof => {
+                                    stdin_received = true;
+                                    child_stdin = None;
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            _ = &mut stdin_timer, if !stdin_received && child_stdin.is_some() => {
+                child_stdin = None;
+            }
+
+            _ = &mut timeout_timer => {
+                term_reason = TermReason::Timeout;
+                break;
+            }
+        }
+    }
+
+    drop(child_stdin);
+    term_reason
 }
 
 async fn handle_exec_request(
@@ -1932,10 +2050,6 @@ async fn handle_exec_request(
     mut framed: Reader,
     mut responder: Responder,
 ) {
-    use tokio::io::AsyncWriteExt;
-    use tokio_stream::StreamExt;
-    use tokio_util::codec::LinesCodecError;
-
     // Set once, up front, so every `Error` this request can send — even one
     // refused before a tool is ever started, like a stale secret's
     // refresh-failure reason below — passes through this session's own
@@ -1989,6 +2103,11 @@ async fn handle_exec_request(
     let mut child = spawned.child;
 
     state.child_registry.insert(pid);
+    let _running = RunningChild {
+        state,
+        pid,
+        _permit: permit,
+    };
     state.ring_buffer.log_session(
         session.id.as_str(),
         format!("tool {tool:?} spawned (PID: {pid})"),
@@ -2005,90 +2124,16 @@ async fn handle_exec_request(
         spawned.stderr,
     );
 
-    let mut child_stdin: Option<tokio::process::ChildStdin> = Some(spawned.stdin);
-    let mut stdin_received = false;
-    let mut stdout_done = false;
-    let mut stderr_done = false;
-
-    let timeout_timer = tokio::time::sleep(timeout);
-    tokio::pin!(timeout_timer);
-    let stdin_timer = tokio::time::sleep(STDIN_TIMEOUT);
-    tokio::pin!(stdin_timer);
-
-    let term_reason: TermReason;
-
-    loop {
-        tokio::select! {
-            status = child.wait() => {
-                term_reason = match status {
-                    Ok(s) => TermReason::ChildExited(s),
-                    Err(e) => TermReason::ChildWaitError(e),
-                };
-                break;
-            }
-
-            data = stdout_rx.recv(), if !stdout_done => {
-                match data {
-                    Some(bytes) => send_output(&mut responder, &bytes, stdout_message).await,
-                    None => stdout_done = true,
-                }
-            }
-
-            data = stderr_rx.recv(), if !stderr_done => {
-                match data {
-                    Some(bytes) => send_output(&mut responder, &bytes, stderr_message).await,
-                    None => stderr_done = true,
-                }
-            }
-
-            result = framed.next() => {
-                match result {
-                    None => {
-                        term_reason = TermReason::ClientDisconnect;
-                        break;
-                    }
-                    Some(Err(LinesCodecError::MaxLineLengthExceeded)) => {
-                        term_reason = TermReason::ClientLineOverflow;
-                        break;
-                    }
-                    Some(Err(LinesCodecError::Io(e))) => {
-                        if e.kind() == std::io::ErrorKind::InvalidData {
-                            continue;
-                        }
-                        term_reason = TermReason::ClientDisconnect;
-                        break;
-                    }
-                    Some(Ok(line)) => {
-                        if let Ok(frame) = serde_json::from_str::<protocol::StdinFrame>(line.trim()) {
-                            match frame {
-                                protocol::StdinFrame::Stdin { data } => {
-                                    stdin_received = true;
-                                    if let Some(ref mut stdin) = child_stdin {
-                                        let _ = stdin.write_all(data.as_bytes()).await;
-                                    }
-                                }
-                                protocol::StdinFrame::StdinEof => {
-                                    stdin_received = true;
-                                    child_stdin = None;
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-
-            _ = &mut stdin_timer, if !stdin_received && child_stdin.is_some() => {
-                child_stdin = None;
-            }
-
-            _ = &mut timeout_timer => {
-                term_reason = TermReason::Timeout;
-                break;
-            }
-        }
-    }
-
-    drop(child_stdin);
+    let term_reason = pump_io(
+        &mut child,
+        spawned.stdin,
+        &mut stdout_rx,
+        &mut stderr_rx,
+        &mut framed,
+        &mut responder,
+        timeout,
+    )
+    .await;
 
     match term_reason {
         TermReason::ChildExited(status) => {
@@ -2144,9 +2189,6 @@ async fn handle_exec_request(
             let _ = responder.send(&DaemonMessage::Exit { code: -1 }).await;
         }
     }
-
-    state.child_registry.remove(pid);
-    drop(permit);
 }
 
 // ─── Child lifecycle helpers ─────────────────────────────────────────────────
