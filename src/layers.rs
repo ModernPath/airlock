@@ -88,7 +88,7 @@ impl LayerFile {
 /// The layers found for one project, before merging.
 #[derive(Debug)]
 pub struct LoadedLayers {
-    /// The project root: the sandbox root, same meaning as in v1.
+    /// The project root, which is also the sandbox root.
     pub root: PathBuf,
     pub global: Option<LayerFile>,
     /// The project-declared layer: `airlock.toml`, or (in

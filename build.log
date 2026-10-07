@@ -1,3 +1,0 @@
-[30430:27079603:20261007,024550.802022:ERROR bootstrap.cc:65] bootstrap_check_in org.chromium.crashpad.child_port_handshake.30430.27079603.ERVJLWGNUYMGZJSP: Permission denied (1100)
-[30430:27079603:20261007,024550.802337:FATAL child_port_handshake.cc:118] Check failed: server_port.is_valid(). 
-[30427:27079579:20261007,024550.802483:ERROR file_io.cc:107] ReadExactly: expected 4, observed 0

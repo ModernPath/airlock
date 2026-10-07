@@ -1895,8 +1895,11 @@ fn start_tool(
         })?;
     let mut env = exec::build_env_from(&policy.snapshot, &policy.path, &secret_pairs);
 
-    // Taken after the secrets are read, never earlier — see the v1 daemon's
-    // equivalent comment, unchanged rationale.
+    // Taken after the secrets are read, never earlier. A refresh swaps the
+    // redactor before it publishes the new value, so a snapshot taken now
+    // knows every value just put into `env`. One taken at accept time would
+    // miss a refresh that lands before the client sends its request, and
+    // the client chooses when that is.
     let session_redactor = Arc::clone(&policy.redactor.read().unwrap_or_else(|e| e.into_inner()));
     let global_redactor = state.global_redactor_snapshot();
 

@@ -21,16 +21,6 @@
 //! The daemon never reads project config, so none of this runs there: it is
 //! all launcher-side (`airlock run`, `session start`, `session reload`,
 //! `airlock trust`).
-//!
-//! # Deviation from the implementation contract
-//!
-//! The contract's `trust.rs` sketch takes `anchors: &Anchors` and
-//! `file: &LayerFile`, both defined in sibling modules (`anchors.rs`,
-//! `layers.rs`) owned by other phase-1 agents and not present in this
-//! worktree. [`TrustStore::open`] takes a plain `&Path` (the trust store
-//! directory, i.e. `anchors.trust_store`) and [`TrustStore::state`] /
-//! [`TrustStore::approve`] take `root: &Path` and `file_name: &str` plus the
-//! bytes, instead of a `LayerFile`. The coordinator adapts call sites.
 
 use std::io::{self, BufRead, Read, Write};
 use std::os::unix::ffi::OsStrExt;

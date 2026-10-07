@@ -855,9 +855,12 @@ fn cmd_exec(args: Vec<String>) -> ExitCode {
     };
 
     let code = rt.block_on(airlock::client::exec(tool, tool_args, &canonical_cwd));
-    // See the v1 rationale this replaces: `forward_stdin` may park a
-    // blocking thread reading real stdin that `JoinHandle::abort` cannot
-    // wake. Detach rather than let the default `Runtime` drop wait for it.
+    // `client::exec` may have spawned `forward_stdin`, which reads stdin on a
+    // blocking thread that `JoinHandle::abort` cannot wake. If stdin is a
+    // pipe whose write end never closes (common under a non-interactive
+    // harness), that thread parks in `read(2)` forever and the default
+    // `Runtime` drop waits for it. Detach instead; the kernel reaps the
+    // thread when this process exits.
     rt.shutdown_background();
     ExitCode::from(code as u8)
 }
