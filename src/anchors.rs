@@ -73,18 +73,28 @@ impl Anchors {
 /// daemon-side code never reads the process environment through it.
 pub fn resolve(env: &dyn Fn(&str) -> Option<String>, home: &Path, runtime: &RuntimeDir) -> Anchors {
     let (state_dir, trust_store_source) = xdg_dir(env, home, "XDG_STATE_HOME", ".local/state");
-    let (config_dir, global_config_source) = xdg_dir(env, home, "XDG_CONFIG_HOME", ".config");
+    let (global_config, global_config_source) = global_config_path(env, home);
     let (cache_dir, tool_state_base_source) = xdg_dir(env, home, "XDG_CACHE_HOME", ".cache");
 
     Anchors {
         trust_store: state_dir.join("airlock").join("trust"),
         trust_store_source,
-        global_config: config_dir.join("airlock").join("airlock.toml"),
+        global_config,
         global_config_source,
         tool_state_base: cache_dir.join("airlock"),
         tool_state_base_source,
         runtime_base: runtime.base().to_path_buf(),
     }
+}
+
+/// The global config file, `$XDG_CONFIG_HOME/airlock/airlock.toml`, and the
+/// `XDG_CONFIG_HOME=...` it came from when that variable was used.
+pub fn global_config_path(
+    env: &dyn Fn(&str) -> Option<String>,
+    home: &Path,
+) -> (PathBuf, Option<String>) {
+    let (config_dir, source) = xdg_dir(env, home, "XDG_CONFIG_HOME", ".config");
+    (config_dir.join("airlock").join("airlock.toml"), source)
 }
 
 /// Resolves one XDG base directory variable, falling back to
@@ -514,6 +524,16 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn global_config_path_treats_an_empty_xdg_config_home_as_unset() {
+        let home = Path::new("/home/u");
+        let empty = |k: &str| (k == "XDG_CONFIG_HOME").then(String::new);
+        assert_eq!(
+            global_config_path(&empty, home),
+            (PathBuf::from("/home/u/.config/airlock/airlock.toml"), None)
+        );
     }
 
     fn fixed_runtime(base: PathBuf) -> RuntimeDir {
