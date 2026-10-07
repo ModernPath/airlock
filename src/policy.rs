@@ -144,6 +144,11 @@ pub fn validate_cwd(cwd: &Path, sandbox_root: &Path) -> Result<(), PolicyError> 
 /// proxy's bound port because it is only known once the per-exec listener is
 /// up.
 ///
+/// `access` is the tool's own `[tools.<name>].access` if set, else the
+/// config's top-level `access` default (itself `ToolAccess::Default` if
+/// unset anywhere) — the same fallback pattern as `timeout` at the call site
+/// in `daemon.rs`.
+///
 /// `git_hooks_deny` is always set to `<sandbox_root>/.git/hooks` (F9); it is
 /// harmless when the root has no `.git` directory. `runtime_base` and
 /// `tmpdir` are left `None` here — the former has no caller-known value yet
@@ -190,11 +195,14 @@ pub fn build_tool_policy(
     read_write_paths.extend(config.filesystem_write.iter().cloned());
     read_write_paths.extend(tool_config.extra_write.iter().cloned());
 
+    let access = tool_config.access.unwrap_or(config.access);
+
     Ok(ToolPolicy {
         read_paths,
         read_write_paths,
         network,
         binary_path: None,
+        access,
         git_hooks_deny: Some(config.sandbox_root.join(".git/hooks")),
         ..Default::default()
     })
@@ -287,6 +295,7 @@ mod tests {
                     extra_read,
                     extra_write,
                     timeout: None,
+                    access: None,
                     description: None,
                     proxy: None,
                 },
@@ -296,6 +305,7 @@ mod tests {
         Config {
             sandbox_root: sandbox_root.clone(),
             timeout: Duration::from_secs(300),
+            access: crate::sandbox::ToolAccess::default(),
             filesystem_read,
             filesystem_write,
             secrets: HashMap::new(),
@@ -427,6 +437,39 @@ mod tests {
 
         let policy = build_tool_policy("mytool", &config, None).unwrap();
         assert_eq!(policy.network, NetworkAccess::Full);
+    }
+
+    #[test]
+    fn tool_access_defaults_to_the_config_level_default() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let config = make_simple_config(sandbox_root);
+
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
+        assert_eq!(policy.access, crate::sandbox::ToolAccess::Default);
+    }
+
+    #[test]
+    fn tool_access_inherits_the_config_top_level_access() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut config = make_simple_config(sandbox_root);
+        config.access = crate::sandbox::ToolAccess::System;
+
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
+        assert_eq!(policy.access, crate::sandbox::ToolAccess::System);
+    }
+
+    #[test]
+    fn tool_access_override_wins_over_the_config_top_level_access() {
+        let tmp = tempdir().unwrap();
+        let sandbox_root = std::fs::canonicalize(tmp.path()).unwrap();
+        let mut config = make_simple_config(sandbox_root);
+        config.access = crate::sandbox::ToolAccess::System;
+        config.tools.get_mut("mytool").unwrap().access = Some(crate::sandbox::ToolAccess::None);
+
+        let policy = build_tool_policy("mytool", &config, None).unwrap();
+        assert_eq!(policy.access, crate::sandbox::ToolAccess::None);
     }
 
     #[test]
@@ -723,6 +766,7 @@ mod tests {
         Config {
             sandbox_root: sandbox_root.clone(),
             timeout: Duration::from_secs(300),
+            access: crate::sandbox::ToolAccess::default(),
             filesystem_read,
             filesystem_write,
             secrets: HashMap::new(),

@@ -19,6 +19,7 @@ use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
 use crate::proxy::{HostPattern, Inject, PathRule, ProxyPolicy, ProxyRoute, RouteError};
+use crate::sandbox::ToolAccess;
 
 // ─── Constants ────────────────────────────────────────────────────────────────
 
@@ -324,6 +325,18 @@ pub enum ConfigError {
         got: String,
     },
 
+    /// An `access` value (top-level or `[tools.<name>]`) is not one of the
+    /// three recognized levels.
+    #[error(
+        "{context}: unknown access level {got:?}; expected \"none\", \"system\", or \"default\""
+    )]
+    UnknownAccessLevel {
+        /// Where the value appeared: `"access"` or `"tools.<name>.access"`.
+        context: String,
+        /// The offending value.
+        got: String,
+    },
+
     /// A `[secrets.<label>]` entry has no `source`, parsed in a context
     /// (the legacy single-file loaders) where nothing can bind it later.
     #[error(
@@ -615,6 +628,11 @@ pub struct RawConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
 
+    /// Default `access` level for every tool that doesn't set its own.
+    /// `"none"`, `"system"`, or `"default"`; unset means `"default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
+
     /// Global filesystem access paths.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub filesystem: Option<RawFilesystem>,
@@ -822,6 +840,10 @@ pub struct RawToolConfig {
     /// Per-tool timeout override in seconds.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub timeout: Option<u64>,
+    /// Per-tool override of the top-level `access` default. `"none"`,
+    /// `"system"`, or `"default"`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<String>,
     /// Human-readable description of what this tool does.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
@@ -884,6 +906,9 @@ pub struct Config {
 
     /// Global timeout for tool execution.
     pub timeout: Duration,
+
+    /// Default `access` level for every tool that doesn't set its own.
+    pub access: ToolAccess,
 
     /// Global read-only filesystem paths.
     pub filesystem_read: Vec<PathBuf>,
@@ -987,6 +1012,9 @@ pub struct ToolConfig {
 
     /// Optional per-tool timeout override.
     pub timeout: Option<Duration>,
+
+    /// Per-tool override of [`Config::access`]. `None` means inherit it.
+    pub access: Option<ToolAccess>,
 
     /// Human-readable description of what this tool does.
     pub description: Option<String>,
@@ -1290,6 +1318,23 @@ pub(crate) fn validate_tool_name(name: &str) -> Result<(), ConfigError> {
     Ok(())
 }
 
+// ─── Access level parsing ───────────────────────────────────────────────────
+
+/// Parse a raw `access` string (top-level or `[tools.<name>]`) into a
+/// [`ToolAccess`]. `context` names the field for the error message —
+/// `"access"` or `"tools.<name>.access"`.
+fn parse_access_level(context: &str, raw: &str) -> Result<ToolAccess, ConfigError> {
+    match raw {
+        "none" => Ok(ToolAccess::None),
+        "system" => Ok(ToolAccess::System),
+        "default" => Ok(ToolAccess::Default),
+        other => Err(ConfigError::UnknownAccessLevel {
+            context: context.to_string(),
+            got: other.to_string(),
+        }),
+    }
+}
+
 // ─── Env var name validation ──────────────────────────────────────────────────
 
 /// Check whether `name` matches `^[A-Za-z_][A-Za-z0-9_]*$` — the POSIX
@@ -1540,6 +1585,11 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
 
     let timeout = Duration::from_secs(raw.timeout.unwrap_or(DEFAULT_TIMEOUT_SECS));
 
+    let access = match raw.access {
+        Some(ref s) => parse_access_level("access", s)?,
+        None => ToolAccess::default(),
+    };
+
     let (filesystem_read, filesystem_write) = match raw.filesystem {
         Some(fs) => (
             fs.read.into_iter().map(PathBuf::from).collect(),
@@ -1615,6 +1665,11 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
 
         let proxy = resolve_proxy_policy(&name, raw_tool.proxy, raw_tool.routes, &secrets)?;
 
+        let tool_access = match raw_tool.access {
+            Some(ref s) => Some(parse_access_level(&format!("tools.{name}.access"), s)?),
+            None => None,
+        };
+
         let tool_config = ToolConfig {
             env,
             extra_read: raw_tool.extra_read.into_iter().map(PathBuf::from).collect(),
@@ -1624,6 +1679,7 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
                 .map(PathBuf::from)
                 .collect(),
             timeout: raw_tool.timeout.map(Duration::from_secs),
+            access: tool_access,
             description: raw_tool.description,
             proxy,
         };
@@ -1687,6 +1743,7 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
     Ok(Config {
         sandbox_root,
         timeout,
+        access,
         filesystem_read,
         filesystem_write,
         secrets,
@@ -1724,6 +1781,13 @@ pub fn default_config_template() -> &'static str {
 # Global timeout for tool execution in seconds (default: 300).
 # timeout = 300
 
+# Default filesystem baseline for every tool's sandbox: "none" (just the
+# tool's own binary and the bare minimum to start and exit), "system"
+# (today's baseline: system libraries, binaries, and config), or "default"
+# (system plus read-only Nix/Homebrew/MacPorts toolchain roots). A [tools.*]
+# entry may override this with its own `access`.
+# access = "default"
+
 # Global filesystem access paths. The directory containing this file is always
 # read-write, and a baseline of system paths (/usr/lib, /etc, /dev/{null,
 # random,urandom}, ...) is always readable. Use [filesystem] only for paths
@@ -1759,6 +1823,7 @@ pub fn default_config_template() -> &'static str {
 # extra_read  = []
 # extra_write = []
 # timeout     = 60
+# access      = "default"  # "none" | "system" | "default"; see above
 #
 # [tools.example.env]
 # API_KEY        = { secret = "API_KEY" }
@@ -1820,10 +1885,16 @@ pub fn global_config_template() -> &'static str {
 # source  = "command"
 # command = ["op", "read", "op://Private/GitHub/token"]
 
+# Default filesystem baseline for every tool's sandbox: "none" (bare
+# minimum), "system" (today's baseline), or "default" (system plus
+# read-only Nix/Homebrew/MacPorts toolchain roots).
+# access = "default"
+
 # Tools you want available everywhere, even in projects that don't declare
 # them. A project's own [tools.<name>] of the same name takes precedence.
 # [tools.aws]
 # description = "AWS CLI"
+# access      = "default"  # "none" | "system" | "default"; see above
 # [tools.aws.env]
 # AWS_PROFILE = "personal"
 
@@ -1867,7 +1938,13 @@ pub fn local_config_template_standalone() -> &'static str {
 # [secrets.API_KEY]
 # source = "env"
 
+# Default filesystem baseline for every tool's sandbox: "none" (bare
+# minimum), "system" (today's baseline), or "default" (system plus
+# read-only Nix/Homebrew/MacPorts toolchain roots).
+# access = "default"
+
 # [tools.example]
+# access = "default"  # "none" | "system" | "default"; see above
 # [tools.example.env]
 # API_KEY = { secret = "API_KEY" }
 
@@ -1957,6 +2034,7 @@ MY_SECRET = { secret = "my_secret" }
     fn full_config() -> &'static str {
         r#"
 timeout = 120
+access  = "system"
 
 [filesystem]
 read = ["/usr/share", "~/docs"]
@@ -1978,6 +2056,7 @@ from = "API_TOKEN"
 extra_read = ["/etc/config"]
 extra_write = ["/tmp/results"]
 timeout = 60
+access = "none"
 
 [tools.grep.env]
 API_KEY = { secret = "api_key" }
@@ -2099,6 +2178,7 @@ passthrough_env = ["TERM"]
 
         // Global timeout.
         assert_eq!(config.timeout, Duration::from_secs(120));
+        assert_eq!(config.access, crate::sandbox::ToolAccess::System);
 
         // Filesystem section.
         assert_eq!(config.filesystem_read.len(), 2);
@@ -2138,6 +2218,7 @@ passthrough_env = ["TERM"]
         assert_eq!(grep.extra_read, vec![PathBuf::from("/etc/config")]);
         assert_eq!(grep.extra_write, vec![PathBuf::from("/tmp/results")]);
         assert_eq!(grep.timeout, Some(Duration::from_secs(60)));
+        assert_eq!(grep.access, Some(crate::sandbox::ToolAccess::None));
 
         let python = config.tools.get("python3").expect("python3 should exist");
         assert!(matches!(
@@ -2153,6 +2234,7 @@ passthrough_env = ["TERM"]
         assert_eq!(python.extra_read, vec![sandbox_root.join("data")]);
         assert_eq!(python.extra_write, vec![sandbox_root.join("output")]);
         assert!(python.timeout.is_none());
+        assert!(python.access.is_none());
 
         // Secrets.
         assert_eq!(config.secrets.len(), 3);
@@ -3454,6 +3536,78 @@ address = "https://vault"
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::ParseError { .. }));
+    }
+
+    // ── access level ──────────────────────────────────────────────────────
+
+    #[test]
+    fn access_defaults_to_default_when_unset_anywhere() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), minimal_config());
+        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+
+        let config = load_config(tmp.path()).unwrap();
+        assert_eq!(config.access, crate::sandbox::ToolAccess::Default);
+        let tool = config.tools.get("mytool").unwrap();
+        assert!(tool.access.is_none());
+    }
+
+    #[test]
+    fn tool_access_overrides_top_level_access() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+access = "system"
+
+[tools.mytool]
+access = "none"
+"#,
+        );
+        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+
+        let config = load_config(tmp.path()).unwrap();
+        assert_eq!(config.access, crate::sandbox::ToolAccess::System);
+        let tool = config.tools.get("mytool").unwrap();
+        assert_eq!(tool.access, Some(crate::sandbox::ToolAccess::None));
+    }
+
+    #[test]
+    fn reject_unknown_top_level_access_level() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), "access = \"bogus\"\n");
+        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+
+        let err = load_config(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::UnknownAccessLevel { context, got } => {
+                assert_eq!(context, "access");
+                assert_eq!(got, "bogus");
+            }
+            other => panic!("expected UnknownAccessLevel, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn reject_unknown_tool_access_level() {
+        let tmp = tempdir().unwrap();
+        write_config(
+            tmp.path(),
+            r#"
+[tools.mytool]
+access = "bogus"
+"#,
+        );
+        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
+
+        let err = load_config(tmp.path()).unwrap_err();
+        match err {
+            ConfigError::UnknownAccessLevel { context, got } => {
+                assert_eq!(context, "tools.mytool.access");
+                assert_eq!(got, "bogus");
+            }
+            other => panic!("expected UnknownAccessLevel, got {other:?}"),
+        }
     }
 
     #[test]
