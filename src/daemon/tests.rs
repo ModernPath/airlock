@@ -890,6 +890,99 @@ async fn global_redactor_masks_another_sessions_secret() {
     assert!(!out.contains("s3cr3t-value"), "{out}");
 }
 
+/// `resolve_tool_env` turns a stale secret's refresh-failure reason into the
+/// `StaleSecret` error's `message` — and that reason is the refresh
+/// command's own captured stderr, not text the daemon composed. Before this
+/// was wired through the redaction choke point in `write_ndjson_message`,
+/// an `Error` leaving the daemon skipped redaction entirely, so a reason
+/// that happened to echo the secret's current value went to the client raw.
+#[tokio::test]
+async fn stale_secret_reason_is_redacted_in_the_error_message() {
+    let daemon = start_test_daemon(DaemonMode::Manual).await;
+    let tmp = tempfile::tempdir().unwrap();
+
+    let raw: crate::config::RawConfig = toml::from_str(
+        "[secrets.TOK]\nsource = \"env\"\n\n[tools.sh.env]\nTOK = { secret = \"TOK\" }\n",
+    )
+    .unwrap();
+    let payload = RegisterPayload {
+        root: tmp.path().to_path_buf(),
+        mode: WireMode::Default,
+        layers: Vec::new(),
+        config: raw,
+        secrets: vec![crate::protocol::WireSecret {
+            label: "TOK".to_string(),
+            value: zeroize::Zeroizing::new("s3cr3t-value".to_string()),
+        }],
+        env_snapshot: Default::default(),
+        path: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+        dropped_path: Vec::new(),
+        write_grants: Vec::new(),
+        anchors: WireAnchors {
+            runtime_base: PathBuf::from("/tmp/a"),
+            trust_store: PathBuf::from("/tmp/b"),
+            global_config: PathBuf::from("/tmp/c"),
+        },
+        agent_hash: "deadbeef".to_string(),
+    };
+
+    let mut admin = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let req = admin_request(
+        &daemon.admin_token,
+        AdminRequest::Register(Box::new(RegisterRequest {
+            payload,
+            name: "claude".to_string(),
+            sandbox: SandboxKind::External,
+            ends: SessionEnds::Ttl { secs: 3600 },
+        })),
+    );
+    let (id, token) = match admin.request(req).await {
+        DaemonMessage::Registered { id, token, .. } => (id, token),
+        other => panic!("expected Registered, got {other:?}"),
+    };
+
+    // Simulate a background refresh failure whose captured stderr happens
+    // to echo the secret's own (still-current) value — exactly the shape
+    // `resolve_tool_env` turns into the `StaleSecret` error's reason.
+    let session = daemon.state.sessions.get(&id).expect("session");
+    {
+        let policy = session.current_policy();
+        let mut slot = policy
+            .secrets
+            .get("TOK")
+            .expect("secret slot")
+            .write()
+            .unwrap();
+        slot.health = crate::secrets::Health::Stale {
+            reason: "exited with status 1: leaked value s3cr3t-value".to_string(),
+            since: std::time::Instant::now(),
+        };
+    }
+
+    let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
+    let reply = client
+        .request(session_request(
+            token,
+            SessionRequest::Exec {
+                tool: "sh".to_string(),
+                args: vec![],
+                cwd: tmp.path().to_path_buf(),
+            },
+        ))
+        .await;
+
+    match reply {
+        DaemonMessage::Error {
+            kind: ErrorKind::StaleSecret,
+            message,
+        } => {
+            assert!(!message.contains("s3cr3t-value"), "{message}");
+            assert!(message.contains("[REDACTED:TOK]"), "{message}");
+        }
+        other => panic!("expected a StaleSecret error, got {other:?}"),
+    }
+}
+
 // ─── Exec: pre-spawn errors (no sandbox needed) ──────────────────────────────
 
 #[tokio::test]
