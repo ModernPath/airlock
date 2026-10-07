@@ -6,6 +6,7 @@ pub mod config;
 pub mod daemon;
 pub mod exec;
 pub mod inspect;
+pub mod kits;
 pub mod launcher;
 pub mod layers;
 pub mod policy;
