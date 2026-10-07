@@ -360,6 +360,14 @@ pub enum Ends {
 }
 
 impl Ends {
+    /// A TTL that expires `ttl` from now; `Duration::ZERO` means never.
+    pub fn ttl_from_now(ttl: Duration) -> Self {
+        Ends::Ttl {
+            ttl,
+            expires_at: SystemTime::now() + ttl,
+        }
+    }
+
     /// Whether `now` is past this session's expiry. Always `false` for a
     /// lease or a never-expiring (`ttl == 0`) TTL.
     pub fn is_expired(&self, now: SystemTime) -> bool {
@@ -421,6 +429,40 @@ impl std::fmt::Debug for Session {
 }
 
 impl Session {
+    /// A freshly registered session with a new token, no execs yet, and the
+    /// full [`EXEC_CAP`] of exec slots.
+    pub fn new(
+        id: SessionId,
+        name: String,
+        root: PathBuf,
+        sandbox: SandboxKind,
+        ends: Ends,
+        anchor: ProcId,
+        policy: SessionPolicy,
+    ) -> Self {
+        Session {
+            token: SessionToken::generate(id.clone()),
+            id,
+            name,
+            root,
+            sandbox,
+            ends: RwLock::new(ends),
+            anchor,
+            started: SystemTime::now(),
+            execs: AtomicU64::new(0),
+            exec_permits: Arc::new(Semaphore::new(EXEC_CAP)),
+            policy: RwLock::new(Arc::new(policy)),
+            lease_closer: CancellationToken::new(),
+        }
+    }
+
+    pub fn is_expired(&self, now: SystemTime) -> bool {
+        self.ends
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .is_expired(now)
+    }
+
     /// Snapshot for `session list`, `tools list` and `agent check`.
     pub fn info(&self) -> SessionInfo {
         let policy = self
@@ -631,21 +673,15 @@ fn resolve_by_ref<'a, T>(
 /// Reused by `daemon`'s own tests via `crate::session::test_session`.
 #[cfg(test)]
 pub(crate) fn test_session(id: SessionId, name: &str) -> Arc<Session> {
-    let token = SessionToken::generate(id.clone());
-    Arc::new(Session {
+    Arc::new(Session::new(
         id,
-        token,
-        name: name.to_string(),
-        root: PathBuf::from("/tmp"),
-        sandbox: SandboxKind::External,
-        ends: RwLock::new(Ends::Lease),
-        anchor: crate::process_tree::proc_id(std::process::id() as i32).unwrap(),
-        started: SystemTime::now(),
-        execs: AtomicU64::new(0),
-        exec_permits: Arc::new(Semaphore::new(EXEC_CAP)),
-        policy: RwLock::new(Arc::new(empty_policy())),
-        lease_closer: CancellationToken::new(),
-    })
+        name.to_string(),
+        PathBuf::from("/tmp"),
+        SandboxKind::External,
+        Ends::Lease,
+        crate::process_tree::proc_id(std::process::id() as i32).unwrap(),
+        empty_policy(),
+    ))
 }
 
 /// A minimal, inert [`SessionPolicy`] with no tools and no secrets, for

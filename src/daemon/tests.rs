@@ -389,22 +389,16 @@ async fn process_tree_binding_refuses_a_non_descendant() {
     let child_pid = child.id().expect("pid") as i32;
     let anchor = crate::process_tree::proc_id(child_pid).expect("proc_id");
 
-    let id = crate::protocol::SessionId::generate();
-    let token = crate::protocol::SessionToken::generate(id.clone());
-    let session = Arc::new(Session {
-        id: id.clone(),
-        token: token.clone(),
-        name: "outsider".to_string(),
-        root: PathBuf::from("/tmp"),
-        sandbox: SandboxKind::External,
-        ends: std::sync::RwLock::new(crate::session::Ends::Lease),
+    let session = Arc::new(Session::new(
+        crate::protocol::SessionId::generate(),
+        "outsider".to_string(),
+        PathBuf::from("/tmp"),
+        SandboxKind::External,
+        crate::session::Ends::Lease,
         anchor,
-        started: std::time::SystemTime::now(),
-        execs: std::sync::atomic::AtomicU64::new(0),
-        exec_permits: Arc::new(tokio::sync::Semaphore::new(crate::session::EXEC_CAP)),
-        policy: std::sync::RwLock::new(Arc::new(crate::session::empty_policy())),
-        lease_closer: CancellationToken::new(),
-    });
+        crate::session::empty_policy(),
+    ));
+    let token = session.token.clone();
     daemon.state.sessions.insert(session);
 
     let mut client = TestClient::connect(&daemon.state.runtime.socket_path()).await;
