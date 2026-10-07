@@ -657,7 +657,7 @@ pub fn ensure_daemon(
         }
 
         if (skewed_protocol || skewed_version) && c.hello.sessions == 0 {
-            let token = read_admin_token(runtime)?;
+            let token = admin::read_admin_token(runtime)?;
             let mut stale = conn.take().expect("checked Some above");
             let _ = stale.admin_request(&token, AdminRequest::Stop);
             drop(stale);
@@ -730,13 +730,6 @@ fn spawn_automatic_daemon(verbose: bool) -> Result<(), LauncherError> {
         return Err(LauncherError::Aborted);
     }
     Ok(())
-}
-
-/// Reads and parses `admin.token` from the runtime directory.
-pub fn read_admin_token(runtime: &RuntimeDir) -> Result<AdminToken, LauncherError> {
-    let raw = std::fs::read_to_string(runtime.admin_token_path())?;
-    AdminToken::parse(raw.trim())
-        .map_err(|_| LauncherError::Message("admin.token is malformed".to_string()))
 }
 
 /// Registers a new session for `prepared` with the daemon over `conn`.
@@ -903,10 +896,7 @@ fn notify_sessions_using_previous_config(root: &Path) {
     let Ok(runtime) = RuntimeDir::locate() else {
         return;
     };
-    let Ok(mut conn) = admin::Connection::connect(&runtime.socket_path()) else {
-        return;
-    };
-    let Ok(token) = read_admin_token(&runtime) else {
+    let Ok((mut conn, token)) = admin::connect_with_token(&runtime) else {
         return;
     };
     let Ok(DaemonMessage::Sessions { sessions }) =
