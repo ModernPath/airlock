@@ -767,9 +767,15 @@ pub struct DaemonState {
     pub child_registry: ChildRegistry,
     /// `None` for a `Manual` or `Service` daemon, which never idle-exits.
     idle_exit: Option<Duration>,
-    open_connections: AtomicUsize,
-    /// `Some(when it became idle)` while there are no sessions and no open
-    /// connections; `None` while busy.
+    /// Number of `Register` admin requests currently being handled — for a
+    /// lease session, that spans the whole time its connection stays open.
+    /// Idle-exit is based on the session count alone (merely connecting,
+    /// e.g. a polling `airlock status`, must never reset the grace period),
+    /// but a registration in flight is the one case where the session count
+    /// can read 0 while the daemon is plainly not idle.
+    registrations_in_flight: AtomicUsize,
+    /// `Some(when it became idle)` while there are no sessions and no
+    /// registration in flight; `None` while busy.
     idle_since: Mutex<Option<Instant>>,
     pub shutdown: CancellationToken,
     /// The startup `flock` ([`acquire_startup_lock`]), held for the
@@ -799,7 +805,7 @@ impl DaemonState {
             ring_buffer,
             child_registry: ChildRegistry::new(),
             idle_exit,
-            open_connections: AtomicUsize::new(0),
+            registrations_in_flight: AtomicUsize::new(0),
             idle_since: Mutex::new(Some(Instant::now())),
             shutdown: CancellationToken::new(),
             _lock: lock,
@@ -866,13 +872,13 @@ impl DaemonState {
     }
 
     /// Recompute the idle marker. Called whenever the session count or the
-    /// open-connection count might have changed.
+    /// in-flight-registration count might have changed.
     fn note_activity(&self) {
         if self.idle_exit.is_none() {
             return;
         }
         let idle_now =
-            self.sessions.count() == 0 && self.open_connections.load(Ordering::SeqCst) == 0;
+            self.sessions.count() == 0 && self.registrations_in_flight.load(Ordering::SeqCst) == 0;
         let mut marker = self.idle_since.lock().unwrap_or_else(|e| e.into_inner());
         if idle_now {
             if marker.is_none() {
@@ -932,11 +938,7 @@ impl Daemon {
                         Ok((stream, _addr)) => {
                             let state = Arc::clone(&state);
                             tokio::spawn(async move {
-                                state.open_connections.fetch_add(1, Ordering::SeqCst);
-                                state.note_activity();
                                 handle_connection(stream, &state).await;
-                                state.open_connections.fetch_sub(1, Ordering::SeqCst);
-                                state.note_activity();
                             });
                         }
                         Err(e) => {
@@ -1464,6 +1466,22 @@ async fn handle_admin_request(
     }
 }
 
+/// Marks a `Register` in flight for as long as it lives, so idle-exit
+/// cannot fire in the gap between accepting the request and the new
+/// session actually being inserted ([`DaemonState::registrations_in_flight`]).
+/// Guard rather than manual decrements before each of `handle_register`'s
+/// several early returns, so none of them can forget it.
+struct RegistrationGuard<'a>(&'a DaemonState);
+
+impl Drop for RegistrationGuard<'_> {
+    fn drop(&mut self) {
+        self.0
+            .registrations_in_flight
+            .fetch_sub(1, Ordering::SeqCst);
+        self.0.note_activity();
+    }
+}
+
 async fn handle_register(
     reg: protocol::RegisterRequest,
     state: &Arc<DaemonState>,
@@ -1472,6 +1490,14 @@ async fn handle_register(
     mut writer: Writer,
 ) {
     use tokio_stream::StreamExt;
+
+    // Idle-exit looks only at the session count, which can still be 0 here
+    // — the new session isn't inserted until below, and for a lease this
+    // call doesn't return until the lease ends. Held for this call's whole
+    // duration so idle-exit can never fire in that gap.
+    state.registrations_in_flight.fetch_add(1, Ordering::SeqCst);
+    state.note_activity();
+    let _registration_guard = RegistrationGuard(state);
 
     let global_redactor = state.global_redactor_snapshot();
 
