@@ -778,6 +778,7 @@ mod tests {
             sandbox,
             layers: Vec::new(),
             mode: WireMode::Default,
+            write_grants: Vec::new(),
         }
     }
 

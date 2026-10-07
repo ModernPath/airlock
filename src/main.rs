@@ -1209,7 +1209,7 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
                 discover,
                 verbose: false,
                 quiet: true,
-                extra_write_grants: Vec::new(),
+                extra_write_grants: session.write_grants.clone(),
                 cli_kits: Vec::new(),
             },
         ) {

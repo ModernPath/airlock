@@ -68,8 +68,9 @@ pub struct SessionPolicy {
     pub snapshot: std::collections::BTreeMap<String, String>,
     /// The session's filtered `PATH`.
     pub path: FilteredPath,
-    /// Every path a sandboxed tool may write to, for `resolve_binary_in`'s
-    /// project/grant refusal.
+    /// Every path a sandboxed tool or the agent may write to, for
+    /// `resolve_binary_in`'s project/grant refusal. Only ever grows across
+    /// reloads (see [`build_session_policy`]).
     pub write_grants: Vec<PathBuf>,
     /// The anchor paths the launcher validated, echoed back by `Check`.
     pub anchors: WireAnchors,
@@ -154,6 +155,18 @@ pub fn build_session_policy(
     let initial_redactor = build_redactor(&secrets).map_err(|e| e.to_string())?;
     let redactor: RedactorSwap = Arc::new(RwLock::new(Arc::new(initial_redactor)));
 
+    // An agent's sandbox is fixed when it launches, so a reload can take a
+    // write grant away from the config but never from the agent. Keep every
+    // grant the session has ever had, and re-filter `PATH` against them, so
+    // `resolve_binary_in` and tools' `PATH` keep refusing what the agent can
+    // still write — whatever the reloading launcher sent.
+    let mut write_grants = existing.map(|p| p.write_grants.clone()).unwrap_or_default();
+    for grant in &payload.write_grants {
+        if !write_grants.contains(grant) {
+            write_grants.push(grant.clone());
+        }
+    }
+
     let path = FilteredPath {
         entries: payload.path.clone(),
         dropped: payload
@@ -161,7 +174,8 @@ pub fn build_session_policy(
             .iter()
             .map(|d| (d.entry.clone(), d.reason.clone()))
             .collect(),
-    };
+    }
+    .refiltered(&payload.root, &write_grants);
 
     let proxy = if config.tools.values().any(|t| t.proxy.is_some()) {
         let ca_path = runtime.ca_path(session_id.as_str());
@@ -220,7 +234,7 @@ pub fn build_session_policy(
         path: path.clone(),
         cwd: payload.root.clone(),
         root: payload.root.clone(),
-        write_grants: payload.write_grants.clone(),
+        write_grants: write_grants.clone(),
     });
 
     let (refresh_tasks, refresh_shutdown) = refresh::spawn_all_ctx(
@@ -240,7 +254,7 @@ pub fn build_session_policy(
         command_ctx,
         snapshot: payload.env_snapshot.clone(),
         path,
-        write_grants: payload.write_grants.clone(),
+        write_grants,
         anchors: payload.anchors.clone(),
         agent_hash: payload.agent_hash.clone(),
         layers: payload.layers.clone(),
@@ -428,6 +442,7 @@ impl Session {
             sandbox: self.sandbox,
             layers: policy.layers.clone(),
             mode: policy.mode.clone(),
+            write_grants: policy.write_grants.clone(),
         }
     }
 

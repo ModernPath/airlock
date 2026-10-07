@@ -47,7 +47,7 @@ use zeroize::Zeroizing;
 /// value interoperate; the launcher's "incompatible daemon" error compares
 /// this, not the binary version (docs/airlock-v2-technical-guidance.md,
 /// "One protocol version, separate from the binary version").
-pub const PROTOCOL_VERSION: u32 = 2;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// NDJSON line cap for the session family, which comes from a sandboxed,
 /// untrusted client.
@@ -835,6 +835,11 @@ pub struct SessionInfo {
     pub layers: Vec<WireLayer>,
     /// How its root was discovered.
     pub mode: WireMode,
+    /// Every path its tools or agent may write to. Only ever grows: a
+    /// reload passes these back to the launcher, so `PATH` filtering and
+    /// secret-command resolution keep refusing what the agent's sandbox,
+    /// fixed at launch, can still write.
+    pub write_grants: Vec<PathBuf>,
 }
 
 /// How a tool's declared env var is shown in `tools list`: the literal
@@ -1030,7 +1035,7 @@ mod tests {
 
     #[test]
     fn constants_match_the_contract() {
-        assert_eq!(PROTOCOL_VERSION, 2);
+        assert_eq!(PROTOCOL_VERSION, 3);
         assert_eq!(MAX_SESSION_LINE_BYTES, 1024 * 1024);
         assert_eq!(MAX_ADMIN_LINE_BYTES, 16 * 1024 * 1024);
     }
@@ -1634,6 +1639,7 @@ mod tests {
                 sha256: "f".repeat(64),
             }],
             mode: WireMode::Default,
+            write_grants: vec![PathBuf::from("/home/user/.claude")],
         }
     }
 
