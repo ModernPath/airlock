@@ -100,6 +100,13 @@ pub struct ToolPolicy {
     /// for TLS). Without `file-read*` on this path, TLS certificate verification
     /// fails even though `process-exec*` allowed the initial execution.
     ///
+    /// On Linux, this is load-bearing for a different reason: Landlock ties
+    /// execute rights to path coverage, so without an explicit `PathBeneath`
+    /// rule on this exact file, a binary outside the access-level baseline
+    /// and outside `read_paths`/`read_write_paths` (e.g. `~/.cargo/bin/foo`
+    /// under `ToolAccess::None`, or any tool's binary under `None` at all)
+    /// cannot exec. Granted at every access level, same as macOS.
+    ///
     /// Set by the daemon after binary resolution; `None` in unit tests that
     /// don't exercise the full daemon flow.
     pub binary_path: Option<PathBuf>,
@@ -3664,14 +3671,16 @@ pub mod linux {
 
     /// Build a Landlock profile from explicit path lists and a baseline slice.
     ///
-    /// Shared by `LinuxLandlock::build` (tool baseline) and
-    /// `LinuxLandlock::build_agent` (agent baseline + `/usr/sbin`).
-    /// The caller selects the baseline constant; all other logic is identical.
+    /// Shared by `LinuxLandlock::build` (tool baseline, `binary_path: Some`)
+    /// and `LinuxLandlock::build_agent` (agent baseline + `/usr/sbin`,
+    /// `binary_path: None` — `AgentPolicy` has no such field). The caller
+    /// selects the baseline constant; all other logic is identical.
     fn build_landlock_profile(
         baseline: &[&str],
         read_paths: &[std::path::PathBuf],
         read_write_paths: &[std::path::PathBuf],
         network: NetworkAccess,
+        binary_path: Option<&std::path::Path>,
     ) -> Result<SandboxProfile, SandboxError> {
         let abi = ABI::V1;
 
@@ -3719,6 +3728,25 @@ pub mod linux {
         if let NetworkAccess::ProxyOnly(port) = network {
             ruleset = ruleset
                 .add_rule(NetPort::new(port, AccessNet::ConnectTcp))
+                .map_err(to_profile_err)?;
+        }
+
+        // ── The tool's own binary ──────────────────────────────────────────
+        // Granted at every access level, mirroring macOS's unconditional
+        // `(allow file-read* (literal <binary>))`: `access` governs only the
+        // built-in baseline, not a tool's own grants. Landlock ties execute
+        // rights to path coverage, so without this a tool whose binary sits
+        // outside the baseline and outside `read_paths`/`read_write_paths`
+        // (any tool under `ToolAccess::None`; any tool installed to
+        // `~/.cargo/bin`, `~/.local/bin`, etc. at every level) cannot exec at
+        // all. The path is a single file, so `read_access_for_path` already
+        // returns the file-compatible `Execute | ReadFile` subset.
+        if let Some(binary) = binary_path
+            && let Ok(path_fd) = PathFd::new(binary)
+        {
+            let access = read_access_for_path(binary, abi);
+            ruleset = ruleset
+                .add_rule(PathBeneath::new(path_fd, access))
                 .map_err(to_profile_err)?;
         }
 
@@ -3828,6 +3856,7 @@ pub mod linux {
                 &policy.read_paths,
                 &policy.read_write_paths,
                 policy.network,
+                policy.binary_path.as_deref(),
             )
         }
 
@@ -3844,6 +3873,7 @@ pub mod linux {
                 &policy.read_paths,
                 &policy.read_write_paths,
                 NetworkAccess::Full,
+                None,
             )
         }
     }
@@ -4123,23 +4153,17 @@ pub mod linux {
 
         // ── ToolAccess levels (needs a real nested sandbox) ──────────────────
 
-        /// Build a tool profile at `access`, spawn `/bin/sh -c script` under
-        /// it, and return its exit status. `read_paths` stands in for a
-        /// tool's own `extra_read`/binary grant — independent of `access` at
-        /// every level (see `build_tool_policy`) — since Landlock ties
-        /// execute rights to path coverage: without granting `/bin` and
-        /// `/usr/bin` explicitly here, `/bin/sh` itself cannot exec under
-        /// `ToolAccess::None`, whose baseline deliberately excludes them.
-        async fn run_under_access(
-            access: ToolAccess,
-            read_paths: Vec<PathBuf>,
-            script: &str,
-        ) -> std::process::ExitStatus {
+        /// Build a tool profile at `access` with `/bin/sh` as `binary_path`
+        /// (the grant every tool's own binary gets at every level — see
+        /// `ToolPolicy::binary_path`), spawn `/bin/sh -c script` under it,
+        /// and return its exit status.
+        async fn run_under_access(access: ToolAccess, script: &str) -> std::process::ExitStatus {
             let tmp = tempfile::tempdir().unwrap();
+            let sh = std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist");
             let profile = LinuxLandlock
                 .build(&ToolPolicy {
-                    read_paths,
                     access,
+                    binary_path: Some(sh.clone()),
                     network: NetworkAccess::None,
                     ..Default::default()
                 })
@@ -4147,7 +4171,7 @@ pub mod linux {
             let mut env = std::collections::HashMap::new();
             env.insert("PATH".to_string(), "/usr/bin:/bin".to_string());
             let request = crate::exec::ExecRequest {
-                binary: std::fs::canonicalize("/bin/sh").expect("/bin/sh should exist"),
+                binary: sh,
                 arg0: "sh".to_string(),
                 args: vec!["-c".to_string(), script.to_string()],
                 work_dir: std::fs::canonicalize(tmp.path()).unwrap(),
@@ -4161,17 +4185,23 @@ pub mod linux {
 
         #[tokio::test]
         #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
-        async fn tool_access_none_denies_etc() {
-            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
-            let status = run_under_access(
-                ToolAccess::None,
-                shell_dirs,
-                "cat /etc/hosts >/dev/null 2>/dev/null",
-            )
-            .await;
+        async fn tool_access_none_runs_sh_but_denies_etc() {
+            // `exit 0` and the `exec 3<...` redirection below are both shell
+            // builtins — neither forks/execs a second binary — so this
+            // proves the `binary_path` grant on `/bin/sh` alone (no baseline
+            // `/bin` or `/usr/bin` grant, which `ToolAccess::None` doesn't
+            // have) is what lets the tool's own binary exec at all.
+            let ran = run_under_access(ToolAccess::None, "exit 0").await;
             assert!(
-                !status.success(),
-                "reading /etc/hosts must fail under ToolAccess::None, got {status:?}"
+                ran.success(),
+                "sh itself should exec under ToolAccess::None with only binary_path \
+                 granted, got {ran:?}"
+            );
+
+            let denied = run_under_access(ToolAccess::None, "exec 3</etc/hosts").await;
+            assert!(
+                !denied.success(),
+                "reading /etc/hosts must fail under ToolAccess::None, got {denied:?}"
             );
         }
 
@@ -4185,25 +4215,19 @@ pub mod linux {
                 // No toolchain root present on this host — nothing to assert.
                 return;
             };
-            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
 
-            let hosts_status = run_under_access(
-                ToolAccess::System,
-                shell_dirs.clone(),
-                "cat /etc/hosts >/dev/null",
-            )
-            .await;
+            // `cat`/`ls` here are external binaries, covered by the `system`
+            // baseline's `/bin`+`/usr/bin` grants, not by `binary_path`
+            // (which only covers `sh` itself).
+            let hosts_status =
+                run_under_access(ToolAccess::System, "cat /etc/hosts >/dev/null").await;
             assert!(
                 hosts_status.success(),
                 "reading /etc/hosts should succeed under ToolAccess::System, got {hosts_status:?}"
             );
 
-            let listing_status = run_under_access(
-                ToolAccess::System,
-                shell_dirs,
-                &format!("ls {root} >/dev/null"),
-            )
-            .await;
+            let listing_status =
+                run_under_access(ToolAccess::System, &format!("ls {root} >/dev/null")).await;
             assert!(
                 !listing_status.success(),
                 "listing toolchain root {root} must fail under ToolAccess::System, \
@@ -4221,14 +4245,9 @@ pub mod linux {
                 // No toolchain root present on this host — nothing to assert.
                 return;
             };
-            let shell_dirs = vec![PathBuf::from("/bin"), PathBuf::from("/usr/bin")];
 
-            let listing_status = run_under_access(
-                ToolAccess::Default,
-                shell_dirs,
-                &format!("ls {root} >/dev/null"),
-            )
-            .await;
+            let listing_status =
+                run_under_access(ToolAccess::Default, &format!("ls {root} >/dev/null")).await;
             assert!(
                 listing_status.success(),
                 "listing toolchain root {root} should succeed under ToolAccess::Default, \
