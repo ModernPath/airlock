@@ -381,6 +381,7 @@ A project needs `airlock.toml` or `airlock.local.toml` somewhere between the cur
 
 ```toml
 timeout = 120                  # global tool timeout in seconds (default: 300)
+access  = "default"            # default sandbox filesystem baseline for every tool (see below)
 
 [filesystem]                   # paths beyond the baseline, for every tool
 write = ["/tmp"]
@@ -436,11 +437,24 @@ Unknown keys are a config error at every level, in every layer — a typo fails 
 | `extra_read`  | Additional read-only paths. |
 | `extra_write` | Additional read-write paths. |
 | `timeout`     | Per-tool timeout in seconds; overrides the global value. |
+| `access`      | Sandbox filesystem baseline for this tool; overrides the top-level `access`. One of `"none"`, `"system"`, `"default"` — see below. |
 | `override`    | Local layer only. Replaces the repo's tool of the same name whole; a config error if the repo defines no such tool. |
 | `proxy`       | `true` marks a *proxy tool*. See [Proxy tools](#proxy-tools). A proxy tool needs at least one route and may not have secrets in `env`. |
 | `routes`      | `[[tools.<name>.routes]]`. Each route names a host the proxy tool may reach, an optional credential header to attach, and optional `METHOD /path` allow/deny rules. |
 
 > **Only declare purpose-built CLIs as tools.** Never declare shells (`bash`), interpreters (`python`, `node`), or any tool where the agent controls the request. If the agent can script the tool, it can transform secrets past the redactor or upload `/proc/self/environ`. `curl` is the one exception, and only as a [proxy tool](#proxy-tools). A proxy tool never holds a secret, so it has no secret to leak. See [SECURITY.md](SECURITY.md#tool-selection-what-should-and-should-not-be-an-airlock-tool).
+
+#### `access`: how much of the system a tool's sandbox sees
+
+Every tool's sandbox always gets its own binary, the project root (read-write), `[filesystem]`, and its own `extra_read`/`extra_write` — `access` governs only the *built-in* filesystem baseline layered on top of that:
+
+| Level       | Gets |
+|-------------|------|
+| `"none"`    | Just the dynamic linker and shared library cache (so the binary can start) plus `/dev/null`. Nothing else of the system. |
+| `"system"`  | `"none"` plus today's baseline: system libraries, binaries, shared data, and configuration (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,random,urandom}`, ...). |
+| `"default"` | `"system"` plus read-only `/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, and `/home/linuxbrew/.linuxbrew` — the common toolchain install roots. **The default when `access` is unset**, at the top level or per tool. |
+
+Set the top-level `access` to change the project default, or a tool's own `access` to override it for just that tool — a config error names the three valid levels if either is misspelled.
 
 ### Proxy tools
 
@@ -603,7 +617,7 @@ Use the full path: zsh has a `log` builtin that shadows `/usr/bin/log` and fails
 
 Each line names the operation and the path or Mach service it hit — that's what to add to `[filesystem]`, `extra_read`/`extra_write`, or `[agent.filesystem]`.
 
-A tool's sandbox can read the tool's own binary, not the libraries it links from elsewhere. A Nix or Homebrew build that does fails with `dyld: Library not loaded: … (blocked by sandbox)`; add the library's directory, or the whole `/nix/store` or `/opt/homebrew`, to that tool's `extra_read`. Statically linked tools such as `gh` don't need this.
+With the default `access = "default"`, Nix and Homebrew tools work out of the box — their toolchain roots (`/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, `/home/linuxbrew/.linuxbrew`) are already in the baseline. A `dyld: Library not loaded: … (blocked by sandbox)` error now means either that tool (or the top-level default) is set to `access = "none"` or `"system"`, or the library lives outside those roots — add its directory to that tool's `extra_read`. Statically linked tools such as `gh` never hit this.
 
 ## Building
 

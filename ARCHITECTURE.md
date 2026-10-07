@@ -146,7 +146,9 @@ Daemon handler:
     HOME, TERM, USER, TZ, LC_*).
  5. Proxy tools only: bind a loopback proxy listener for this exec, overlay
     the daemon-owned HTTPS_PROXY / CA variables.
- 6. Resolve timeout; build ToolPolicy and SandboxProfile (SBPL / Landlock).
+ 6. Resolve timeout and `access` level (`tools.<name>.access`, else the
+    config's top-level default, else `ToolAccess::Default`); build ToolPolicy
+    and SandboxProfile (SBPL / Landlock).
  7. spawn, register child PID, run the concurrent I/O loop (stdout/stderr
     redacted through the session's own redactor, then the global one; stdin;
     timeout → SIGTERM → SIGKILL), same as v1.
@@ -382,6 +384,10 @@ Register ──▶ Healthy ──(refresh fails)──▶ Stale ──(refresh s
 | Token binding peer info | `LOCAL_PEERPID` / `proc_pidinfo` | `SO_PEERCRED` / `/proc/<pid>/stat` |
 
 On unsupported platforms, the sandbox is a no-op (only `setpgid` in `pre_exec`), but the daemon still functions for development/testing.
+
+### Tool filesystem baseline: `ToolAccess`
+
+A tool's `ToolPolicy` carries an `access` level ([src/sandbox.rs](src/sandbox.rs)) that governs only the built-in filesystem baseline layered under a tool's own grants (project root, `[filesystem]`, `extra_read`/`extra_write`, its own binary, a proxy tool's CA) — `None` is the bare minimum to exec and exit (the dynamic linker, the shared library cache, `/dev/null`), `System` is the fixed baseline every tool got before `access` existed, and `Default` (the fallback when config sets nothing) adds the read-only toolchain roots in `TOOLCHAIN_ROOTS`. The agent's own `AgentPolicy` has no `access` field; it always gets the `None` + `System` baseline unconditionally, same as before. See [README.md](README.md#access-how-much-of-the-system-a-tools-sandbox-sees) for the config surface and [SECURITY.md](SECURITY.md) for the tradeoffs of each level.
 
 ## Dependencies
 

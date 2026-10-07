@@ -38,6 +38,11 @@ source = "env"
 description = "GitHub CLI"
 extra_read = ["~/.config/gh"]
 timeout = 60
+# `gh` is statically linked, so it never needs the toolchain roots
+# `access = "default"` (the project-wide default) adds — `"system"` or even
+# `"none"` works just as well here. A tool built by Nix or Homebrew usually
+# needs the default; see README.md's `access` section.
+access = "system"
 
 [tools.gh.env]
 GH_TOKEN = { secret = "GH_TOKEN" }
