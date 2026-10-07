@@ -14,12 +14,12 @@
 //! rules this module implements, and "Messages → Launcher" in
 //! `docs/airlock-v2-ux.md` for the exact wording of the errors below.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    self, ConfigError, RawConfig, RawEnvValue, RawSecretRef, RawSecretSpec, RawToolConfig,
-    SecretSource,
+    self, ConfigError, RawConfig, RawEnvValue, RawKitConfig, RawSecretRef, RawSecretSpec,
+    RawToolConfig, SecretSource,
 };
 
 // ─── Discovery ──────────────────────────────────────────────────────────────
@@ -275,6 +275,9 @@ pub struct SettingsProvenance {
     pub filesystem_write: Vec<(String, LayerKind)>,
     pub agent_passthrough_env: Vec<(String, LayerKind)>,
     pub agent_env: HashMap<String, AgentEnvProvenance>,
+    /// `(kit name, layer)` for each name first added to `agent.kits`, in
+    /// the order it appeared.
+    pub agent_kits: Vec<(String, LayerKind)>,
 }
 
 /// Provenance recorded during [`merge`], kept for `airlock config` and the
@@ -284,6 +287,8 @@ pub struct Provenance {
     pub tools: HashMap<String, ToolProvenance>,
     pub secrets: HashMap<String, SecretProvenance>,
     pub settings: SettingsProvenance,
+    /// Which layer's `[kits.<name>]` table won, by kit name.
+    pub kits: HashMap<String, LayerKind>,
 }
 
 /// The result of merging a project's layers: a wire-ready [`RawConfig`] plus
@@ -294,6 +299,7 @@ pub struct MergedConfig {
     root: PathBuf,
     tool_state_dirs: Vec<PathBuf>,
     provenance: Provenance,
+    kits: BTreeMap<String, RawKitConfig>,
 }
 
 impl MergedConfig {
@@ -318,6 +324,13 @@ impl MergedConfig {
 
     pub fn provenance(&self) -> &Provenance {
         &self.provenance
+    }
+
+    /// The merged `[kits.<name>]` tables (global/local only; local wins by
+    /// name). Launcher-only — never part of [`Self::to_wire`]. See
+    /// [`crate::kits`].
+    pub fn kits(&self) -> &BTreeMap<String, RawKitConfig> {
+        &self.kits
     }
 }
 
@@ -661,6 +674,11 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 file: file.to_path_buf(),
             });
         }
+        if repo.kits.is_some() {
+            return Err(ConfigError::KitsInRepo {
+                file: file.to_path_buf(),
+            });
+        }
         if let Some(tools) = &repo.tools {
             for (name, t) in tools {
                 if t.r#override {
@@ -699,6 +717,12 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
             check_global_paths_absolute(file, &fs.read)?;
             check_global_paths_absolute(file, &fs.write)?;
         }
+        if let Some(kits) = &global.kits {
+            for def in kits.values() {
+                check_global_paths_absolute(file, &def.read)?;
+                check_global_paths_absolute(file, &def.write)?;
+            }
+        }
     }
 
     // ── Home-root guard ──────────────────────────────────────────────────
@@ -712,6 +736,28 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         return Err(ConfigError::HomeRootNotAllowed {
             home: ctx.root.clone(),
         });
+    }
+
+    // ── Kits: global/local `[kits.<name>]` tables, local overriding global
+    //    whole, by name ────────────────────────────────────────────────────
+    // (The repo layer is already refused above.) Table-shape validation
+    // (built-in vs. user-defined field restrictions, {tool_state}, env var
+    // names) and resolving `agent.kits` into an active list happen later, in
+    // crate::kits, called from crate::launcher::prepare — this only needs
+    // to merge the raw tables and record which layer each came from.
+    let mut kits: BTreeMap<String, RawKitConfig> = BTreeMap::new();
+    let mut kit_provenance: HashMap<String, LayerKind> = HashMap::new();
+    if let Some(global) = global_raw.as_ref().and_then(|c| c.kits.as_ref()) {
+        for (name, def) in global {
+            kits.insert(name.clone(), def.clone());
+            kit_provenance.insert(name.clone(), LayerKind::Global);
+        }
+    }
+    if let Some(local) = local_raw.as_ref().and_then(|c| c.kits.as_ref()) {
+        for (name, def) in local {
+            kits.insert(name.clone(), def.clone());
+            kit_provenance.insert(name.clone(), LayerKind::Local);
+        }
     }
 
     // ── Secret classification and the unbound-labels check ──────────────
@@ -973,120 +1019,136 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         Option<config::RawAgentConfig>,
         Vec<(String, LayerKind)>,
         HashMap<String, AgentEnvProvenance>,
+        Vec<(String, LayerKind)>,
     );
 
     let any_agent = layered_agents.iter().any(|(_, a)| a.is_some());
-    let (agent, passthrough_env_prov, agent_env_prov): AgentMergeResult = if !any_agent {
-        (None, Vec::new(), HashMap::new())
-    } else {
-        let mut timeout: Option<u64> = None;
-        let mut passthrough_env: Vec<String> = Vec::new();
-        let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
-        let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
-        // Every layer (in merge order) that set a given `agent.env` key, so
-        // the winner (last) and what it overrode (the one before it, if
-        // any) can both be reported — `airlock config`'s `local (overrides
-        // repo)` annotation.
-        let mut env_history: HashMap<String, Vec<LayerKind>> = HashMap::new();
-        let mut fs_read: Vec<String> = Vec::new();
-        let mut fs_write: Vec<String> = Vec::new();
+    let (agent, passthrough_env_prov, agent_env_prov, agent_kits_prov): AgentMergeResult =
+        if !any_agent {
+            (None, Vec::new(), HashMap::new(), Vec::new())
+        } else {
+            let mut timeout: Option<u64> = None;
+            let mut passthrough_env: Vec<String> = Vec::new();
+            let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
+            let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
+            // Every layer (in merge order) that set a given `agent.env` key, so
+            // the winner (last) and what it overrode (the one before it, if
+            // any) can both be reported — `airlock config`'s `local (overrides
+            // repo)` annotation.
+            let mut env_history: HashMap<String, Vec<LayerKind>> = HashMap::new();
+            let mut fs_read: Vec<String> = Vec::new();
+            let mut fs_write: Vec<String> = Vec::new();
+            let mut agent_kits: Vec<String> = Vec::new();
+            let mut agent_kits_prov: Vec<(String, LayerKind)> = Vec::new();
 
-        for (kind, agent_cfg) in &layered_agents {
-            let Some(a) = agent_cfg else { continue };
-            if a.timeout.is_some() {
-                timeout = a.timeout;
-            }
-            for v in &a.passthrough_env {
-                if !passthrough_env.contains(v) {
-                    passthrough_env.push(v.clone());
-                    passthrough_env_prov.push((v.clone(), *kind));
+            for (kind, agent_cfg) in &layered_agents {
+                let Some(a) = agent_cfg else { continue };
+                if a.timeout.is_some() {
+                    timeout = a.timeout;
                 }
-            }
-            for (k, v) in &a.env {
-                env_by_key.insert(k.clone(), (*kind, v.clone()));
-                env_history.entry(k.clone()).or_default().push(*kind);
-            }
-            if let Some(fs) = &a.filesystem {
-                for p in resolve_path_list(&fs.read, ctx) {
-                    if !fs_read.contains(&p) {
-                        fs_read.push(p);
+                for v in &a.passthrough_env {
+                    if !passthrough_env.contains(v) {
+                        passthrough_env.push(v.clone());
+                        passthrough_env_prov.push((v.clone(), *kind));
                     }
                 }
-                for p in resolve_path_list(&fs.write, ctx) {
-                    if !fs_write.contains(&p) {
-                        fs_write.push(p);
+                for (k, v) in &a.env {
+                    env_by_key.insert(k.clone(), (*kind, v.clone()));
+                    env_history.entry(k.clone()).or_default().push(*kind);
+                }
+                if let Some(fs) = &a.filesystem {
+                    for p in resolve_path_list(&fs.read, ctx) {
+                        if !fs_read.contains(&p) {
+                            fs_read.push(p);
+                        }
+                    }
+                    for p in resolve_path_list(&fs.write, ctx) {
+                        if !fs_write.contains(&p) {
+                            fs_write.push(p);
+                        }
+                    }
+                }
+                // Any layer; union across layers (same rule as
+                // passthrough_env) — see "Merge rules" in the v2 design.
+                for k in &a.kits {
+                    if !agent_kits.contains(k) {
+                        agent_kits.push(k.clone());
+                        agent_kits_prov.push((k.clone(), *kind));
                     }
                 }
             }
-        }
 
-        let agent_env_prov: HashMap<String, AgentEnvProvenance> = env_history
-            .into_iter()
-            .map(|(key, layers_seen)| {
-                let winner = *layers_seen.last().expect("push always precedes a read");
-                let overrides = (layers_seen.len() > 1).then(|| layers_seen[layers_seen.len() - 2]);
-                (
-                    key,
-                    AgentEnvProvenance {
-                        layer: winner,
-                        overrides,
+            let agent_env_prov: HashMap<String, AgentEnvProvenance> = env_history
+                .into_iter()
+                .map(|(key, layers_seen)| {
+                    let winner = *layers_seen.last().expect("push always precedes a read");
+                    let overrides =
+                        (layers_seen.len() > 1).then(|| layers_seen[layers_seen.len() - 2]);
+                    (
+                        key,
+                        AgentEnvProvenance {
+                            layer: winner,
+                            overrides,
+                        },
+                    )
+                })
+                .collect();
+
+            let mut final_env: HashMap<String, RawEnvValue> =
+                HashMap::with_capacity(env_by_key.len());
+            for (key, (kind, value)) in env_by_key {
+                let scope = match kind {
+                    LayerKind::Global => RefScope::Global {
+                        file: global_file.unwrap(),
                     },
-                )
-            })
-            .collect();
+                    LayerKind::Local => RefScope::Local,
+                    LayerKind::Repo | LayerKind::ConfigFile => RefScope::RepoLike {
+                        file: repo_file.unwrap(),
+                    },
+                };
+                let pool = match kind {
+                    LayerKind::Global => &global_pool,
+                    LayerKind::Local => &combined_for_local,
+                    LayerKind::Repo | LayerKind::ConfigFile => &repo_pool,
+                };
+                let mut single = HashMap::with_capacity(1);
+                single.insert(key.clone(), value);
+                let resolved = resolve_env_table(
+                    "agent",
+                    single,
+                    scope,
+                    ctx,
+                    &project_id,
+                    pool,
+                    &global_pool,
+                    false,
+                    &mut tool_state_dirs,
+                    &mut referenced_global_labels,
+                    &mut undeclared_refs,
+                )?;
+                final_env.extend(resolved);
+            }
 
-        let mut final_env: HashMap<String, RawEnvValue> = HashMap::with_capacity(env_by_key.len());
-        for (key, (kind, value)) in env_by_key {
-            let scope = match kind {
-                LayerKind::Global => RefScope::Global {
-                    file: global_file.unwrap(),
-                },
-                LayerKind::Local => RefScope::Local,
-                LayerKind::Repo | LayerKind::ConfigFile => RefScope::RepoLike {
-                    file: repo_file.unwrap(),
-                },
-            };
-            let pool = match kind {
-                LayerKind::Global => &global_pool,
-                LayerKind::Local => &combined_for_local,
-                LayerKind::Repo | LayerKind::ConfigFile => &repo_pool,
-            };
-            let mut single = HashMap::with_capacity(1);
-            single.insert(key.clone(), value);
-            let resolved = resolve_env_table(
-                "agent",
-                single,
-                scope,
-                ctx,
-                &project_id,
-                pool,
-                &global_pool,
-                false,
-                &mut tool_state_dirs,
-                &mut referenced_global_labels,
-                &mut undeclared_refs,
-            )?;
-            final_env.extend(resolved);
-        }
-
-        (
-            Some(config::RawAgentConfig {
-                timeout,
-                passthrough_env,
-                env: final_env,
-                filesystem: if fs_read.is_empty() && fs_write.is_empty() {
-                    None
-                } else {
-                    Some(config::RawAgentFilesystem {
-                        read: fs_read,
-                        write: fs_write,
-                    })
-                },
-            }),
-            passthrough_env_prov,
-            agent_env_prov,
-        )
-    };
+            (
+                Some(config::RawAgentConfig {
+                    timeout,
+                    passthrough_env,
+                    env: final_env,
+                    filesystem: if fs_read.is_empty() && fs_write.is_empty() {
+                        None
+                    } else {
+                        Some(config::RawAgentFilesystem {
+                            read: fs_read,
+                            write: fs_write,
+                        })
+                    },
+                    kits: agent_kits,
+                }),
+                passthrough_env_prov,
+                agent_env_prov,
+                agent_kits_prov,
+            )
+        };
 
     if !undeclared_refs.is_empty() {
         return Err(ConfigError::UndeclaredSecretRefs {
@@ -1198,6 +1260,8 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
         },
         agent,
         allow_home_root: None,
+        // Launcher-only (crate::kits); never sent to the daemon.
+        kits: None,
     };
 
     Ok(MergedConfig {
@@ -1213,8 +1277,11 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 filesystem_write: fs_write_prov,
                 agent_passthrough_env: passthrough_env_prov,
                 agent_env: agent_env_prov,
+                agent_kits: agent_kits_prov,
             },
+            kits: kit_provenance,
         },
+        kits,
     })
 }
 
@@ -1819,6 +1886,121 @@ LOG_LEVEL = "debug"
         let log_level = settings.agent_env.get("LOG_LEVEL").unwrap();
         assert_eq!(log_level.layer, LayerKind::Local);
         assert_eq!(log_level.overrides, Some(LayerKind::Repo));
+    }
+
+    // ── Kits ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn merge_kits_in_repo_layer_errors() {
+        let tmp = tempdir().unwrap();
+        write(
+            tmp.path(),
+            "airlock.toml",
+            "[kits.rust]\nmode = \"shared\"\n",
+        );
+        let layers = load_default(tmp.path(), tmp.path()).unwrap();
+        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        assert!(matches!(err, ConfigError::KitsInRepo { .. }));
+    }
+
+    #[test]
+    fn merge_kits_in_local_layer_is_allowed_and_not_on_the_wire() {
+        let tmp = tempdir().unwrap();
+        write(tmp.path(), "airlock.toml", "[tools.t]\n");
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[kits.rust]\nmode = \"shared\"\n",
+        );
+        let layers = load_default(tmp.path(), tmp.path()).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        assert_eq!(
+            merged.kits().get("rust").and_then(|d| d.mode.as_deref()),
+            Some("shared")
+        );
+        assert!(merged.provenance().kits.get("rust").copied() == Some(LayerKind::Local));
+        // The wire RawConfig sent to the daemon never carries [kits.*].
+        assert!(merged.to_wire().kits.is_none());
+    }
+
+    #[test]
+    fn merge_kits_in_global_layer_is_allowed() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "[kits.go]\nmode = \"shared\"\n").unwrap();
+        write(tmp.path(), "airlock.toml", "[tools.t]\n");
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        assert_eq!(
+            merged.kits().get("go").and_then(|d| d.mode.as_deref()),
+            Some("shared")
+        );
+        assert_eq!(
+            merged.provenance().kits.get("go").copied(),
+            Some(LayerKind::Global)
+        );
+    }
+
+    #[test]
+    fn merge_local_kit_table_overrides_global_whole() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "[kits.rust]\nmode = \"shared\"\n").unwrap();
+        write(tmp.path(), "airlock.toml", "[tools.t]\n");
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[kits.rust]\nmode = \"isolated\"\n",
+        );
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        assert_eq!(
+            merged.kits().get("rust").and_then(|d| d.mode.as_deref()),
+            Some("isolated")
+        );
+        assert_eq!(
+            merged.provenance().kits.get("rust").copied(),
+            Some(LayerKind::Local)
+        );
+    }
+
+    #[test]
+    fn merge_global_kit_relative_path_errors() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "[kits.bazel]\nread = [\"relative\"]\n").unwrap();
+        write(tmp.path(), "airlock.toml", "[tools.t]\n");
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        assert!(matches!(err, ConfigError::RelativePathInGlobal { .. }));
+    }
+
+    #[test]
+    fn merge_agent_kits_unions_across_layers_and_records_provenance() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "[agent]\nkits = [\"rust\"]\n").unwrap();
+        write(tmp.path(), "airlock.toml", "[agent]\nkits = [\"node\"]\n");
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[agent]\nkits = [\"rust\", \"go\"]\n",
+        );
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let wire = merged.to_wire();
+        assert_eq!(
+            wire.agent.unwrap().kits,
+            vec!["rust".to_string(), "node".to_string(), "go".to_string()]
+        );
+        assert_eq!(
+            merged.provenance().settings.agent_kits,
+            vec![
+                ("rust".to_string(), LayerKind::Global),
+                ("node".to_string(), LayerKind::Repo),
+                ("go".to_string(), LayerKind::Local),
+            ]
+        );
     }
 
     // ── Wire round trip ───────────────────────────────────────────────
