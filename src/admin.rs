@@ -152,8 +152,15 @@ impl Connection {
     /// Lease }` session: the launcher keeps this connection open for the
     /// lifetime of the agent, and a watcher thread blocks on it for EOF
     /// (the daemon closing it means the session ended).
-    pub fn into_raw(self) -> UnixStream {
-        self.reader.into_inner()
+    ///
+    /// Clears the request timeouts set by [`Connection::connect`]: the
+    /// watcher's read must block for as long as the agent runs, and a
+    /// timed-out read would end the lease.
+    pub fn into_raw(self) -> Result<UnixStream, AdminError> {
+        let stream = self.reader.into_inner();
+        stream.set_read_timeout(None)?;
+        stream.set_write_timeout(None)?;
+        Ok(stream)
     }
 }
 
@@ -247,6 +254,21 @@ mod tests {
         assert_eq!(conn.hello.sessions, 1);
 
         drop(conn);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn into_raw_clears_the_request_timeouts() {
+        let dir = tempdir();
+        let socket_path = dir.path().join("airlock.sock");
+        let handle = fake_daemon(socket_path.clone(), ok_hello(), DaemonMessage::Ok);
+
+        let conn = Connection::connect(&socket_path).unwrap();
+        let stream = conn.into_raw().unwrap();
+        assert_eq!(stream.read_timeout().unwrap(), None);
+        assert_eq!(stream.write_timeout().unwrap(), None);
+
+        drop(stream);
         let _ = handle.join();
     }
 
