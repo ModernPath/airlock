@@ -16,6 +16,7 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use crate::config::{self, RawEnvValue, RawSecretSpec};
+use crate::kits;
 use crate::layers::{
     self, AgentEnvProvenance, DiscoveryMode, LoadedLayers, MergeContext, MergedConfig,
     SecretProvenance,
@@ -243,6 +244,24 @@ pub enum SettingRow {
     },
 }
 
+/// One `kits` row: a single active kit (`agent.kits`, from any layer, plus
+/// `--kit`, though `airlock config` only ever sees the config-declared
+/// ones), fully expanded — the same expansion `airlock run` uses.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KitRow {
+    pub name: String,
+    /// Where `agent.kits` first named it, or where its `[kits.<name>]`
+    /// table lives, whichever this kit has.
+    pub layer_text: String,
+    /// `"isolated"`/`"shared"` for a built-in kit, empty for a user-defined
+    /// one (no mode concept).
+    pub mode: String,
+    pub read: Vec<String>,
+    pub write: Vec<String>,
+    /// `(VAR, VALUE)` pairs, in a stable order.
+    pub env: Vec<(String, String)>,
+}
+
 /// Everything `render_config` needs. Built by [`config_cmd`] from a
 /// [`LoadedLayers`], a [`MergedConfig`] and the layers' approval state —
 /// kept as its own type so the renderer itself touches none of those types
@@ -253,6 +272,7 @@ pub struct ConfigReport {
     pub secrets: Vec<SecretRow>,
     pub tools: Vec<ToolRow>,
     pub settings: Vec<SettingRow>,
+    pub kits: Vec<KitRow>,
     /// Trailing notes, one per unapproved repo/local file, e.g.
     /// `"airlock.local.toml changed since you trusted it; the next session
     /// start asks about it."`.
@@ -324,6 +344,48 @@ pub fn render_config(report: &ConfigReport) -> String {
         out.push('\n');
         out.push_str("settings\n");
         out.push_str(&render_settings_rows(&report.settings));
+    }
+
+    if !report.kits.is_empty() {
+        out.push('\n');
+        out.push_str("kits\n");
+        let rows: Vec<Vec<String>> = report
+            .kits
+            .iter()
+            .map(|k| {
+                let env = k
+                    .env
+                    .iter()
+                    .map(|(var, val)| format!("{}={}", esc(var), esc(val)))
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let paths = format!(
+                    "read: {}; write: {}",
+                    if k.read.is_empty() {
+                        "-".to_string()
+                    } else {
+                        k.read.iter().map(|p| esc(p)).collect::<Vec<_>>().join(", ")
+                    },
+                    if k.write.is_empty() {
+                        "-".to_string()
+                    } else {
+                        k.write
+                            .iter()
+                            .map(|p| esc(p))
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    },
+                );
+                vec![
+                    format!("  {}", esc(&k.name)),
+                    k.layer_text.clone(),
+                    esc(&k.mode),
+                    paths,
+                    env,
+                ]
+            })
+            .collect();
+        out.push_str(&table(&rows));
     }
 
     for note in &report.notes {
@@ -614,6 +676,9 @@ fn build_config_report(merged: &MergedConfig, layer_rows: &[LayerRow]) -> Config
         secrets,
         tools,
         settings,
+        // Filled in separately by config_cmd (build_kit_rows), which needs
+        // inputs (home, env snapshot, platform) this function does not take.
+        kits: Vec::new(),
         notes,
     }
 }
@@ -637,6 +702,7 @@ pub fn config_cmd(
     home: &Path,
     global_config_path: &Path,
     tool_state_base: &Path,
+    env_snapshot: &std::collections::BTreeMap<String, String>,
     paths: &ConfigPaths,
     in_sandbox: bool,
     out: &mut dyn Write,
@@ -689,7 +755,15 @@ pub fn config_cmd(
     };
     match layers::merge(&loaded, &ctx) {
         Ok(merged) => {
-            let report = build_config_report(&merged, &layer_rows);
+            let mut report = build_config_report(&merged, &layer_rows);
+            match build_kit_rows(&merged, home, tool_state_base, env_snapshot) {
+                Ok(kits) => report.kits = kits,
+                Err(e) => {
+                    write!(out, "{}", render_config(&report)).ok();
+                    writeln!(out, "error: {e}").ok();
+                    return ExitCode::from(125);
+                }
+            }
             write!(out, "{}", render_config(&report)).ok();
             ExitCode::SUCCESS
         }
@@ -703,6 +777,82 @@ pub fn config_cmd(
             ExitCode::from(125)
         }
     }
+}
+
+/// Builds the `kits` section: every active kit (`agent.kits`, unioned
+/// across layers by `layers::merge`), fully expanded exactly like `airlock
+/// run` would expand it — same inputs, same [`kits::expand_all`]. Each kit
+/// is expanded on its own (rather than once for the whole active list) so
+/// each row shows only its own paths/env.
+fn build_kit_rows(
+    merged: &MergedConfig,
+    home: &Path,
+    tool_state_base: &Path,
+    env_snapshot: &std::collections::BTreeMap<String, String>,
+) -> Result<Vec<KitRow>, config::ConfigError> {
+    let raw_config = merged.to_wire();
+    kits::validate_all(merged.kits())?;
+    let active = kits::resolve_active(&raw_config, &[], merged.kits())?;
+    kits::check_env_collision(raw_config.agent.as_ref(), &active, merged.kits())?;
+
+    let project_id = config::project_id(merged.root());
+    let mut rows = Vec::with_capacity(active.len());
+    for name in &active {
+        let inputs = kits::Inputs {
+            home,
+            env: env_snapshot,
+            platform: kits::Platform::current(),
+            project_id: &project_id,
+            tool_state_base,
+            root: merged.root(),
+        };
+        let expanded = kits::expand_all(std::slice::from_ref(name), merged.kits(), &inputs)?;
+        let mode = expanded
+            .active
+            .first()
+            .and_then(|(_, m)| *m)
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default();
+        let layer_text = match merged.provenance().kits.get(name) {
+            Some(kind) => layer_label(*kind).to_string(),
+            None => merged
+                .provenance()
+                .settings
+                .agent_kits
+                .iter()
+                .find(|(k, _)| k == name)
+                .map(|(_, kind)| layer_label(*kind).to_string())
+                .unwrap_or_default(),
+        };
+        let mut read: Vec<String> = expanded
+            .read
+            .iter()
+            .map(|p| display_path(p, home))
+            .collect();
+        read.sort();
+        let mut write: Vec<String> = expanded
+            .write
+            .iter()
+            .map(|p| display_path(p, home))
+            .collect();
+        write.extend(expanded.write_files.iter().map(|p| display_path(p, home)));
+        write.sort();
+        let mut env: Vec<(String, String)> = expanded
+            .env
+            .iter()
+            .map(|(k, v)| (k.clone(), display_path(Path::new(v), home)))
+            .collect();
+        env.sort();
+        rows.push(KitRow {
+            name: name.clone(),
+            layer_text,
+            mode,
+            read,
+            write,
+            env,
+        });
+    }
+    Ok(rows)
 }
 
 // ─── `airlock status` ───────────────────────────────────────────────────────
@@ -1366,6 +1516,7 @@ mod tests {
                     unapproved: true,
                 },
             ],
+            kits: vec![],
             notes: vec![
                 "airlock.local.toml changed since you trusted it; the next session start asks about it.".to_string(),
             ],
@@ -1878,5 +2029,99 @@ mod tests {
             render_git_ignore_note(Some(false)),
             "warning: airlock.local.toml is not ignored by git. To ignore it in every repo:\n         echo airlock.local.toml >> ~/.config/git/ignore\n"
         );
+    }
+
+    // ── build_kit_rows ────────────────────────────────────────────────
+
+    fn merge_for(root: &Path, home: &Path, tool_state_base: &Path) -> MergedConfig {
+        let no_global = home.join("no-such-global.toml");
+        let loaded = layers::load_layers(&DiscoveryMode::Default, root, home, &no_global).unwrap();
+        let ctx = MergeContext {
+            root: loaded.root.clone(),
+            home: home.to_path_buf(),
+            tool_state_base: tool_state_base.to_path_buf(),
+        };
+        layers::merge(&loaded, &ctx).unwrap()
+    }
+
+    #[test]
+    fn build_kit_rows_shows_isolated_builtin_env_and_layer() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("airlock.toml"), "[agent]\nkits = [\"rust\"]\n").unwrap();
+        let tool_state_base = tmp.path().join("cache/airlock");
+
+        let merged = merge_for(&project, &home, &tool_state_base);
+        let rows = build_kit_rows(
+            &merged,
+            &home,
+            &tool_state_base,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let rust = &rows[0];
+        assert_eq!(rust.name, "rust");
+        assert_eq!(rust.layer_text, "repo");
+        assert_eq!(rust.mode, "isolated");
+        assert!(rust.env.iter().any(|(k, _)| k == "CARGO_HOME"));
+        assert!(rust.read.iter().any(|p| p.ends_with(".cargo/bin")));
+    }
+
+    #[test]
+    fn build_kit_rows_shows_shared_builtin_with_no_env() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("airlock.toml"), "[agent]\nkits = [\"go\"]\n").unwrap();
+        std::fs::write(
+            project.join("airlock.local.toml"),
+            "[kits.go]\nmode = \"shared\"\n",
+        )
+        .unwrap();
+        let tool_state_base = tmp.path().join("cache/airlock");
+
+        let merged = merge_for(&project, &home, &tool_state_base);
+        let rows = build_kit_rows(
+            &merged,
+            &home,
+            &tool_state_base,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap();
+
+        assert_eq!(rows.len(), 1);
+        let go = &rows[0];
+        assert_eq!(go.mode, "shared");
+        assert!(go.env.is_empty());
+        assert_eq!(go.layer_text, "local");
+        assert!(go.write.iter().any(|p| p.ends_with("pkg/mod")));
+    }
+
+    #[test]
+    fn build_kit_rows_surfaces_unknown_kit_as_an_error() {
+        let tmp = tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("airlock.toml"), "[agent]\nkits = [\"nope\"]\n").unwrap();
+        let tool_state_base = tmp.path().join("cache/airlock");
+
+        let merged = merge_for(&project, &home, &tool_state_base);
+        let err = build_kit_rows(
+            &merged,
+            &home,
+            &tool_state_base,
+            &std::collections::BTreeMap::new(),
+        )
+        .unwrap_err();
+        assert!(matches!(err, config::ConfigError::UnknownKit { .. }));
     }
 }
