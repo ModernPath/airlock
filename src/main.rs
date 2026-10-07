@@ -70,6 +70,10 @@ enum Commands {
         allow_write: Vec<PathBuf>,
         #[arg(long = "passthrough-env", value_name = "VAR", action = clap::ArgAction::Append)]
         passthrough_env: Vec<String>,
+        /// Add a kit (built-in or user-defined) to the agent sandbox,
+        /// additive to `agent.kits`. Repeatable.
+        #[arg(long = "kit", value_name = "NAME", action = clap::ArgAction::Append)]
+        kits: Vec<String>,
         #[arg(long)]
         name: Option<String>,
         #[arg(long)]
@@ -531,6 +535,7 @@ fn main() -> ExitCode {
             allow_read,
             allow_write,
             passthrough_env,
+            kits,
             name,
             no_session,
             config,
@@ -545,6 +550,7 @@ fn main() -> ExitCode {
                 allow_read,
                 allow_write,
                 passthrough_env,
+                kits,
                 name,
                 no_session,
                 discover: discover_opts(config, no_project_config),
@@ -690,6 +696,7 @@ fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> 
         tool_state_base: anchors.tool_state_base.clone(),
     };
 
+    let env_snapshot: std::collections::BTreeMap<String, String> = std::env::vars().collect();
     let mut stdout = std::io::stdout();
     inspect::config_cmd(
         &opts,
@@ -697,6 +704,7 @@ fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> 
         &home,
         &anchors.global_config,
         &anchors.tool_state_base,
+        &env_snapshot,
         &paths_report,
         in_sandbox(),
         &mut stdout,
@@ -935,6 +943,7 @@ fn cmd_session_start(
             verbose: false,
             quiet,
             extra_write_grants: Vec::new(),
+            cli_kits: Vec::new(),
         },
     ) {
         Ok(p) => p,
@@ -1198,6 +1207,7 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
                 verbose: false,
                 quiet: true,
                 extra_write_grants: Vec::new(),
+                cli_kits: Vec::new(),
             },
         ) {
             Ok(p) => p,
