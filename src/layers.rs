@@ -18,7 +18,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::config::{
-    self, ConfigError, RawConfig, RawEnvValue, RawKitConfig, RawSecretRef, RawSecretSpec,
+    self, ConfigError, EnvOwner, RawConfig, RawEnvValue, RawKitConfig, RawSecretRef, RawSecretSpec,
     RawToolConfig, SecretSource,
 };
 
@@ -532,7 +532,7 @@ enum RefScope<'a> {
 /// the wire) and any new `{tool_state}` directories it introduced.
 #[allow(clippy::too_many_arguments)]
 fn resolve_env_table(
-    item: &str,
+    owner: EnvOwner<'_>,
     raw_env: HashMap<String, RawEnvValue>,
     scope: RefScope<'_>,
     ctx: &MergeContext,
@@ -544,20 +544,10 @@ fn resolve_env_table(
     referenced_global_labels: &mut std::collections::HashSet<String>,
     undeclared_refs: &mut Vec<(String, String, String)>,
 ) -> Result<HashMap<String, RawEnvValue>, ConfigError> {
+    let item = owner.item();
     let mut out = HashMap::with_capacity(raw_env.len());
     for (var_name, raw_value) in raw_env {
-        if !config::is_valid_env_var_name(&var_name) {
-            return Err(ConfigError::InvalidEnvVarName {
-                tool: item.to_string(),
-                name: var_name,
-            });
-        }
-        if is_proxy_tool && crate::proxy::is_reserved_env_var(&var_name) {
-            return Err(ConfigError::ProxyReservedEnvVar {
-                tool: item.to_string(),
-                var_name,
-            });
-        }
+        config::check_env_entry(owner, &var_name, &raw_value, is_proxy_tool)?;
         let value = match raw_value {
             RawEnvValue::Static(s) => {
                 let tool_state_dir = if config::uses_tool_state_placeholder(&s) {
@@ -582,12 +572,6 @@ fn resolve_env_table(
                 RawEnvValue::Static(rendered)
             }
             RawEnvValue::SecretRef(RawSecretRef { secret }) => {
-                if is_proxy_tool {
-                    return Err(ConfigError::ProxyToolSecretEnv {
-                        tool: item.to_string(),
-                        var_name,
-                    });
-                }
                 if !pool.contains_key(&secret) {
                     match scope {
                         RefScope::Global { file } => {
@@ -606,7 +590,7 @@ fn resolve_env_table(
                         }
                         RefScope::Local => {
                             undeclared_refs.push((
-                                item.to_string(),
+                                owner.location(),
                                 var_name.clone(),
                                 secret.clone(),
                             ));
@@ -947,7 +931,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
 
         let raw_env = winning.env.clone().unwrap_or_default();
         let env = resolve_env_table(
-            name,
+            EnvOwner::Tool(name),
             raw_env,
             scope,
             ctx,
@@ -1116,7 +1100,7 @@ pub fn merge(layers: &LoadedLayers, ctx: &MergeContext) -> Result<MergedConfig, 
                 let mut single = HashMap::with_capacity(1);
                 single.insert(key.clone(), value);
                 let resolved = resolve_env_table(
-                    "agent",
+                    EnvOwner::Agent,
                     single,
                     scope,
                     ctx,
@@ -1377,6 +1361,21 @@ mod tests {
     }
 
     // ── Discovery ─────────────────────────────────────────────────────
+
+    #[test]
+    fn undeclared_ref_names_the_same_location_as_the_daemon() {
+        let tmp = tempdir().unwrap();
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[tools.gh.env]\nGH_TOKEN = { secret = \"ghost\" }\n\n[agent.env]\nX = { secret = \"ghost\" }\n",
+        );
+        let layers = load_default(tmp.path(), tmp.path()).unwrap();
+        let err = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("[tools.gh.env.GH_TOKEN]"), "{message}");
+        assert!(message.contains("[agent.env.X]"), "{message}");
+    }
 
     #[test]
     fn discover_repo_only() {
