@@ -502,6 +502,20 @@ pub mod macos {
         Ok(regex_escape(&s))
     }
 
+    /// Push `(<rule> (<filter> "<path>"))`, `path` validated and escaped by
+    /// [`escape_path`]: `rule` is the action and operations (`"allow
+    /// file-read*"`), `filter` is `"literal"` or `"subpath"`.
+    fn push_rule(
+        out: &mut String,
+        rule: &str,
+        filter: &str,
+        path: &Path,
+    ) -> Result<(), SandboxError> {
+        let escaped = escape_path(path)?;
+        out.push_str(&format!("({rule} ({filter} \"{escaped}\"))\n"));
+        Ok(())
+    }
+
     /// Emit ancestor directory metadata-access rules for a path.
     ///
     /// For every ancestor directory (from the parent up to but not including `/`),
@@ -742,14 +756,12 @@ pub mod macos {
     fn emit_none_filesystem_baseline(out: &mut String) -> Result<(), SandboxError> {
         let dyld = Path::new("/usr/lib/dyld");
         emit_ancestor_rules(dyld, out)?;
-        let escaped = escape_path(dyld)?;
-        out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+        push_rule(out, "allow file-read*", "literal", dyld)?;
 
         for cache_dir in MACOS_DYLD_SHARED_CACHE_DIRS {
             let path = Path::new(cache_dir);
             emit_ancestor_rules(path, out)?;
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-read*", "subpath", path)?;
         }
 
         out.push_str("(allow file-read* (literal \"/dev/null\"))\n");
@@ -826,8 +838,7 @@ pub mod macos {
         for root in TOOLCHAIN_ROOTS {
             let path = Path::new(root);
             emit_ancestor_rules(path, out)?;
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-read*", "subpath", path)?;
         }
         Ok(())
     }
@@ -878,24 +889,20 @@ pub mod macos {
             // emit ancestor and read rules for both.
             if let Some(canonical) = try_canonicalize(path) {
                 emit_ancestor_rules(&canonical, out)?;
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+                push_rule(out, "allow file-read*", "subpath", &canonical)?;
             }
 
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-read*", "subpath", path)?;
         }
 
         // Write rules are emitted after read rules to respect SBPL precedence.
         for path in read_write_paths {
             // Emit canonical form write rule if needed.
             if let Some(canonical) = try_canonicalize(path) {
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
+                push_rule(out, "allow file-write*", "subpath", &canonical)?;
             }
 
-            let escaped = escape_path(path)?;
-            out.push_str(&format!("(allow file-write* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "allow file-write*", "subpath", path)?;
         }
 
         Ok(())
@@ -986,12 +993,10 @@ pub mod macos {
         out: &mut String,
     ) -> Result<(), SandboxError> {
         if let Some(hooks) = git_hooks_deny {
-            let escaped = escape_path(hooks)?;
-            out.push_str(&format!("(deny file-write* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "deny file-write*", "subpath", hooks)?;
         }
         if let Some(base) = runtime_base {
-            let escaped = escape_path(base)?;
-            out.push_str(&format!("(deny file-write* (subpath \"{escaped}\"))\n"));
+            push_rule(out, "deny file-write*", "subpath", base)?;
             let admin_token = base.join("admin.token");
             let escaped_token = escape_path(&admin_token)?;
             out.push_str(&format!(
@@ -1036,14 +1041,12 @@ pub mod macos {
         // "SecPolicyCreateSSL error: 0".
         if let Some(ref binary) = policy.binary_path {
             emit_ancestor_rules(binary, &mut out)?;
-            let escaped = escape_path(binary)?;
-            out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+            push_rule(&mut out, "allow file-read*", "literal", binary)?;
             // If the binary path has a different canonical form (e.g., the
             // daemon resolved a symlink), emit rules for both.
             if let Some(canonical) = try_canonicalize(binary) {
                 emit_ancestor_rules(&canonical, &mut out)?;
-                let escaped = escape_path(&canonical)?;
-                out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+                push_rule(&mut out, "allow file-read*", "literal", &canonical)?;
             }
         }
 
@@ -1152,8 +1155,7 @@ pub mod macos {
         // is unset.
         if let Some(home) = &policy.home {
             let user_apps = home.join("Applications");
-            let escaped = escape_path(&user_apps)?;
-            out.push_str(&format!("(allow file-read* (subpath \"{escaped}\"))\n"));
+            push_rule(&mut out, "allow file-read*", "subpath", &user_apps)?;
         }
 
         // ── Timezone data ─────────────────────────────────────────────────────
@@ -1216,8 +1218,7 @@ pub mod macos {
         // silently if HOME is unset.
         if let Some(home) = &policy.home {
             let encoding_path = home.join(".CFUserTextEncoding");
-            let escaped = escape_path(&encoding_path)?;
-            out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+            push_rule(&mut out, "allow file-read*", "literal", &encoding_path)?;
         }
 
         emit_filesystem_rules(&policy.read_paths, &policy.read_write_paths, &mut out)?;
@@ -1374,8 +1375,7 @@ pub mod macos {
                 ".inputrc",
             ];
             for name in DOTFILES {
-                let escaped = escape_path(&home.join(name))?;
-                out.push_str(&format!("(allow file-read* (literal \"{escaped}\"))\n"));
+                push_rule(out, "allow file-read*", "literal", &home.join(name))?;
             }
         }
 
