@@ -2167,7 +2167,6 @@ passthrough_env = ["TERM"]
     fn parse_minimal_config() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
 
@@ -2290,7 +2289,6 @@ timeout = 60
 passthrough_env = ["TERM", "COLORTERM"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config
@@ -2317,7 +2315,6 @@ passthrough_env = ["TERM", "COLORTERM"]
 relaxed = true
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(
@@ -2343,7 +2340,6 @@ from = "ONE"
 ONE = { secret = "one" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
 
@@ -2372,7 +2368,6 @@ ONE = { secret = "one" }
 [tools]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(
@@ -2387,7 +2382,6 @@ ONE = { secret = "one" }
     fn parse_invalid_toml_includes_path() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), "this is not valid toml [[[");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2425,7 +2419,6 @@ from = "S"
 S = { secret = "s" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -2479,7 +2472,6 @@ S = { secret = "s" }
     fn sandbox_root_is_canonicalized_parent() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let canonical = std::fs::canonicalize(tmp.path()).unwrap();
@@ -2589,7 +2581,6 @@ S = { secret = "s" }
 [tools."bad/name"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2609,7 +2600,6 @@ S = { secret = "s" }
 [tools."bad\\name"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let result = load_config(tmp.path());
         assert!(result.is_err());
@@ -2685,7 +2675,6 @@ source = "env"
 GH_TOKEN = { secret = "GH_TOKEN" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["GH_TOKEN"].source {
@@ -2709,7 +2698,6 @@ command = ["echo", "hello"]
 TOKEN = { secret = "cmd_token" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["cmd_token"].source {
@@ -2750,7 +2738,6 @@ refresh_max_backoff = 600
 TOKEN = { secret = "gcp_token" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["gcp_token"].source {
             SecretSource::Command {
@@ -2781,7 +2768,6 @@ refresh = 60
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["tok"].source {
             SecretSource::Command {
@@ -2812,7 +2798,6 @@ refresh = 0
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshInterval { ref label, .. } if label == "tok"),
@@ -2837,7 +2822,6 @@ refresh = 5
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshInterval { .. }),
@@ -2861,7 +2845,6 @@ refresh_max_backoff = 30
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshConfig { .. }),
@@ -2887,7 +2870,6 @@ refresh_max_backoff = 5
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidRefreshConfig { .. }),
@@ -2912,7 +2894,6 @@ env_clear = true
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let config = load_config(tmp.path()).unwrap();
         match &config.secrets["tok"].source {
             SecretSource::Command { env, .. } => {
@@ -2944,7 +2925,6 @@ command = ["echo", "hi"]
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::InvalidSecretEnvVarName { ref label, ref name } if label == "tok" && name == "1BAD"),
@@ -2972,7 +2952,6 @@ refresh = 60
 TOKEN = { secret = "tok" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
             matches!(err, ConfigError::SecretFieldMismatch { ref label, .. } if label == "tok"),
@@ -2997,7 +2976,6 @@ LOG_LEVEL = "debug"
 REGION = "eu-north-1"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let tool = &config.tools["app"];
@@ -3063,7 +3041,6 @@ from = "GCP_TOKEN"
 {body}"#
             ),
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
         load_config(tmp.path())
     }
 
@@ -3364,7 +3341,6 @@ alow = ["GET /**"]
 "1LEADING_DIGIT" = "nope"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidEnvVarName { .. }));
@@ -3383,7 +3359,6 @@ alow = ["GET /**"]
 GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let expected = format!("{}/.config/gh", config.sandbox_root.display());
@@ -3404,7 +3379,6 @@ GH_CONFIG_DIR = "{sandbox_root}/.config/gh"
 BOTH = "{sandbox_root}:{sandbox_root}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let root = config.sandbox_root.display().to_string();
@@ -3426,7 +3400,6 @@ BOTH = "{sandbox_root}:{sandbox_root}"
 LIT = "\\{sandbox_root\\}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3446,7 +3419,6 @@ LIT = "\\{sandbox_root\\}"
 X = "{home}"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         match err {
@@ -3474,7 +3446,6 @@ X = "{home}"
 X = "{sandbox_root"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -3501,7 +3472,6 @@ from = "WEIRD"
 WEIRD = { secret = "weird{label}" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3521,7 +3491,6 @@ WEIRD = { secret = "weird{label}" }
 HOST = "github.com"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(matches!(
@@ -3542,7 +3511,6 @@ source = "command"
 command = []
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::EmptyCommandArgv { .. }));
@@ -3560,7 +3528,6 @@ source = "vault"
 address = "https://vault"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::ParseError { .. }));
@@ -3572,7 +3539,6 @@ address = "https://vault"
     fn access_defaults_to_default_when_unset_anywhere() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(config.access, crate::sandbox::ToolAccess::Default);
@@ -3592,7 +3558,6 @@ access = "system"
 access = "none"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(config.access, crate::sandbox::ToolAccess::System);
@@ -3604,7 +3569,6 @@ access = "none"
     fn reject_unknown_top_level_access_level() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), "access = \"bogus\"\n");
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         match err {
@@ -3626,7 +3590,6 @@ access = "none"
 access = "bogus"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         match err {
@@ -3653,7 +3616,6 @@ from = "X"
 X = { secret = "x", type = "string" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         // The untagged enum in RawEnvValue means this falls through to
         // Static(String), then fails as a non-string. Either way it must
@@ -3693,53 +3655,6 @@ X = { secret = "x", type = "string" }
             name: "bad/tool".to_string(),
         };
         assert!(err.to_string().contains("bad/tool"));
-    }
-
-    // ── Helper: temporary environment variable override ──────────────────
-
-    use std::sync::MutexGuard;
-
-    /// RAII guard that sets an environment variable for the duration of a test
-    /// and restores it when dropped. Holds [`crate::test_support::ENV_MUTEX`]
-    /// — the crate-wide lock — to serialize against every other test that
-    /// touches the process environment, in any module. Using a single mutex
-    /// across the test suite is what keeps `HOME`-mutating tests in
-    /// `config`, `run`, and `sandbox` from racing each other.
-    struct TempEnvVar {
-        key: String,
-        prev: Option<String>,
-        _lock: MutexGuard<'static, ()>,
-    }
-
-    impl TempEnvVar {
-        fn new(key: &str, value: &str) -> Self {
-            // Acquire the crate-wide env mutex first to ensure exclusive
-            // access. Poisoned-lock recovery is fine here: a panicked test
-            // already restored its own var via the Drop below.
-            let lock = crate::test_support::ENV_MUTEX
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var(key).ok();
-            // SAFETY: we hold the crate-wide ENV_MUTEX, so no other test
-            // thread anywhere in the suite is reading or writing env vars
-            // concurrently.
-            unsafe { std::env::set_var(key, value) };
-            Self {
-                key: key.to_string(),
-                prev,
-                _lock: lock,
-            }
-        }
-    }
-
-    impl Drop for TempEnvVar {
-        fn drop(&mut self) {
-            match &self.prev {
-                // SAFETY: We still hold ENV_MUTEX (dropped after this).
-                Some(v) => unsafe { std::env::set_var(&self.key, v) },
-                None => unsafe { std::env::remove_var(&self.key) },
-            }
-        }
     }
 
     // ── Default config template ──────────────────────────────────────────
@@ -3812,7 +3727,6 @@ kits = ["rust"]
     fn agent_absent_is_none() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(
@@ -3833,7 +3747,6 @@ kits = ["rust"]
 [agent]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config
@@ -3872,7 +3785,6 @@ kits = ["rust"]
 timeout = 0
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(
@@ -3893,7 +3805,6 @@ timeout = 0
 timeout = 120
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert_eq!(
@@ -3916,7 +3827,6 @@ timeout = 120
 passthrough_env = ["COLORTERM", "NO_COLOR"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3939,7 +3849,6 @@ passthrough_env = ["COLORTERM", "NO_COLOR"]
 LOG_LEVEL = "info"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -3966,7 +3875,6 @@ from = "API_KEY"
 API_KEY = { secret = "API_KEY" }
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -4102,7 +4010,6 @@ write = ["/tmp/agent"]
     fn load_config_from_file_success() {
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = tmp.path().join(CONFIG_FILENAME);
         let config = load_config_from_file(&config_path).unwrap();
@@ -4119,7 +4026,6 @@ write = ["/tmp/agent"]
     #[test]
     fn load_config_from_file_missing_path_returns_error() {
         let tmp = tempdir().unwrap();
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         // Parent directory exists; file does not. This surfaces as ReadError
         // (not CanonicalizationError) — the spec's recommended variant.
@@ -4138,7 +4044,6 @@ write = ["/tmp/agent"]
         // verify the check runs by testing with a uid that is not ours.
         let tmp = tempdir().unwrap();
         write_config(tmp.path(), minimal_config());
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = tmp.path().join(CONFIG_FILENAME);
         let euid = current_euid();
@@ -4222,7 +4127,6 @@ TOK = { secret = "tok" }
 LOG_LEVEL = "debug"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         assert!(config.agent.is_none());
@@ -4279,7 +4183,6 @@ ALPHA = "a"
 MANGO = "m"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let agent = config.agent.unwrap();
@@ -4300,7 +4203,6 @@ MANGO = "m"
 "1INVALID" = "value"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -4322,7 +4224,6 @@ MANGO = "m"
 unknown_field = "should fail"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let err = load_config(tmp.path()).unwrap_err();
         assert!(
@@ -4340,8 +4241,6 @@ unknown_field = "should fail"
         let project = tmp.path().join("project");
         fs::create_dir(&project).unwrap();
         write_config(&project, minimal_config());
-
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config_path = project.join(CONFIG_FILENAME);
         let config = load_config_from_file(&config_path).unwrap();
@@ -4366,7 +4265,6 @@ unknown_field = "should fail"
 WORK_DIR = "{sandbox_root}/work"
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let expected = format!("{}/work", config.sandbox_root.display());
@@ -4402,7 +4300,6 @@ extra_write = ["/tmp/b-write"]
 write = ["/tmp/agent-write"]
 "#,
         );
-        let _home_guard = TempEnvVar::new("HOME", tmp.path().to_str().unwrap());
 
         let config = load_config(tmp.path()).unwrap();
         let grants = write_grants(&config);
