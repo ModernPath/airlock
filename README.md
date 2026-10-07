@@ -572,6 +572,8 @@ Use the full path: zsh has a `log` builtin that shadows `/usr/bin/log` and fails
 
 Each line names the operation and the path or Mach service it hit — that's what to add to `[filesystem]`, `extra_read`/`extra_write`, or `[agent.filesystem]`.
 
+A tool's sandbox can read the tool's own binary, not the libraries it links from elsewhere. A Nix or Homebrew build that does fails with `dyld: Library not loaded: … (blocked by sandbox)`; add the library's directory, or the whole `/nix/store` or `/opt/homebrew`, to that tool's `extra_read`. Statically linked tools such as `gh` don't need this.
+
 ## Building
 
 ```bash
