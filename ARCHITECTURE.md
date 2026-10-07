@@ -14,6 +14,7 @@ src/
 ├── process_tree.rs  Peer PID/uid of a Unix connection, parent-chain walk, token-binding check
 ├── layers.rs        Config layer discovery (global/repo/local), merge rules, provenance
 ├── config.rs        Raw TOML types, per-file parsing and validation, wire (daemon-side) config resolution
+├── kits.rs          Agent kits: built-in/user-defined definitions, validation, pure expansion (launcher-only)
 ├── trust.rs         Trust store, approval state, escaped diff rendering, prompts
 ├── protocol.rs      Wire types: Hello, Request/Auth, two request families, ErrorKind, exit-code mapping
 ├── session.rs        In-daemon session state: policy, secrets, redactor, binding, lease/TTL
@@ -67,10 +68,13 @@ main()
  │           ├─ install SIGTERM handler
  │           └─ accept loop, no sessions yet
  │
- ├─ "run [--profile NAME] [-- CMD...]"
+ ├─ "run [--profile NAME] [--kit NAME]... [-- CMD...]"
  │   └─ run::run_agent()
- │       ├─ launcher::register_session()   ← discover, approve, resolve secrets (see below)
- │       ├─ build_agent_policy() + sandbox::build_profile()
+ │       ├─ launcher::register_session()   ← discover, approve, resolve secrets (see below);
+ │       │  also validates and expands this run's active kits (kits::expand_all) and folds
+ │       │  their write dirs/files into write_grants before the anchor/PATH checks run
+ │       ├─ build_agent_policy() + sandbox::build_profile(), kit read/write paths added on top
+ │       ├─ build_agent_env(), kit env applied on top (overriding passthrough/[agent.env])
  │       ├─ spawn agent with AIRLOCK_ADDR / AIRLOCK_SESSION set, sandbox applied in pre_exec
  │       ├─ hold the `Register` connection open as the session's lease
  │       ├─ forward SIGTERM / SIGHUP to agent; enforce optional timeout
@@ -100,6 +104,10 @@ A **launcher** (`airlock run`, `session start`, `session reload`, and `trust`/`c
 5. **Register.** The launcher sends a `Register` request over the admin channel: the project root, the merged config (as `RawConfig`, the same `deny_unknown_fields` TOML types the files parse into — a field the daemon doesn't recognize is rejected, not ignored), the layer hashes, the resolved secret values, an environment snapshot and the filtered `PATH`, a session name, and whether the agent runs in Airlock's own sandbox or an external one. The daemon answers with a session id and a 32-byte token; the launcher drops its `Secret<T>` values once this succeeds.
 
 `session reload` repeats steps 1–4 for one or more running sessions and sends `Reload`; the daemon compiles a new policy and swaps it into the session in one step. The session keeps its id and token. The agent's own sandbox settings (`[agent]`) cannot change on a running process, so a reload that touches them is applied to everything else and reported as "agent settings changed; restart to apply".
+
+### Kits
+
+Kits ([src/kits.rs](src/kits.rs)) add a language toolchain's cache access to `airlock run`'s agent sandbox — a layer orthogonal to the harness profile. They are purely a `run`-time, launcher-side concept: `layers::merge` validates and resolves `[kits.*]`/`agent.kits` but **never puts the `[kits.*]` option tables on the wire** (`agent.kits`, the plain name list, does ride along on `RawAgentConfig`, unused by the daemon, so it and the resolved option tables both feed the agent hash `session reload` checks). `kits::expand_all` is the one pure function that turns an active kit list into concrete paths and env — called from `launcher::prepare` (for `run`) and from `inspect::config_cmd`'s own display, never from `layers::merge`, which reads no environment by design. A kit's write dirs/files are folded into `write_grants` before the anchor and filtered-`PATH` checks in step 4 above, so no separate check was needed for them.
 
 ## Sessions
 

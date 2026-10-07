@@ -21,6 +21,7 @@ Airlock brokers credentials for the tools your agent *runs*, not just the APIs i
 - [An always-on daemon](#an-always-on-daemon)
 - [Minting scoped credentials](#minting-scoped-credentials)
 - [Configuration](#configuration)
+- [Kits](#kits)
 - [Command reference](#command-reference)
 - [Troubleshooting](#troubleshooting)
 - [Building](#building)
@@ -522,6 +523,36 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 - `~/foo` → `$HOME/foo`; relative paths resolve against the sandbox root (an error in the global layer, since it applies to every project); absolute paths are used as-is.
 - Static `env` strings may use `{sandbox_root}` (the canonicalized project directory), or `{tool_state}` (a per-project, per-tool directory under `$XDG_CACHE_HOME/airlock`, created on first use, writable only by that one tool — nothing else, not even another tool or the agent, can reach it). Use `{tool_state}` for a tool's own config directory (`GH_CONFIG_DIR`, `CLOUDSDK_CONFIG`); use `{sandbox_root}` only when two tools genuinely need to share a path, as `KUBECONFIG` does above. Escape literal braces as `\{` `\}`. No other placeholders exist; this is not shell interpolation.
 - **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System` and `/Library` on macOS, `/usr/bin`, `/bin`, `/lib*` on Linux) — except `/dev/null`, which is also writable, so `2>/dev/null` works. Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
+
+## Kits
+
+Kits are a separate, composable layer on top of `airlock run`'s agent sandbox: what a *kind of work* needs (a language toolchain and its package caches), independent of whatever harness profile you use (`--profile claude`). They apply only to the agent sandbox — never to tools, and never to `session start`, which an external harness owns.
+
+```toml
+[agent]
+kits = ["rust", "node"]     # any config layer; unioned across them
+
+[kits.rust]                 # a built-in kit's own option: global or local layer only
+mode = "isolated"           # the default; or "shared"
+```
+
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Each has two modes:
+
+- **isolated** (the default). Airlock creates a directory private to this project (`$XDG_CACHE_HOME/airlock/kits/<id>/<kit>`) and points the toolchain's cache env vars (`CARGO_HOME`, `GOPATH`, ...) at it. The agent can read/write that directory and nothing else of the toolchain's; your real `~/.cargo`, `~/go`, etc. are untouched.
+- **shared**. No env override — the agent gets write access to your real cache locations instead (honoring `CARGO_HOME`/`GOPATH`/etc. if you've already set them). **This lets the agent poison a cache an unsandboxed build later trusts without re-verifying** — e.g. `~/.cargo/registry/src` is extracted once and not re-checked per build. Prefer isolated; reach for shared only when you understand that tradeoff. See [SECURITY.md](SECURITY.md#kits).
+
+`--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` and `airlock config` both show the active kits, their mode, and the exact paths/env each one resolved to.
+
+A kit never grants write, or read, to binaries or credential files — not `~/.cargo/bin`, not `~/.cargo/credentials.toml`, not `~/.hex/hex.config`. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
+
+```toml
+[kits.bazel]                # global or local layer only; no mode (always these paths)
+read  = ["~/.bazelrc"]
+write = ["~/.cache/bazel"]
+env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+```
+
+`{kit_state}` expands to that kit's own directory under `$XDG_CACHE_HOME/airlock/kits` — the same idea as `{tool_state}` above, but for a kit instead of a tool. A kit's `[kits.<name>]` table sits in the same restricted slot as `allow_home_root`: your global config or `airlock.local.toml` only, never a project's own `airlock.toml` — a teammate's checked-in file must not decide what the agent may write in your home. `agent.kits` itself has no such restriction.
 
 ## Command reference
 

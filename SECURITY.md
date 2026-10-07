@@ -230,6 +230,20 @@ Pick `claude-relaxed` when you want the convenience and accept those marginal ri
 
 Clipboard reads can return password-manager tokens; `open <url>` reveals OAuth redirect URLs (with codes) to the browser process; dotfiles frequently carry `export AWS_*`, `export GITHUB_TOKEN`, etc. The relaxed bundle widens the **data-leak surface**, not the authority to write to your account-state. The keychain widening adds DoS and metadata disclosure but not decryption capability.
 
+## Kits
+
+Kits (`airlock run --kit <name>` / `agent.kits` / `[kits.<name>]`) add a language toolchain's cache access to the agent sandbox, on top of the harness profile above. They apply only to `airlock run`'s agent sandbox, never to a tool, and never to `session start` — an external harness's own sandbox is what actually runs there.
+
+**Isolated** (the default) points the toolchain's own cache/home env vars (`CARGO_HOME`, `GOPATH`, `npm_config_cache`, ...) at a directory private to this project, under `$XDG_CACHE_HOME/airlock/kits`. The agent can read/write only that directory for the toolchain's purposes; the user's real `~/.cargo`, `~/go`, `~/.npm`, etc. are never granted at all. This is the safe default and should be left in place unless you have a specific reason to change it.
+
+**Shared** grants the agent write access to the real cache locations instead, with no env override. **This is the mode to be careful with: it lets a hostile or compromised agent poison a cache that your *next, unsandboxed* build or `pip install` will trust without re-verifying.** Concretely:
+
+- `cargo` extracts a crate's source into `~/.cargo/registry/src` once, the first time it's fetched, and verifies its checksum against `Cargo.lock`/the registry index at that point. Every subsequent build reads the extracted source directly — there is no re-verification. An agent with write access to that tree can plant a backdoor in a dependency's extracted source; your next unsandboxed `cargo build` compiles it unmodified, outside any sandbox.
+- Go's module cache (`$GOPATH/pkg/mod`) and pip's wheel cache behave the same way: each verifies on first download, then trusts the cached, already-unpacked copy on every later build.
+- Writing `~/.cargo/bin`, or `~/.mix/escripts`/`~/.mix/archives` (Mix archives are themselves code Mix loads), or anywhere Mix/npm/pip put *executables* rather than plain cache data, is strictly worse — not cache poisoning but a direct sandbox escape, the same way a writable `PATH` entry is ([B2](docs/airlock-v2-design.md#blocking)). No kit, in either mode, ever grants write (or read) to a toolchain's binaries or credential/config files that could redirect what runs — `~/.cargo/bin`, `~/.cargo/credentials.toml`, `~/.hex/hex.config`, Go's env file. Hex does verify a package's checksum against `mix.lock` on fetch, same as cargo/pip; `deps/` and the extracted archives are trusted on every build after that, same caveat.
+
+This is why isolated is the default, and why `[kits.<name>]` (the table that sets a built-in kit's mode, or defines a custom one) is restricted to your global config or `airlock.local.toml` — the same restricted slot as `allow_home_root` — never a project's own `airlock.toml`. A teammate's checked-in config choosing shared mode for you, silently, would be exactly this risk without your consent.
+
 ## External sandboxes
 
 A harness started from an `airlock session start` shell — Claude Code's own `--sandbox`, or an IDE extension `airlock run` can't wrap — runs in a sandbox Airlock did not build. Airlock's protections for the agent then depend entirely on that sandbox, and on the harness not inheriting secrets through some other path. Specifically, the harness's own sandbox **must**:

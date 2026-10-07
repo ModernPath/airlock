@@ -253,6 +253,8 @@ must not hold a secret" is checked against the merged tools.
 | `agent.env.<VAR>` | per key, highest layer wins |
 | `timeout`, `agent.timeout` | highest layer that sets it |
 | `allow_home_root` | Honored in global or local. In the repo layer it is a config error. |
+| `agent.kits` | union across layers (see [Kits](#kits)) |
+| `[kits.<name>]` | Honored in global or local, local wins whole by name. In the repo layer it is a config error. Launcher-only — never part of the wire config. |
 
 ### Tools across layers
 
@@ -991,6 +993,126 @@ it.
 A PreToolUse hook that denies a direct `gh` and suggests the `airlock exec`
 form is left out. It costs a daemon round trip per shell command and needs
 a command parser that is never complete.
+
+## Kits
+
+`airlock run`'s agent gets a fixed baseline, plus whatever the harness
+profile (`--profile claude`/`claude-relaxed`) adds. **Kits** are a separate,
+composable layer on top: what a *kind of work* needs — a language
+toolchain and its package caches — independent of the harness. Kits apply
+only to `airlock run`'s agent sandbox and env. They never reach a tool
+sandbox, and never apply to `session start` (an external harness owns that
+sandbox).
+
+```toml
+[agent]
+kits = ["rust", "node"]     # any layer; union across layers
+
+[kits.rust]                 # options for a built-in kit; global or local layer only
+mode = "isolated"           # the default; or "shared"
+
+[kits.bazel]                # a user-defined kit; global or local layer only
+read  = ["~/.bazelrc"]
+write = ["~/.cache/bazel"]
+env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+```
+
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Their `[kits.<name>]`
+table accepts only `mode`. A user-defined kit's table accepts `read`,
+`write` and `env` instead (no `mode` — it has no isolated/shared concept of
+its own). `[kits.*]` sits in the same restricted slot as `allow_home_root`:
+global or local only, a config error in the repo layer — a teammate's
+checked-in `airlock.toml` must not decide what the agent may write in your
+home. `agent.kits` itself has no such restriction and unions across every
+layer, the same as `agent.passthrough_env`.
+
+**`[kits.*]` is a launcher-only concept and never reaches the wire config
+the daemon runs against** — `layers::merge` validates and resolves it, but
+`MergedConfig::to_wire()` always clears it. `agent.kits` (just the list of
+names) does ride along on `RawAgentConfig`, harmlessly unused by the
+daemon, so that it — and the resolved `[kits.*]` option tables alongside it
+— contribute to the agent hash `session reload` uses to decide whether to
+print "restart the agent to apply them".
+
+### Modes
+
+- **isolated** (the default). Airlock creates a per-project directory,
+  `{kit_state}` = `<tool_state_base>/kits/<project-id>/<kit>` — a sibling
+  tree of [`{tool_state}`](#tool-state-outside-the-project)
+  (`<tool_state_base>/<project-id>/<tool>`; a project id is 16 hex
+  characters, so it can never collide with the literal `kits`) — and points
+  the toolchain's own cache/home env vars at it. The agent gets read-write
+  access to that directory only; it never writes the user's real caches.
+  Created with mode 0700 the way a tool's `{tool_state}` dir is, and
+  validated the same way (refused if it resolves inside the project root or
+  overlaps an anchor).
+- **shared**. No env override; the agent gets write access to the real
+  cache locations instead. Each location is resolved from the launcher's
+  environment snapshot when the user has already set the tool's own
+  variable (`CARGO_HOME`, `npm_config_cache`, `GOPATH`, ...), otherwise the
+  platform default. Missing cache dirs are created (mode 0700) — Landlock
+  can only grant a path that exists.
+
+Kit env (isolated built-ins and user-defined kits; a shared built-in sets
+none) is applied after the environment snapshot and the passthrough env,
+so a `CARGO_HOME` the user passes through cannot defeat isolation.
+
+### Built-in kit definitions
+
+A kit never grants write, and never grants read, to binaries or
+config/credential files — writing to `~/.cargo/bin`, or reading
+`~/.cargo/credentials.toml` or `~/.hex/hex.config`, would hand the agent a
+way to run code the user later trusts unsandboxed, or read a live API key.
+
+| Kit | Reads | Isolated env | Shared writes |
+|---|---|---|---|
+| `rust` | `~/.rustup`, `~/.cargo/bin` | `CARGO_HOME` | `~/.cargo/registry`, `~/.cargo/git`, plus `.package-cache`/`.package-cache-mutate`/`.global-cache` as individual files under `CARGO_HOME` |
+| `node` | `~/.nvm`, `~/.volta`, fnm's dir, `~/.bun/bin` | `npm_config_cache`, `YARN_CACHE_FOLDER`, `npm_config_store_dir`, `BUN_INSTALL_CACHE_DIR`, `COREPACK_HOME` | the real dirs for each |
+| `python` | `~/.pyenv`, `~/.local/share/uv/python` | `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR` | the platform cache defaults |
+| `go` | `~/go/bin`, `~/sdk` | `GOMODCACHE`, `GOCACHE`, and `GOPATH` (not just the two caches — `go install`'s output and the sumdb cache live under `GOPATH` with no env var of their own) | `$GOPATH/pkg/{mod,sumdb}`, `GOCACHE`'s platform default |
+| `elixir` | `~/.asdf`, `~/.kiex` | `MIX_HOME`, `HEX_HOME`, `REBAR_CACHE_DIR` (plus `MIX_ARCHIVES` pointed read-only at the real `~/.mix/archives`, and `~/.mix/elixir` read-only for the already-installed rebar3 escript, so the agent does not need to `mix local.hex`/`local.rebar` again) | reads real `~/.mix` (never writes it — archives and escripts are code and binaries, like `~/.cargo/bin`); writes `~/.hex/packages` and the rebar3 cache only. Never reads or writes `~/.hex` itself — `hex.config` can hold the user's Hex API key. |
+
+Missing read paths are skipped; isolated-mode subdirectories are created up
+front. See [`src/kits.rs`](../src/kits.rs) for the exact expansion
+(`expand_all`, a pure function of home, the env snapshot, the platform, the
+project id and `tool_state_base` — unit-tested for every kit, both modes,
+both platforms).
+
+### Config errors
+
+Each with a clear message, checked in `crate::layers::merge` (placement
+and table shape) or `crate::kits` (everything that needs the active kit
+list — called from `crate::launcher::prepare`, and from `airlock config`'s
+own display, which expands kits exactly like `airlock run` does):
+
+- `[kits.*]` in the repo layer.
+- `read`/`write`/`env` on a built-in kit; `mode` on a user-defined kit; an
+  unrecognized `mode` value.
+- `{tool_state}` anywhere in a kit's `read`, `write` or `env` — the agent
+  must never see tool state.
+- An unknown name in `agent.kits` (lists every known kit: the built-ins
+  plus any `[kits.<name>]` table).
+- An `[agent.env]` key a listed kit's env also sets ("set by kit rust; drop
+  one of them").
+
+### Integration points
+
+- `crate::launcher::prepare` validates, resolves the active kit list
+  (`agent.kits` plus `airlock run --kit <name>`, repeatable and additive),
+  and expands it. A kit's write dirs/files are folded into `write_grants`
+  before `anchors::validate` and `exec::filter_path` run, so the existing
+  anchor checks and the [B2](#blocking) binary-location check already cover
+  them — no separate check was needed. Kit dirs are created after trust,
+  like `{tool_state}` dirs.
+- `crate::run` adds the kit's read paths (filtered by existence, like
+  `detect_toolchain_paths`) and read-write paths to the `AgentPolicy`, and
+  applies kit env on top of the already-built agent env. `airlock run -v`
+  names the active kits and their modes.
+- `airlock config` shows the active kits with layer provenance, mode, and
+  the same expanded paths/env `airlock run` would use.
+- `session start` calls the same `prepare`, computing kit expansion for no
+  reason it uses — simpler than branching, and harmless, since an external
+  harness's own sandbox is what actually runs.
 
 ## Threat walkthrough
 
@@ -1734,3 +1856,13 @@ proposed:
   doc called this out explicitly; it follows from [Token
   binding](#token-binding) but is easy to trip over, so README.md and
   SECURITY.md now say it directly.
+- **[Kits](#kits)' `[kits.*]` option tables never reach the wire config**,
+  unlike almost everything else `layers::merge` produces. Only `agent.kits`
+  (the plain name list) rides on `RawAgentConfig`, unused by the daemon,
+  solely so it — together with the resolved `[kits.*]` tables, hashed
+  alongside it in `crate::launcher::prepare` — changes the agent hash
+  `session reload` checks. Expansion itself (`crate::kits::expand_all`) is
+  a pure function of home, the env snapshot, the platform, the project id
+  and `tool_state_base`, called only from `prepare` (for `airlock run`) and
+  from `airlock config`'s own display — never from `layers::merge`, which
+  by design never reads the environment.

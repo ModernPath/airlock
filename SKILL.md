@@ -234,6 +234,18 @@ need airlock, but signed commits (GPG key) and HTTPS pushes using a credential
 helper (GitHub token, etc.) are legitimate airlock-brokered use cases, and
 your session serves them if the project declares them.
 
+### Cache env vars may already point into Airlock's own directory
+
+If you were started with `airlock run` and the project (or your user) enabled
+a kit (`rust`, `node`, `python`, `go`, `elixir`, or a custom one), variables
+like `CARGO_HOME`, `GOPATH`, `npm_config_cache`, `PIP_CACHE_DIR` or
+`UV_CACHE_DIR` may already be set in your environment, pointing at a
+directory under `$XDG_CACHE_HOME/airlock/kits` instead of the usual
+`~/.cargo`, `~/go`, etc. This is deliberate — it is how `cargo`, `go`, `npm`,
+`pip` and similar tools keep working for you without ever writing to the
+user's real caches. Run them exactly as you normally would; do not unset or
+override these variables to "fix" a path that looks unfamiliar.
+
 ## Workflow
 
 1. Run `airlock tools list` to discover available tools in this session.
