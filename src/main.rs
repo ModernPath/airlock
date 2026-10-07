@@ -447,22 +447,19 @@ fn customize_help(mut cmd: clap::Command, sandboxed: bool) -> clap::Command {
     clippy::disallowed_methods,
     reason = "client-side: the CLI binary resolving its own cwd before talking to the daemon"
 )]
-fn current_dir_or_fail() -> Result<PathBuf, ExitCode> {
-    std::env::current_dir().map_err(|e| {
-        eprintln!("error: failed to determine current directory: {e}");
-        ExitCode::from(125)
-    })
+fn current_dir() -> Result<PathBuf, CliError> {
+    std::env::current_dir()
+        .map_err(|e| CliError::new(format!("failed to determine current directory: {e}")))
 }
 
 #[allow(
     clippy::disallowed_methods,
     reason = "client-side: the CLI binary resolving the user's home directory, not daemon request-path code"
 )]
-fn home_dir_or_fail() -> Result<PathBuf, ExitCode> {
-    std::env::var_os("HOME").map(PathBuf::from).ok_or_else(|| {
-        eprintln!("error: HOME is not set");
-        ExitCode::from(125)
-    })
+fn home_dir() -> Result<PathBuf, CliError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::new("HOME is not set"))
 }
 
 fn now_unix() -> u64 {
@@ -472,11 +469,9 @@ fn now_unix() -> u64 {
         .unwrap_or(0)
 }
 
-fn tokio_runtime_or_fail() -> Result<tokio::runtime::Runtime, ExitCode> {
-    tokio::runtime::Runtime::new().map_err(|e| {
-        eprintln!("error: failed to create async runtime: {e}");
-        ExitCode::from(125)
-    })
+fn tokio_runtime() -> Result<tokio::runtime::Runtime, CliError> {
+    tokio::runtime::Runtime::new()
+        .map_err(|e| CliError::new(format!("failed to create async runtime: {e}")))
 }
 
 /// The line [`eprint_error`] prints, split out so the escaping itself is
@@ -507,6 +502,76 @@ fn report_launcher_error(e: &LauncherError) {
     }
 }
 
+/// Why a command stopped early. [`finish`] is the one place it is printed,
+/// so every message gets [`eprint_error`]'s escaping.
+enum CliError {
+    /// Already reported to the user (the launcher's `Aborted`).
+    Reported,
+    /// Print `message` and exit with `code`.
+    Failed { message: String, code: u8 },
+}
+
+impl CliError {
+    fn new(message: impl std::fmt::Display) -> Self {
+        CliError::Failed {
+            message: message.to_string(),
+            code: 125,
+        }
+    }
+}
+
+impl From<LauncherError> for CliError {
+    fn from(e: LauncherError) -> Self {
+        match e {
+            LauncherError::Aborted => CliError::Reported,
+            e => CliError::new(e),
+        }
+    }
+}
+
+impl From<run::RunError> for CliError {
+    fn from(e: run::RunError) -> Self {
+        match e {
+            run::RunError::Aborted => CliError::Reported,
+            e => CliError::new(e),
+        }
+    }
+}
+
+/// The daemon's own [`ErrorKind`](airlock::protocol::ErrorKind) picks the
+/// exit code when it answered with one.
+impl From<AdminError> for CliError {
+    fn from(e: AdminError) -> Self {
+        let code = match &e {
+            AdminError::Daemon { kind, .. } => kind.exit_code(),
+            _ => 125,
+        };
+        CliError::Failed {
+            message: e.to_string(),
+            code,
+        }
+    }
+}
+
+impl From<airlock::runtime_dir::RuntimeDirError> for CliError {
+    fn from(e: airlock::runtime_dir::RuntimeDirError) -> Self {
+        CliError::new(e)
+    }
+}
+
+type CliResult = Result<ExitCode, CliError>;
+
+fn finish(result: CliResult) -> ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(CliError::Reported) => ExitCode::from(125),
+        Err(CliError::Failed { message, code }) => {
+            eprint_error(message);
+            ExitCode::from(code)
+        }
+    }
+}
+
 fn discover_opts(config: Option<PathBuf>, no_project_config: bool) -> DiscoverOpts {
     DiscoverOpts {
         config,
@@ -529,7 +594,7 @@ fn main() -> ExitCode {
         return code;
     }
 
-    match cli.command {
+    finish(match cli.command {
         Commands::Run {
             profile,
             allow_read,
@@ -578,21 +643,20 @@ fn main() -> ExitCode {
         Commands::Agent { action } => cmd_agent(action),
         Commands::Session { action } => cmd_session(action),
         Commands::Daemon { action } => cmd_daemon(action),
-    }
+    })
 }
 
 // ─── Command: run ───────────────────────────────────────────────────────────
 
-fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
+fn cmd_run(args: Vec<String>, opts: RunOptions) -> CliResult {
     let resolved_args: Vec<String> = if args.is_empty() {
         match opts.profile {
             Some(p) => p.default_command(),
             None => {
-                eprintln!(
-                    "error: no command specified\n\n\
-                     Usage: airlock run [--profile <NAME>] -- <command> [args...]"
-                );
-                return ExitCode::from(125);
+                return Err(CliError::new(
+                    "no command specified\n\n\
+                     Usage: airlock run [--profile <NAME>] -- <command> [args...]",
+                ));
             }
         }
     } else {
@@ -602,19 +666,8 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
     let command = resolved_args[0].clone();
     let command_args = resolved_args[1..].to_vec();
 
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    match run::run_agent(&cwd, &command, &command_args, opts) {
-        Ok(code) => code,
-        Err(run::RunError::Aborted) => ExitCode::from(125),
-        Err(e) => {
-            eprint_error(e);
-            ExitCode::from(125)
-        }
-    }
+    let cwd = current_dir()?;
+    Ok(run::run_agent(&cwd, &command, &command_args, opts)?)
 }
 
 // ─── Command: init ───────────────────────────────────────────────────────────
@@ -627,15 +680,9 @@ fn cmd_run(args: Vec<String>, opts: RunOptions) -> ExitCode {
     clippy::disallowed_methods,
     reason = "client-side inspect wrapper: gathers the CLI's own cwd/HOME/XDG_CONFIG_HOME to hand to inspect::init_cmd"
 )]
-fn cmd_init(local: bool, global: bool) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let home = match home_dir_or_fail() {
-        Ok(h) => h,
-        Err(code) => return code,
-    };
+fn cmd_init(local: bool, global: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
     let (global_config, _) =
         airlock::anchors::global_config_path(&|k| std::env::var(k).ok(), &home);
     let kind = if global {
@@ -646,14 +693,14 @@ fn cmd_init(local: bool, global: bool) -> ExitCode {
         inspect::InitKind::Plain
     };
     let mut stdout = std::io::stdout();
-    inspect::init_cmd(
+    Ok(inspect::init_cmd(
         kind,
         &cwd,
         &home,
         &global_config,
         &inspect::RealGitRunner,
         &mut stdout,
-    )
+    ))
 }
 
 // ─── Command: config ─────────────────────────────────────────────────────────
@@ -666,22 +713,10 @@ fn cmd_init(local: bool, global: bool) -> ExitCode {
     clippy::disallowed_methods,
     reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::config_cmd"
 )]
-fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let home = match home_dir_or_fail() {
-        Ok(h) => h,
-        Err(code) => return code,
-    };
-    let runtime = match RuntimeDir::locate() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(125);
-        }
-    };
+fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
+    let runtime = RuntimeDir::locate()?;
     let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
 
     let opts = inspect::ConfigOptions {
@@ -699,7 +734,7 @@ fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> 
 
     let env_snapshot: std::collections::BTreeMap<String, String> = std::env::vars().collect();
     let mut stdout = std::io::stdout();
-    inspect::config_cmd(
+    Ok(inspect::config_cmd(
         &opts,
         &cwd,
         &home,
@@ -709,7 +744,7 @@ fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> 
         &paths_report,
         in_sandbox(),
         &mut stdout,
-    )
+    ))
 }
 
 // ─── Command: status ─────────────────────────────────────────────────────────
@@ -780,22 +815,10 @@ impl inspect::DaemonProbe for AdminProbe {
     clippy::disallowed_methods,
     reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::status_cmd"
 )]
-fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-    let home = match home_dir_or_fail() {
-        Ok(h) => h,
-        Err(code) => return code,
-    };
-    let runtime = match RuntimeDir::locate() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(125);
-        }
-    };
+fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
+    let runtime = RuntimeDir::locate()?;
     let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
 
     let opts = inspect::StatusOptions {
@@ -804,7 +827,7 @@ fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> ExitCode {
     };
     let mut probe = AdminProbe::new(runtime);
     let mut stdout = std::io::stdout();
-    inspect::status_cmd(
+    Ok(inspect::status_cmd(
         &opts,
         &cwd,
         &home,
@@ -813,47 +836,32 @@ fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> ExitCode {
         &mut probe,
         now_unix(),
         &mut stdout,
-    )
+    ))
 }
 
 // ─── Command: trust ──────────────────────────────────────────────────────────
 
-fn cmd_trust(config: Option<PathBuf>, yes: bool, expect_sha256: Vec<String>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    match airlock::launcher::run_trust(&cwd, config, yes, &expect_sha256) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(LauncherError::Aborted) => ExitCode::from(125),
-        Err(e) => {
-            eprint_error(e);
-            ExitCode::from(125)
-        }
-    }
+fn cmd_trust(config: Option<PathBuf>, yes: bool, expect_sha256: Vec<String>) -> CliResult {
+    let cwd = current_dir()?;
+    airlock::launcher::run_trust(&cwd, config, yes, &expect_sha256)?;
+    Ok(ExitCode::SUCCESS)
 }
 
 // ─── Command: exec ───────────────────────────────────────────────────────────
 
-fn cmd_exec(args: Vec<String>) -> ExitCode {
+fn cmd_exec(args: Vec<String>) -> CliResult {
     if args.is_empty() {
-        eprintln!("error: no tool specified\n\nUsage: airlock exec -- <tool> [args...]");
-        return ExitCode::from(125);
+        return Err(CliError::new(
+            "no tool specified\n\nUsage: airlock exec -- <tool> [args...]",
+        ));
     }
     let tool = args[0].clone();
     let tool_args: Vec<String> = args[1..].to_vec();
 
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
+    let cwd = current_dir()?;
     let canonical_cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
 
-    let rt = match tokio_runtime_or_fail() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
+    let rt = tokio_runtime()?;
 
     let code = rt.block_on(airlock::client::exec(tool, tool_args, &canonical_cwd));
     // `client::exec` may have spawned `forward_stdin`, which reads stdin on a
@@ -863,49 +871,37 @@ fn cmd_exec(args: Vec<String>) -> ExitCode {
     // `Runtime` drop waits for it. Detach instead; the kernel reaps the
     // thread when this process exits.
     rt.shutdown_background();
-    ExitCode::from(code as u8)
+    Ok(ExitCode::from(code as u8))
 }
 
 // ─── Command: tools ──────────────────────────────────────────────────────────
 
-fn cmd_tools(action: Option<ToolsAction>) -> ExitCode {
+fn cmd_tools(action: Option<ToolsAction>) -> CliResult {
     let session = match action {
         None => None,
         Some(ToolsAction::List { session }) => session,
     };
-    if session.is_some() && in_sandbox() {
-        eprintln!(
-            "error: `airlock tools list --session` needs the user's terminal; run it from your own terminal"
-        );
-        return ExitCode::from(125);
-    }
-    let rt = match tokio_runtime_or_fail() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
+    let rt = tokio_runtime()?;
     let code = rt.block_on(airlock::client::tools_list(session));
-    ExitCode::from(code as u8)
+    Ok(ExitCode::from(code as u8))
 }
 
 // ─── Command: agent ──────────────────────────────────────────────────────────
 
-fn cmd_agent(action: AgentAction) -> ExitCode {
-    match action {
+fn cmd_agent(action: AgentAction) -> CliResult {
+    Ok(match action {
         AgentAction::Check { quiet } => airlock::agent::check_cmd(quiet),
         AgentAction::Hook {
             harness,
             print_settings,
         } => airlock::agent::hook_cmd(harness, print_settings),
-    }
+    })
 }
 
 // ─── Command: session ────────────────────────────────────────────────────────
 
-fn cmd_session(action: SessionAction) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
+fn cmd_session(action: SessionAction) -> CliResult {
+    let cwd = current_dir()?;
     match action {
         SessionAction::Start {
             name,
@@ -930,17 +926,11 @@ fn cmd_session_start(
     config: Option<PathBuf>,
     no_project_config: bool,
     quiet: bool,
-) -> ExitCode {
-    let ttl_secs = match launcher::parse_ttl(&ttl) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(125);
-        }
-    };
+) -> CliResult {
+    let ttl_secs = launcher::parse_ttl(&ttl).map_err(CliError::new)?;
     let name = name.unwrap_or_else(launcher::default_session_start_name);
 
-    let prepared = match launcher::prepare(
+    let prepared = launcher::prepare(
         cwd,
         &PrepareOptions {
             discover: discover_opts(config, no_project_config),
@@ -949,42 +939,18 @@ fn cmd_session_start(
             extra_write_grants: Vec::new(),
             cli_kits: Vec::new(),
         },
-    ) {
-        Ok(p) => p,
-        Err(e) => {
-            report_launcher_error(&e);
-            return ExitCode::from(125);
-        }
-    };
+    )?;
 
-    let (mut conn, _started_new) = match launcher::ensure_daemon(&prepared.runtime, false, quiet) {
-        Ok(c) => c,
-        Err(e) => {
-            report_launcher_error(&e);
-            return ExitCode::from(125);
-        }
-    };
-    let admin_token = match launcher::read_admin_token(&prepared.runtime) {
-        Ok(t) => t,
-        Err(e) => {
-            report_launcher_error(&e);
-            return ExitCode::from(125);
-        }
-    };
-    let (id, token, _ca_path) = match launcher::register(
+    let (mut conn, _started_new) = launcher::ensure_daemon(&prepared.runtime, false, quiet)?;
+    let admin_token = launcher::read_admin_token(&prepared.runtime)?;
+    let (id, token, _ca_path) = launcher::register(
         &mut conn,
         &admin_token,
         &prepared,
         name.clone(),
         SandboxKind::External,
         SessionEnds::Ttl { secs: ttl_secs },
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            report_launcher_error(&e);
-            return ExitCode::from(125);
-        }
-    };
+    )?;
 
     let addr = prepared.runtime.addr();
     let session = token.expose_secret();
@@ -1023,35 +989,24 @@ fn cmd_session_start(
         );
     }
 
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
-    let ttl_secs = match &ttl {
-        Some(s) => match launcher::parse_ttl(s) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                eprintln!("error: {e}");
-                return ExitCode::from(125);
-            }
-        },
-        None => None,
-    };
+fn cmd_session_renew(id: String, ttl: Option<String>) -> CliResult {
+    let ttl_secs = ttl
+        .as_deref()
+        .map(launcher::parse_ttl)
+        .transpose()
+        .map_err(CliError::new)?;
 
-    let (mut conn, token, _runtime) = match connect_admin() {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-
-    if let Err(e) = conn.request_ok(
+    let (mut conn, token, _runtime) = connect_admin()?;
+    conn.request_ok(
         &token,
         AdminRequest::Renew {
             session: id.clone(),
             ttl_secs,
         },
-    ) {
-        return admin_failed(e);
-    }
+    )?;
 
     match find_session(&mut conn, &token, &id) {
         Some(info) => {
@@ -1063,7 +1018,7 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
         }
         None => println!("renewed {id}"),
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 /// What ends a session, per "Options" in `docs/airlock-v2-ux.md`
@@ -1080,19 +1035,10 @@ fn ends_text(ends: &EndsInfo, now: u64) -> String {
     }
 }
 
-fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
-    let home = match home_dir_or_fail() {
-        Ok(h) => h,
-        Err(code) => return code,
-    };
-    let (mut conn, token, _runtime) = match connect_admin() {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let sessions = match conn.list_sessions(&token) {
-        Ok(sessions) => sessions,
-        Err(e) => return admin_failed(e),
-    };
+fn cmd_session_list(cwd: &std::path::Path, here: bool) -> CliResult {
+    let home = home_dir()?;
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
 
     let project_root = discover_root_quietly(cwd);
     let now = now_unix();
@@ -1116,18 +1062,12 @@ fn cmd_session_list(cwd: &std::path::Path, here: bool) -> ExitCode {
         })
         .collect();
     print!("{}", inspect::table(&rows));
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
-fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> ExitCode {
-    let (mut conn, token, _runtime) = match connect_admin() {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    let sessions = match conn.list_sessions(&token) {
-        Ok(sessions) => sessions,
-        Err(e) => return admin_failed(e),
-    };
+fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
 
     let project_root = discover_root_quietly(cwd);
     let targets: Vec<SessionInfo> = if all {
@@ -1136,17 +1076,10 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
         // Resolve each ref exactly once, by the same rule the daemon's own
         // handlers use (exact id, unique id prefix, or unique name) — never
         // silently reload every session an ambiguous ref happens to match.
-        let mut resolved = Vec::with_capacity(ids.len());
-        for id in &ids {
-            match session::resolve_session_ref(id, &sessions) {
-                Ok(info) => resolved.push(info.clone()),
-                Err(msg) => {
-                    eprint_error(msg);
-                    return ExitCode::from(125);
-                }
-            }
-        }
-        resolved
+        ids.iter()
+            .map(|id| session::resolve_session_ref(id, &sessions).cloned())
+            .collect::<Result<_, _>>()
+            .map_err(CliError::new)?
     } else {
         sessions
             .into_iter()
@@ -1202,19 +1135,12 @@ fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> Exi
             }
         }
     }
-    exit
+    Ok(exit)
 }
 
-fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: bool) -> ExitCode {
-    let (mut conn, token, _runtime) = match connect_admin() {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-
-    let sessions = match conn.list_sessions(&token) {
-        Ok(sessions) => sessions,
-        Err(e) => return admin_failed(e),
-    };
+fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: bool) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
 
     // Refs resolve by the daemon's rule (exact id, unique id prefix, unique
     // name), so an ambiguous ref is refused instead of ending every session
@@ -1226,56 +1152,43 @@ fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: 
             .filter(|s| all || project_root.as_deref() == Some(s.root.as_path()))
             .collect()
     } else {
-        let mut resolved = Vec::new();
-        for id in &ids {
-            match airlock::session::resolve_session_ref(id, &sessions) {
-                Ok(s) => resolved.push(s),
-                Err(message) => {
-                    eprint_error(message);
-                    return ExitCode::from(125);
-                }
-            }
-        }
-        resolved
+        ids.iter()
+            .map(|id| session::resolve_session_ref(id, &sessions))
+            .collect::<Result<_, _>>()
+            .map_err(CliError::new)?
     };
 
     if targets.is_empty() {
-        eprintln!("error: no matching session");
-        return ExitCode::from(125);
+        return Err(CliError::new("no matching session"));
     }
 
-    if let Err(e) = conn.request_ok(
+    conn.request_ok(
         &token,
         AdminRequest::Revoke {
             sessions: targets.iter().map(|s| s.id.to_string()).collect(),
         },
-    ) {
-        return admin_failed(e);
-    }
+    )?;
 
     for s in &targets {
         println!("ended {} {:?}", s.id, s.name);
     }
-    ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
 }
 
 // ─── Command: daemon ─────────────────────────────────────────────────────────
 
-fn report_daemon_start_result(result: Result<(), daemon::DaemonError>) -> ExitCode {
+fn report_daemon_start_result(result: Result<(), daemon::DaemonError>) -> CliResult {
     match result {
-        Ok(()) => ExitCode::SUCCESS,
+        Ok(()) => Ok(ExitCode::SUCCESS),
         Err(daemon::DaemonError::StartInProgress) => {
             eprintln!("note: another process is already starting or running the daemon");
-            ExitCode::from(daemon::START_IN_PROGRESS_EXIT_CODE)
+            Ok(ExitCode::from(daemon::START_IN_PROGRESS_EXIT_CODE))
         }
-        Err(e) => {
-            eprint_error(e);
-            ExitCode::from(125)
-        }
+        Err(e) => Err(CliError::new(e)),
     }
 }
 
-fn cmd_daemon(action: DaemonAction) -> ExitCode {
+fn cmd_daemon(action: DaemonAction) -> CliResult {
     match action {
         DaemonAction::Start {
             foreground,
@@ -1293,15 +1206,15 @@ fn cmd_daemon(action: DaemonAction) -> ExitCode {
         }
         DaemonAction::Stop { yes } => cmd_daemon_stop(yes),
         DaemonAction::Restart { yes } => {
-            let stop_code = cmd_daemon_stop(yes);
+            let stop_code = cmd_daemon_stop(yes)?;
             if stop_code != ExitCode::SUCCESS {
-                return stop_code;
+                return Ok(stop_code);
             }
             report_daemon_start_result(daemon::start(DaemonMode::Manual, false))
         }
         DaemonAction::Logs { session } => cmd_daemon_logs(session),
-        DaemonAction::Install => cmd_daemon_install(),
-        DaemonAction::Uninstall => airlock::service::uninstall_cmd(),
+        DaemonAction::Install => Ok(cmd_daemon_install()),
+        DaemonAction::Uninstall => Ok(airlock::service::uninstall_cmd()),
     }
 }
 
@@ -1319,32 +1232,17 @@ fn cmd_daemon_install() -> ExitCode {
 const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
 const DAEMON_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
-fn cmd_daemon_stop(yes: bool) -> ExitCode {
-    let runtime = match RuntimeDir::locate() {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::from(125);
-        }
-    };
+fn cmd_daemon_stop(yes: bool) -> CliResult {
+    let runtime = RuntimeDir::locate()?;
     let mut conn = match admin::Connection::connect(&runtime.socket_path()) {
         Ok(c) => c,
         Err(AdminError::Unreachable { .. }) => {
             eprintln!("daemon is not running");
-            return ExitCode::SUCCESS;
+            return Ok(ExitCode::SUCCESS);
         }
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
+        Err(e) => return Err(e.into()),
     };
-    let token = match launcher::read_admin_token(&runtime) {
-        Ok(t) => t,
-        Err(e) => {
-            eprint_error(e);
-            return ExitCode::from(125);
-        }
-    };
+    let token = launcher::read_admin_token(&runtime)?;
 
     if conn.hello.sessions > 0 {
         let interactive = airlock::trust::is_interactive();
@@ -1366,79 +1264,52 @@ fn cmd_daemon_stop(yes: bool) -> ExitCode {
             let approved = airlock::trust::prompt_yes_no("Stop the daemon? [y/N]").unwrap_or(false);
             if !approved {
                 eprintln!("not stopped");
-                return ExitCode::from(125);
+                return Ok(ExitCode::from(125));
             }
         } else if !yes {
-            eprintln!(
-                "error: the daemon has {} active session(s); pass --yes to stop it anyway",
+            return Err(CliError::new(format!(
+                "the daemon has {} active session(s); pass --yes to stop it anyway",
                 conn.hello.sessions
-            );
-            return ExitCode::from(125);
+            )));
         }
     }
 
     let pid = conn.hello.pid;
-    if let Err(e) = conn.request_ok(&token, AdminRequest::Stop) {
-        return admin_failed(e);
-    }
+    conn.request_ok(&token, AdminRequest::Stop)?;
     drop(conn);
 
     let deadline = std::time::Instant::now() + DAEMON_STOP_TIMEOUT;
     while std::time::Instant::now() < deadline {
         if unsafe { libc::kill(pid as i32, 0) } != 0 {
             eprintln!("daemon stopped");
-            return ExitCode::SUCCESS;
+            return Ok(ExitCode::SUCCESS);
         }
         std::thread::sleep(DAEMON_STOP_POLL_INTERVAL);
     }
     eprintln!("daemon did not stop; PID {pid} may require manual intervention");
-    ExitCode::from(125)
+    Ok(ExitCode::from(125))
 }
 
-fn cmd_daemon_logs(session: Option<String>) -> ExitCode {
-    let (mut conn, token, _runtime) = match connect_admin() {
-        Ok(v) => v,
-        Err(code) => return code,
-    };
-    match conn.admin_request(&token, AdminRequest::Logs { session }) {
-        Ok(DaemonMessage::LogsResponse { entries }) => {
+fn cmd_daemon_logs(session: Option<String>) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    match conn.admin_request(&token, AdminRequest::Logs { session })? {
+        DaemonMessage::LogsResponse { entries } => {
             for entry in &entries {
                 println!("{} {}", entry.timestamp, entry.message);
             }
-            ExitCode::SUCCESS
+            Ok(ExitCode::SUCCESS)
         }
-        Ok(_) => admin_failed(AdminError::UnexpectedResponse),
-        Err(e) => admin_failed(e),
+        _ => Err(AdminError::UnexpectedResponse.into()),
     }
 }
 
 // ─── Shared admin helpers ─────────────────────────────────────────────────────
 
-/// Reports a failed admin request and picks its exit code: the daemon's
-/// own [`ErrorKind`](airlock::protocol::ErrorKind) when it answered with
-/// one, else 125.
-fn admin_failed(e: AdminError) -> ExitCode {
-    eprint_error(&e);
-    match e {
-        AdminError::Daemon { kind, .. } => ExitCode::from(kind.exit_code()),
-        _ => ExitCode::from(125),
-    }
-}
-
 fn connect_admin()
--> Result<(admin::Connection, airlock::protocol::AdminToken, RuntimeDir), ExitCode> {
-    let runtime = RuntimeDir::locate().map_err(|e| {
-        eprintln!("error: {e}");
-        ExitCode::from(125)
-    })?;
-    let conn = admin::Connection::connect(&runtime.socket_path()).map_err(|e| {
-        eprint_error(e);
-        ExitCode::from(125)
-    })?;
-    let token = launcher::read_admin_token(&runtime).map_err(|e| {
-        eprint_error(e);
-        ExitCode::from(125)
-    })?;
+-> Result<(admin::Connection, airlock::protocol::AdminToken, RuntimeDir), CliError> {
+    let runtime = RuntimeDir::locate()?;
+    let conn = admin::Connection::connect(&runtime.socket_path())?;
+    let token = launcher::read_admin_token(&runtime)?;
     Ok((conn, token, runtime))
 }
 
