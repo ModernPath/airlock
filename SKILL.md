@@ -226,7 +226,15 @@ fail. Use non-interactive flags where available (e.g. `--yes`, `--no-pager`).
 allocate new ones: `tmux`, `script`, `expect` and similar fail to open a pty.
 That's deliberate (a pty grant on macOS would also reach the user's other
 terminal tabs). If a task needs one, tell the user; they can set
-`[agent] pty = true`.
+`pty = true` under `[agent.terminal]` in `airlock.local.toml`.
+
+### Clipboard writes lose their line breaks
+
+If you copy text to the user's clipboard with an `OSC 52` escape sequence,
+line breaks and tabs arrive as spaces and other control characters are
+removed, so a paste can never submit anything by itself. Reading the
+clipboard that way doesn't work at all. To hand the user multi-line text,
+print it or write it to a file.
 
 ### No binary output
 

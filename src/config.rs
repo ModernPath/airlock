@@ -366,6 +366,17 @@ pub enum ConfigError {
         tool: String,
     },
 
+    /// `[agent.terminal]` was set in the repo layer, which is not allowed —
+    /// every setting there turns a protection of the user's own terminal
+    /// off, which a checked-in file must not decide for them.
+    #[error(
+        "{file}: [agent.terminal] is not allowed in the repo config; set it in airlock.local.toml or your global config"
+    )]
+    AgentTerminalInRepo {
+        /// The repo config file.
+        file: PathBuf,
+    },
+
     /// `[kits.<name>]` was set in the repo layer, which is not allowed —
     /// same spirit as [`ConfigError::AllowHomeRootInRepo`]: a teammate's
     /// checked-in file must not decide what a kit may write in your home.
@@ -776,8 +787,25 @@ pub struct RawAgentConfig {
     /// ([`crate::launcher::prepare`]).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub kits: Vec<String>,
-    /// Let the agent allocate pseudo-terminals. Off by default: on macOS it
-    /// also opens every other terminal tab to the agent.
+    /// `[agent.terminal]`: how the agent gets its terminal. Global and
+    /// local layers only — each setting turns a protection off.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub terminal: Option<RawAgentTerminal>,
+}
+
+/// Raw deserialized `[agent.terminal]` subsection. Each field merges on
+/// its own, the highest layer that sets it winning.
+#[derive(Debug, Clone, Default, PartialEq, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RawAgentTerminal {
+    /// Relay the agent's terminal through a pty of its own. Default `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub relay: Option<bool>,
+    /// Filter escape sequences out of the relayed output. Default `true`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub filter: Option<bool>,
+    /// Let the agent allocate pseudo-terminals. Default `false`: on macOS
+    /// it also opens every other terminal tab to the agent.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pty: Option<bool>,
 }
@@ -1102,8 +1130,41 @@ pub struct AgentConfig {
     /// Additional read-write filesystem paths for the agent sandbox (resolved).
     pub filesystem_write: Vec<PathBuf>,
 
-    /// Whether the agent may allocate pseudo-terminals.
+    /// `[agent.terminal]`, defaults filled in.
+    pub terminal: AgentTerminal,
+}
+
+/// Resolved `[agent.terminal]`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct AgentTerminal {
+    /// Relay the agent's terminal through a pty of its own.
+    pub relay: bool,
+    /// Filter escape sequences out of the relayed output.
+    pub filter: bool,
+    /// Let the agent allocate pseudo-terminals.
     pub pty: bool,
+}
+
+impl Default for AgentTerminal {
+    fn default() -> Self {
+        AgentTerminal {
+            relay: true,
+            filter: true,
+            pty: false,
+        }
+    }
+}
+
+impl AgentTerminal {
+    fn resolve(raw: Option<&RawAgentTerminal>) -> Self {
+        let default = AgentTerminal::default();
+        let Some(raw) = raw else { return default };
+        AgentTerminal {
+            relay: raw.relay.unwrap_or(default.relay),
+            filter: raw.filter.unwrap_or(default.filter),
+            pty: raw.pty.unwrap_or(default.pty),
+        }
+    }
 }
 
 /// Every path this config grants write access to: `filesystem.write`, every
@@ -1826,7 +1887,7 @@ pub fn resolve_wire_config(raw: RawConfig, root: &Path) -> Result<Config, Config
                 env: agent_env,
                 filesystem_read: agent_fs_read,
                 filesystem_write: agent_fs_write,
-                pty: raw_agent.pty.unwrap_or(false),
+                terminal: AgentTerminal::resolve(raw_agent.terminal.as_ref()),
             })
         }
     };
@@ -3849,6 +3910,26 @@ kits = ["rust"]
             agent.filesystem_write.is_empty(),
             "default filesystem_write should be empty"
         );
+        assert_eq!(
+            agent.terminal,
+            AgentTerminal {
+                relay: true,
+                filter: true,
+                pty: false,
+            },
+            "the terminal protections are on unless turned off"
+        );
+    }
+
+    #[test]
+    fn agent_terminal_keeps_defaults_for_what_it_leaves_unset() {
+        let tmp = tempdir().unwrap();
+        write_config(tmp.path(), minimal_config());
+        write_local_config(tmp.path(), "[agent.terminal]\nfilter = false\n");
+        let terminal = load_config(tmp.path()).unwrap().agent.unwrap().terminal;
+        assert!(terminal.relay);
+        assert!(!terminal.filter);
+        assert!(!terminal.pty);
     }
 
     // ── AgentConfig: timeout = 0 → zero Duration; positive → seconds ────

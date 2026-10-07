@@ -258,18 +258,23 @@ fn openpty() -> (std::os::fd::OwnedFd, std::os::fd::OwnedFd, String) {
     (master, slave, name)
 }
 
-// The agent can reopen the terminal it was started on by name, but another
-// pty — standing in for another terminal tab — only with `[agent] pty`.
+// The agent can reopen its own terminal by name — the relay's pty, or with
+// `relay = false` the terminal `airlock run` was started on — but another
+// pty, standing in for another terminal tab, only with `pty = true`.
 #[test]
 #[cfg(target_os = "macos")]
 #[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 fn run_agent_reaches_its_own_terminal_and_others_only_with_pty() {
-    for (config, expected) in [
-        (minimal_config(), 0),
-        ("[tools.echo]\n\n[agent]\npty = true\n", 2),
+    for (local, expected) in [
+        (None, 0),
+        (Some("[agent.terminal]\nrelay = false\n"), 0),
+        (Some("[agent.terminal]\npty = true\n"), 2),
     ] {
         let fx = Fixture::new();
-        fx.write_config(config);
+        fx.write_config(minimal_config());
+        if let Some(local) = local {
+            std::fs::write(fx.project.path().join("airlock.local.toml"), local).unwrap();
+        }
         let trust_output = fx.cmd().args(["trust", "--yes"]).output().unwrap();
         assert!(trust_output.status.success(), "{trust_output:?}");
 
@@ -284,7 +289,7 @@ fn run_agent_reaches_its_own_terminal_and_others_only_with_pty() {
             .args(["run", "--no-session", "--", "/bin/sh", "-c", &script])
             .status()
             .unwrap();
-        assert_eq!(status.code(), Some(expected), "config:\n{config}");
+        assert_eq!(status.code(), Some(expected), "local config: {local:?}");
     }
 }
 

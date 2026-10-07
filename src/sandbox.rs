@@ -172,7 +172,7 @@ pub struct AgentPolicy {
     /// terminal. Only these and `/dev/tty` are opened read-write — never
     /// every `/dev/ttys*`, which is every terminal tab the user has open.
     pub terminals: Vec<PathBuf>,
-    /// `[agent] pty = true`: the agent may allocate pseudo-terminals.
+    /// `[agent.terminal] pty = true`: the agent may allocate pseudo-terminals.
     /// Seatbelt can't tell a pty the agent just allocated from another
     /// tab's, so this grants every `/dev/ttys*` again.
     pub pty: bool,

@@ -29,6 +29,7 @@ src/
 ├── exec.rs          Filtered PATH, binary resolution and location check, env construction, child spawn
 ├── run.rs           `airlock run`: launcher + agent sandbox orchestration, tool shims
 ├── relay.rs         `airlock run`'s pty between the agent and the user's terminal
+│   └── filter.rs     Escape-sequence filter on the relayed output (clipboard, iTerm2 tmux integration)
 ├── launcher.rs       Shared launcher steps: discover, approve, resolve secrets, `Register`/`Reload`
 ├── daemon.rs        Daemonization, accept loop, per-connection dispatch across sessions
 ├── agent.rs          `airlock agent check` / `agent hook`
@@ -112,7 +113,7 @@ Kits ([src/kits.rs](src/kits.rs)) add a language toolchain's cache access to `ai
 
 ### The agent's terminal
 
-When any of `airlock run`'s stdio is a terminal, the agent gets a pty of its own instead ([src/relay.rs](src/relay.rs)): `Relay::open` allocates it before the sandbox profile is built (the profile grants exactly its slave), `spawn_agent` hands the slave to the agent as stdio and, in `pre_exec` before the sandbox applies, `setsid` + `TIOCSCTTY` make it the agent's controlling terminal. `Relay::start` puts the real terminal in raw mode and starts one relay thread that `poll`s the master and stdin; `signal_loop` passes SIGWINCH on through `Relay::resize`. When the agent exits, `Relay::finish` stops the thread, forwards output still in flight, and reads the terminal's input up to the answer to its own status query (`ESC [5n`) before restoring the terminal and closing the master. Why each step exists is in [SECURITY.md](SECURITY.md#the-agents-terminal).
+When any of `airlock run`'s stdio is a terminal and `[agent.terminal] relay` is on (the default), the agent gets a pty of its own instead ([src/relay.rs](src/relay.rs)): `Relay::open` allocates it before the sandbox profile is built (the profile grants exactly its slave), `spawn_agent` hands the slave to the agent as stdio and, in `pre_exec` before the sandbox applies, `setsid` + `TIOCSCTTY` make it the agent's controlling terminal. `Relay::start` puts the real terminal in raw mode and starts one relay thread that `poll`s the master and stdin, passing the agent's output through `relay::filter::Filter` unless `filter = false` (a streaming parser; the thread hands it back, mid-sequence state and all, for the final forward); `signal_loop` passes SIGWINCH on through `Relay::resize`. When the agent exits, `Relay::finish` stops the thread, forwards output still in flight, and reads the terminal's input up to the answer to its own status query (`ESC [5n`) before restoring the terminal and closing the master. Why each step exists is in [SECURITY.md](SECURITY.md#the-agents-terminal).
 
 ### Tool shims
 

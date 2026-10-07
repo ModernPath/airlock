@@ -9,7 +9,11 @@
 //! stops; and when the agent exits, [`Relay::finish`] reads the terminal's
 //! input up to the answer to a query of its own before handing the terminal
 //! back, so no reply the agent provoked is left for the user's shell to read
-//! as typed input. See SECURITY.md, "The agent's terminal".
+//! as typed input. With [`filter`] on, the agent's output also loses the
+//! escape sequences the terminal would act on by itself. See SECURITY.md,
+//! "The agent's terminal".
+
+mod filter;
 
 use std::ffi::OsString;
 use std::io;
@@ -25,6 +29,8 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{Mode, OFlags};
 use rustix::pty::OpenptFlags;
 use rustix::termios::{OptionalActions, QueueSelector, Termios};
+
+use self::filter::Filter;
 
 /// Asks the terminal for a status report. Every VT100-compatible terminal
 /// answers [`STATUS_OK`], and answers queries in the order it got them, so
@@ -66,15 +72,18 @@ pub struct Relay {
     slave_path: PathBuf,
     /// The terminal's modes before raw mode, restored on drop.
     saved: Option<Termios>,
+    /// The output filter, when on. The relay thread has it while it runs.
+    filter: Option<Filter>,
     /// The relay thread and the write end of the pipe that stops it.
-    running: Option<(OwnedFd, JoinHandle<()>)>,
+    running: Option<(OwnedFd, JoinHandle<Option<Filter>>)>,
 }
 
 impl Relay {
     /// A pty for the agent, if any of `stdio` (stdin, stdout, stderr) is a
     /// terminal. `None` means there is no terminal to protect, and the agent
-    /// inherits `stdio` as is.
-    pub fn open(stdio: [BorrowedFd<'static>; 3]) -> io::Result<Option<Self>> {
+    /// inherits `stdio` as is. `filter` runs the agent's output through
+    /// [`Filter`].
+    pub fn open(stdio: [BorrowedFd<'static>; 3], filter: bool) -> io::Result<Option<Self>> {
         let is_tty = stdio.map(rustix::termios::isatty);
         let Some(terminal) = [1, 2, 0].into_iter().find(|&i| is_tty[i]).map(|i| stdio[i]) else {
             return Ok(None);
@@ -115,6 +124,7 @@ impl Relay {
             slave: Some(slave),
             slave_path,
             saved: None,
+            filter: filter.then(Filter::new),
             running: None,
         }))
     }
@@ -169,7 +179,8 @@ impl Relay {
         let master = Arc::clone(&self.master);
         let stdin = self.input.then_some(self.stdin);
         let terminal = self.terminal;
-        let thread = std::thread::spawn(move || pump(&master, stdin, terminal, &stop_rx));
+        let filter = self.filter.take();
+        let thread = std::thread::spawn(move || pump(&master, stdin, terminal, &stop_rx, filter));
         self.running = Some((stop_tx, thread));
         Ok(())
     }
@@ -189,7 +200,17 @@ impl Relay {
     /// still holding the slave writing into nothing.
     pub fn finish(mut self) {
         self.stop();
-        forward_available(&self.master, self.terminal, FINAL_OUTPUT_LIMIT);
+        forward_available(
+            &self.master,
+            self.terminal,
+            FINAL_OUTPUT_LIMIT,
+            self.filter.as_mut(),
+        );
+        if let Some(filter) = &mut self.filter {
+            let mut tail = Vec::new();
+            filter.close(&mut tail);
+            let _ = write_all(self.terminal, &tail);
+        }
         if self.input {
             drain_replies(self.stdin, self.terminal);
         }
@@ -198,7 +219,9 @@ impl Relay {
     fn stop(&mut self) {
         if let Some((stop_tx, thread)) = self.running.take() {
             let _ = rustix::io::write(&stop_tx, b"x");
-            let _ = thread.join();
+            if let Ok(filter) = thread.join() {
+                self.filter = filter;
+            }
         }
     }
 }
@@ -212,16 +235,24 @@ impl Drop for Relay {
     }
 }
 
-/// The relay loop: agent output from the master to the terminal, keyboard
-/// input from stdin (when relayed) to the master, until `stop` is readable.
-/// The master is non-blocking, so an agent that stops reading its input
-/// can't wedge the loop; writes to the terminal block, as they would for
-/// the agent writing to it directly.
-fn pump(master: &OwnedFd, stdin: Option<BorrowedFd<'_>>, terminal: BorrowedFd<'_>, stop: &OwnedFd) {
+/// The relay loop: agent output from the master to the terminal (through
+/// `filter`, when on), keyboard input from stdin (when relayed) to the
+/// master, until `stop` is readable. Hands `filter` back, mid-sequence
+/// state and all, for [`Relay::finish`]. The master is non-blocking, so an
+/// agent that stops reading its input can't wedge the loop; writes to the
+/// terminal block, as they would for the agent writing to it directly.
+fn pump(
+    master: &OwnedFd,
+    stdin: Option<BorrowedFd<'_>>,
+    terminal: BorrowedFd<'_>,
+    stop: &OwnedFd,
+    mut filter: Option<Filter>,
+) -> Option<Filter> {
     let mut stdin = stdin;
     let mut master_open = true;
     let mut to_agent: Vec<u8> = Vec::new();
     let mut buf = vec![0u8; 16 * 1024];
+    let mut filtered = Vec::new();
 
     loop {
         let mut master_events = PollFlags::IN;
@@ -242,7 +273,7 @@ fn pump(master: &OwnedFd, stdin: Option<BorrowedFd<'_>>, terminal: BorrowedFd<'_
         match rustix::event::poll(&mut fds, None) {
             Ok(_) => {}
             Err(rustix::io::Errno::INTR) => continue,
-            Err(_) => return,
+            Err(_) => return filter,
         }
         let stop_ready = !fds[0].revents().is_empty();
         let master_ready = if master_open {
@@ -257,14 +288,14 @@ fn pump(master: &OwnedFd, stdin: Option<BorrowedFd<'_>>, terminal: BorrowedFd<'_
         drop(fds);
 
         if stop_ready {
-            return;
+            return filter;
         }
 
         if master_ready.intersects(PollFlags::IN | PollFlags::HUP | PollFlags::ERR) {
             match rustix::io::read(master, &mut buf) {
                 Ok(0) => master_open = false,
                 Ok(n) => {
-                    let _ = write_all(terminal, &buf[..n]);
+                    let _ = write_all(terminal, through(filter.as_mut(), &buf[..n], &mut filtered));
                 }
                 Err(rustix::io::Errno::AGAIN | rustix::io::Errno::INTR) => {}
                 // EIO: every process holding the slave has closed it.
@@ -299,17 +330,38 @@ fn pump(master: &OwnedFd, stdin: Option<BorrowedFd<'_>>, terminal: BorrowedFd<'_
     }
 }
 
+/// `bytes` as they should reach the terminal: through `filter` when on,
+/// using `scratch` for the result.
+fn through<'a>(filter: Option<&mut Filter>, bytes: &'a [u8], scratch: &'a mut Vec<u8>) -> &'a [u8] {
+    match filter {
+        Some(filter) => {
+            scratch.clear();
+            filter.push(bytes, scratch);
+            scratch
+        }
+        None => bytes,
+    }
+}
+
 /// Forwards agent output already waiting in the master, up to `limit`
 /// bytes, without waiting for more.
-fn forward_available(master: &OwnedFd, terminal: BorrowedFd<'_>, limit: usize) {
+fn forward_available(
+    master: &OwnedFd,
+    terminal: BorrowedFd<'_>,
+    limit: usize,
+    filter: Option<&mut Filter>,
+) {
+    let mut filter = filter;
     let mut buf = vec![0u8; 16 * 1024];
+    let mut filtered = Vec::new();
     let mut forwarded = 0;
     while forwarded < limit {
         let want = buf.len().min(limit - forwarded);
         match rustix::io::read(master, &mut buf[..want]) {
             Ok(0) => return,
             Ok(n) => {
-                if write_all(terminal, &buf[..n]).is_err() {
+                let bytes = through(filter.as_deref_mut(), &buf[..n], &mut filtered);
+                if write_all(terminal, bytes).is_err() {
                     return;
                 }
                 forwarded += n;
@@ -437,7 +489,7 @@ mod tests {
         let r: &'static OwnedFd = Box::leak(Box::new(r));
         let w: &'static OwnedFd = Box::leak(Box::new(w));
         assert!(
-            Relay::open([r.as_fd(), w.as_fd(), w.as_fd()])
+            Relay::open([r.as_fd(), w.as_fd(), w.as_fd()], true)
                 .unwrap()
                 .is_none()
         );
@@ -446,7 +498,7 @@ mod tests {
     #[test]
     fn agent_output_reaches_the_terminal_until_finish_and_never_after() {
         let term = FakeTerminal::new();
-        let mut relay = Relay::open(term.stdio()).unwrap().unwrap();
+        let mut relay = Relay::open(term.stdio(), true).unwrap().unwrap();
         let agent = rustix::fs::open(relay.slave_path(), OFlags::RDWR, Mode::empty()).unwrap();
         relay.start().unwrap();
 
@@ -469,7 +521,7 @@ mod tests {
     #[test]
     fn output_in_flight_at_exit_is_still_forwarded() {
         let term = FakeTerminal::new();
-        let mut relay = Relay::open(term.stdio()).unwrap().unwrap();
+        let mut relay = Relay::open(term.stdio(), true).unwrap().unwrap();
         let agent = rustix::fs::open(relay.slave_path(), OFlags::RDWR, Mode::empty()).unwrap();
         relay.start().unwrap();
         // Stop the relay thread first, so the bytes below are still in the
@@ -483,13 +535,40 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn filtered_relay_keeps_line_breaks_out_of_the_clipboard() {
+        use base64::Engine;
+        let b64 = |s: &str| base64::engine::general_purpose::STANDARD.encode(s);
+
+        for (filter, expected) in [(true, "rm -rf ~ "), (false, "rm -rf ~\n")] {
+            let term = FakeTerminal::new();
+            let mut relay = Relay::open(term.stdio(), filter).unwrap().unwrap();
+            let agent = rustix::fs::open(relay.slave_path(), OFlags::RDWR, Mode::empty()).unwrap();
+            let mut raw = rustix::termios::tcgetattr(&agent).unwrap();
+            raw.make_raw();
+            rustix::termios::tcsetattr(&agent, OptionalActions::Now, &raw).unwrap();
+            relay.start().unwrap();
+
+            let sent = format!("\x1b]52;c;{}\x07done", b64("rm -rf ~\n"));
+            write_all(agent.as_fd(), sent.as_bytes()).unwrap();
+            let screen = read_until(&term.master, b"done");
+            let want = format!("\x1b]52;c;{}\x07done", b64(expected));
+            assert!(
+                contains(&screen, want.as_bytes()),
+                "filter {filter}: {:?}",
+                String::from_utf8_lossy(&screen)
+            );
+            relay.finish();
+        }
+    }
+
     // The relay only reads keyboard input in the terminal's foreground,
     // which a test pty with no controlling process isn't; `pump` is driven
     // directly instead.
     #[test]
     fn keyboard_input_reaches_the_agent() {
         let term = FakeTerminal::new();
-        let relay = Relay::open(term.stdio()).unwrap().unwrap();
+        let relay = Relay::open(term.stdio(), true).unwrap().unwrap();
         let agent = rustix::fs::open(relay.slave_path(), OFlags::RDWR, Mode::empty()).unwrap();
         // Raw on both sides, as `start` leaves the user's terminal and a
         // full-screen agent leaves its own.
@@ -503,7 +582,8 @@ mod tests {
         let master = Arc::clone(&relay.master);
         let stdin = relay.stdin;
         let terminal = relay.terminal;
-        let thread = std::thread::spawn(move || pump(&master, Some(stdin), terminal, &stop_rx));
+        let thread =
+            std::thread::spawn(move || pump(&master, Some(stdin), terminal, &stop_rx, None));
 
         write_all(term.master.as_fd(), b"typed").unwrap();
         assert!(contains(&read_until(&agent, b"typed"), b"typed"));

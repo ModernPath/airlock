@@ -1278,6 +1278,11 @@ fn merge_level(
                 file: file.to_path_buf(),
             });
         }
+        if repo.agent.as_ref().is_some_and(|a| a.terminal.is_some()) {
+            return Err(ConfigError::AgentTerminalInRepo {
+                file: file.to_path_buf(),
+            });
+        }
         reject_override(file, repo.tools.as_ref())?;
     }
 
@@ -1558,7 +1563,7 @@ fn merge_level(
             (None, Vec::new(), HashMap::new(), Vec::new())
         } else {
             let mut timeout: Option<u64> = None;
-            let mut pty: Option<bool> = None;
+            let mut terminal: Option<config::RawAgentTerminal> = None;
             let mut passthrough_env_prov: Vec<(String, LayerKind)> = Vec::new();
             let mut env_by_key: HashMap<String, (LayerKind, RawEnvValue)> = HashMap::new();
             // Every layer (in merge order) that set a given `agent.env` key, so
@@ -1575,8 +1580,11 @@ fn merge_level(
                 if a.timeout.is_some() {
                     timeout = a.timeout;
                 }
-                if a.pty.is_some() {
-                    pty = a.pty;
+                if let Some(t) = &a.terminal {
+                    let merged = terminal.get_or_insert_with(Default::default);
+                    merged.relay = t.relay.or(merged.relay);
+                    merged.filter = t.filter.or(merged.filter);
+                    merged.pty = t.pty.or(merged.pty);
                 }
                 union_with_layer(&mut passthrough_env_prov, *kind, a.passthrough_env.clone());
                 for (k, v) in &a.env {
@@ -1653,7 +1661,7 @@ fn merge_level(
                         })
                     },
                     kits: items_of(&agent_kits_prov),
-                    pty,
+                    terminal,
                 }),
                 passthrough_env_prov,
                 agent_env_prov,
@@ -2038,6 +2046,42 @@ mod tests {
         write(tmp.path(), "airlock.toml", "[tools.gh]\noverride = true\n");
         let err = merge_default(tmp.path()).unwrap_err();
         assert!(matches!(err, ConfigError::OverrideOutsideLocal { .. }));
+    }
+
+    #[test]
+    fn merge_agent_terminal_in_repo_errors() {
+        let tmp = tempdir().unwrap();
+        write(
+            tmp.path(),
+            "airlock.toml",
+            "[agent.terminal]\nrelay = false\n",
+        );
+        let err = merge_default(tmp.path()).unwrap_err();
+        assert!(matches!(err, ConfigError::AgentTerminalInRepo { .. }));
+        assert!(err.to_string().contains("airlock.local.toml"), "{err}");
+    }
+
+    #[test]
+    fn merge_agent_terminal_merges_each_setting_on_its_own() {
+        let tmp = tempdir().unwrap();
+        let global = tmp.path().join("global.toml");
+        std::fs::write(&global, "[agent.terminal]\nrelay = false\npty = true\n").unwrap();
+        write(tmp.path(), "airlock.toml", "[tools.t]\n");
+        write(
+            tmp.path(),
+            "airlock.local.toml",
+            "[agent.terminal]\nrelay = true\nfilter = false\n",
+        );
+        let layers = load_layers(&DiscoveryMode::Default, tmp.path(), tmp.path(), &global).unwrap();
+        let merged = merge(&layers, &ctx(&layers.root.clone(), tmp.path())).unwrap();
+        let terminal = merged.to_wire().agent.unwrap().terminal.unwrap();
+        assert_eq!(terminal.relay, Some(true), "local wins over global");
+        assert_eq!(terminal.filter, Some(false));
+        assert_eq!(
+            terminal.pty,
+            Some(true),
+            "global kept where local is silent"
+        );
     }
 
     #[test]

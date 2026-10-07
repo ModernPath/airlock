@@ -254,7 +254,7 @@ pub fn build_agent_policy(config: &Config, toolchain_paths: &[PathBuf]) -> Agent
         read_write_paths,
         requires_network: true,
         requires_terminal: true,
-        pty: config.agent.as_ref().is_some_and(|a| a.pty),
+        pty: config.agent.as_ref().is_some_and(|a| a.terminal.pty),
         git_hooks_deny: Some(config.sandbox_root.join(".git/hooks")),
         ..Default::default()
     }
@@ -780,7 +780,7 @@ mod tests {
             env: BTreeMap::new(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
-            pty: false,
+            terminal: Default::default(),
         }
     }
 

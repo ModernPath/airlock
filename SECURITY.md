@@ -211,7 +211,7 @@ Landlock is allow-only and cannot carve a deny out of a granted subtree, which i
 
 ### The agent's terminal
 
-`airlock run` never gives the agent the user's terminal. If the agent shared it, it could do things to the terminal that outlast its own run or reach past it:
+By default `airlock run` never gives the agent the user's terminal. If the agent shared it, it could do things to the terminal that outlast its own run or reach past it:
 
 - **A process it leaves running keeps the terminal** after the agent exits. It can write into the terminal while the user's shell is in charge again, and read what the user types next — a `sudo` password included — racing the shell for input. Seatbelt can't stop this: the descriptor was inherited before the sandbox applied, and some processes will always outlive the agent (a `setsid` takes them out of its process group, and macOS has no way to keep orphans attached to `airlock run`).
 - **Replies become typed input.** Some escape sequences make the terminal emulator answer — with the cursor position, or the window title — by writing into the terminal's input. A reply the agent provokes just before it exits, or times to arrive just after, is read by the user's shell as if typed. When the reply carries text the agent chose (a window title it set, a `DECRQSS` request), it can become a command: xterm, rxvt and iTerm2 have all had CVEs of exactly this shape.
@@ -228,17 +228,26 @@ Keyboard input is relayed only when stdin is the terminal and `airlock run` is i
 
 **The sandbox on top.** The agent profile (macOS) grants read-write and ioctl on `/dev/tty` and the relay's pty only, nothing else under `/dev/ttys*` or `/dev/ptmx`, so the agent can't open another tab either; `run_agent_reaches_its_own_terminal_and_others_only_with_pty` checks this.
 
-- **`[agent] pty = true` brings back the patterns.** Allocating a pty means opening `/dev/ptmx` and then whichever `/dev/ttysNNN` the kernel hands out, which no literal can name in advance, and Seatbelt can't tell a pty the agent allocated from one of the user's tabs. So turning `pty` on lets the agent open every tab again. Leave it off unless the agent needs `tmux`, `script`, `expect` or a harness that runs commands in a pty.
+- **`[agent.terminal] pty = true` brings back the patterns.** Allocating a pty means opening `/dev/ptmx` and then whichever `/dev/ttysNNN` the kernel hands out, which no literal can name in advance, and Seatbelt can't tell a pty the agent allocated from one of the user's tabs. So turning `pty` on lets the agent open every tab again. Leave it off unless the agent needs `tmux`, `script`, `expect` or a harness that runs commands in a pty.
 - **`TIOCSTI` is denied by name**, `(deny file-ioctl (ioctl-command TIOCSTI))`, after every `file-ioctl` allow. With the relay it could only reach the agent's own pty anyway; something else in the profile already refused it (we tested it), but not by name.
 - **Linux**: the Landlock rules grant nothing under `/dev/pts` or `/dev/ptmx`. The agent's stdio keeps working (Landlock checks a path when it's opened, and these were opened before the sandbox applied), and neither another terminal nor pty allocation is granted. `pty` has no effect on Linux yet.
 
-**What remains: escape sequences while the agent runs.** The agent draws its UI on the user's terminal, so its output reaches the terminal emulator, which acts on it. Replies are no longer the risk — while the agent runs they go to the agent's own pty, and after it exits they're discarded — but some sequences act on the terminal itself. Airlock doesn't filter them today:
+**The output filter.** The agent draws its UI on the user's terminal, so its output reaches the terminal emulator, which acts on it. Replies are no longer the risk — while the agent runs they go to the agent's own pty, and after it exits they're discarded — but some sequences act on the terminal itself. The relay filters the agent's output on its way through ([src/relay/filter.rs](src/relay/filter.rs)):
 
-- **Clipboard (`OSC 52`).** Writing lets the agent put text in the user's clipboard to be pasted later (a command, say). Reading, where the terminal allows it, hands the clipboard's contents to the agent.
-- **Terminal-specific file and integration features**: iTerm2's `OSC 1337` (`File=` downloads, `RequestUpload`, clipboard copy) and its tmux integration mode (`DCS 1000p`), whose parser has had remote-code-execution bugs; kitty's file transfer protocol.
+- **Clipboard writes (`OSC 52`) are cut down to visible text.** The relay decodes the text, turns each run of line breaks and tabs into one space, removes every other control character (C0, `DEL`, C1) and bidi control, and re-encodes it. A paste of what the agent copied can't submit a command line or a form by itself, can't end bracketed paste (`ESC [201~` loses its `ESC`), and shows what it contains. A write with nothing left, or one that isn't valid base64 or UTF-8, is dropped.
+- **Clipboard reads (`OSC 52` with `?`) are dropped.** Where the terminal allows them, they'd hand the clipboard's contents to the agent.
+- **iTerm2's tmux integration (`DCS 1000p`) is dropped, up to the string terminator.** iTerm2 hands everything after it to its tmux protocol parser, which has had remote-code-execution bugs (CVE-2019-9535).
+
+The filter follows how xterm-style terminals delimit these strings, including their UTF-8 C1 forms (`C2 9D` for `OSC`, `C2 9C` for the terminator): an `ESC` other than `ESC \`, or `CAN`/`SUB`, abandons the string, so a clipboard write hidden inside a window title is still seen and filtered. Where the filter and a terminal could disagree, it drops rather than passes: a `DCS 1000p` ends only at a string terminator, and a clipboard write longer than 1 MiB is dropped whole. If the agent exits inside a string it left open, the relay ends it, so the terminal isn't left swallowing the user's shell.
+
+Not filtered, and still reaching the terminal while the agent runs:
+
+- **Other terminal-specific file features**: iTerm2's `OSC 1337` (`File=` downloads, `RequestUpload`, its own clipboard copy) and kitty's file transfer protocol. Both terminals ask before acting on most of these.
 - **Spoofing**: window titles (`OSC 0/2`), desktop notifications (`OSC 9`, `OSC 777`), hyperlinks whose text and target differ (`OSC 8`).
 
-Most terminals turn the dangerous ones off by default or ask first. Keep the terminal emulator up to date, and check its settings for clipboard access and file transfer.
+Keep the terminal emulator up to date, and check its settings for clipboard access and file transfer.
+
+**Turning these off.** `[agent.terminal]` takes `relay = false` (the agent inherits the user's terminal directly; the sandbox then grants exactly that device, found with `ttyname`, and every risk at the top of this section is back) and `filter = false` (the relayed output passes unchanged). Like `pty = true`, they are allowed only in `airlock.local.toml` or the global config — a repo's `airlock.toml` that sets anything under `[agent.terminal]` is a config error — for the same reason as [kits](#kits): a teammate's checked-in file must not turn off a protection of the user's own terminal.
 
 ### Sandbox root
 

@@ -390,8 +390,21 @@ pub fn run_agent(
     policy.runtime_base = Some(prepared.anchors.runtime_base.clone());
     policy.tmpdir = prepared.env_snapshot.get("TMPDIR").map(PathBuf::from);
     policy.home = home.map(PathBuf::from);
-    let mut relay = Relay::open(stdio_fds()).map_err(RunError::Terminal)?;
-    policy.terminals = relay.iter().map(|r| r.slave_path().to_path_buf()).collect();
+    let terminal = prepared
+        .config
+        .agent
+        .as_ref()
+        .map(|a| a.terminal)
+        .unwrap_or_default();
+    let mut relay = if terminal.relay {
+        Relay::open(stdio_fds(), terminal.filter).map_err(RunError::Terminal)?
+    } else {
+        None
+    };
+    policy.terminals = match &relay {
+        Some(relay) => vec![relay.slave_path().to_path_buf()],
+        None => inherited_terminals(),
+    };
     policy
         .read_paths
         .extend(resolve_paths(&opts.allow_read, cwd));
@@ -527,6 +540,24 @@ fn stdio_fds() -> [std::os::fd::BorrowedFd<'static>; 3] {
         rustix::stdio::stdout(),
         rustix::stdio::stderr(),
     ]
+}
+
+/// With `[agent.terminal] relay = false`, the terminal devices behind this
+/// process's stdin/stdout/stderr, which the agent then inherits as they
+/// are: the only ones its sandbox may open.
+fn inherited_terminals() -> Vec<PathBuf> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let mut terminals = Vec::new();
+    for fd in stdio_fds() {
+        if let Ok(name) = rustix::termios::ttyname(fd, Vec::new()) {
+            let path = PathBuf::from(std::ffi::OsString::from_vec(name.into_bytes()));
+            if !terminals.contains(&path) {
+                terminals.push(path);
+            }
+        }
+    }
+    terminals
 }
 
 fn resolve_paths(paths: &[PathBuf], cwd: &Path) -> Vec<PathBuf> {
@@ -723,7 +754,8 @@ fn spawn_agent(
                 });
             }
         }
-        // No terminal at all: nothing for the agent to take over.
+        // No terminal, or `relay = false`: the agent inherits this
+        // process's stdio as is.
         None => {
             cmd.stdin(std::process::Stdio::inherit());
             cmd.stdout(std::process::Stdio::inherit());
@@ -894,7 +926,7 @@ mod tests {
             env: BTreeMap::new(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
-            pty: false,
+            terminal: Default::default(),
         }
     }
 
@@ -908,7 +940,7 @@ mod tests {
                 .collect(),
             filesystem_read: Vec::new(),
             filesystem_write: Vec::new(),
-            pty: false,
+            terminal: Default::default(),
         }
     }
 

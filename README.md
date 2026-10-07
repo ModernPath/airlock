@@ -566,7 +566,19 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 | `passthrough_env` | Host env var names forwarded to the agent (skipped if unset). |
 | `env`             | `NAME = value` map, same syntax as tool `env`. |
 | `filesystem`      | `read = [...]` / `write = [...]` paths beyond the sandbox root. |
-| `pty`             | `true` lets the agent allocate pseudo-terminals (`tmux`, `script`, `expect`, a harness that runs commands in a pty). Off by default: on macOS it also lets the agent open every other terminal tab you have. See [SECURITY.md](SECURITY.md#the-agents-terminal). |
+| `terminal`        | `[agent.terminal]`: how the agent gets its terminal. See below. |
+
+#### `[agent.terminal]`
+
+Every setting here turns a protection off, so like `[kits.*]` it is allowed only in `airlock.local.toml` or your global config, never in a repo's `airlock.toml`. Each setting merges on its own, the highest layer that sets it winning.
+
+| Field    | Default | Description |
+|----------|---------|-------------|
+| `relay`  | `true`  | Give the agent a pty of its own, relayed to your terminal, instead of your terminal itself. Off, a process the agent leaves running keeps your terminal after it exits. |
+| `filter` | `true`  | Filter the relayed output: clipboard writes (`OSC 52`) lose line breaks and control characters, so a paste can't submit anything; clipboard reads and iTerm2's tmux integration (`DCS 1000p`) are dropped. Needs `relay`. |
+| `pty`    | `false` | Let the agent allocate pseudo-terminals (`tmux`, `script`, `expect`, a harness that runs commands in a pty). On macOS this also lets it open every other terminal tab you have. |
+
+See [SECURITY.md](SECURITY.md#the-agents-terminal) for what each one protects against.
 
 `[agent.env]` may reference secrets. This is the one deliberate exception to "the agent never sees secrets": it is for credentials the agent itself must hold — its own LLM API key, typically — not for tool credentials, which belong in `[tools.<name>.env]`.
 
