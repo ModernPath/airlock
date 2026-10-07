@@ -566,40 +566,11 @@ impl Sessions {
         self.live.read().unwrap_or_else(|e| e.into_inner()).len()
     }
 
-    /// Resolve `s` as a session id, a unique id prefix, or a unique name.
-    ///
-    /// Keep this in sync with [`resolve_session_ref`] below, which applies
-    /// the identical rule client-side, over the `SessionInfo` list `session
-    /// list` already returns, for a CLI command that must resolve a ref
-    /// itself before it can act (`session reload`, `session revoke`) rather
-    /// than hand the raw ref to an admin request that resolves it here.
+    /// Resolve `s` as a session id, a unique id prefix, or a unique name,
+    /// by the same rule as [`resolve_session_ref`].
     pub fn resolve_ref(&self, s: &str) -> Result<Arc<Session>, String> {
         let live = self.live.read().unwrap_or_else(|e| e.into_inner());
-
-        if let Ok(id) = SessionId::parse(s)
-            && let Some(session) = live.get(&id)
-        {
-            return Ok(Arc::clone(session));
-        }
-
-        let mut matches: Vec<&Arc<Session>> = live
-            .values()
-            .filter(|session| session.id.as_str().starts_with(s) || session.name == s)
-            .collect();
-        matches.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-        matches.dedup_by(|a, b| a.id == b.id);
-
-        match matches.len() {
-            0 => Err(format!("no session matches {s:?}")),
-            1 => Ok(Arc::clone(matches[0])),
-            _ => {
-                let ids: Vec<&str> = matches.iter().map(|s| s.id.as_str()).collect();
-                Err(format!(
-                    "{s:?} matches more than one session: {}",
-                    ids.join(", ")
-                ))
-            }
-        }
+        resolve_by_ref(s, live.values(), |x| x.id.as_str(), |x| x.name.as_str()).map(Arc::clone)
     }
 }
 
@@ -618,22 +589,35 @@ pub fn resolve_session_ref<'a>(
     s: &str,
     sessions: &'a [SessionInfo],
 ) -> Result<&'a SessionInfo, String> {
-    if let Some(exact) = sessions.iter().find(|session| session.id.as_str() == s) {
+    resolve_by_ref(s, sessions, |x| x.id.as_str(), |x| x.name.as_str())
+}
+
+/// The one rule a session reference resolves by, daemon-side and
+/// client-side alike: an exact id, else a unique id prefix or name.
+/// Ambiguity is an error naming every candidate, never a silent pick.
+fn resolve_by_ref<'a, T>(
+    s: &str,
+    items: impl IntoIterator<Item = &'a T>,
+    id: fn(&T) -> &str,
+    name: fn(&T) -> &str,
+) -> Result<&'a T, String> {
+    let items: Vec<&T> = items.into_iter().collect();
+    if let Some(exact) = items.iter().find(|item| id(item) == s) {
         return Ok(exact);
     }
 
-    let mut matches: Vec<&SessionInfo> = sessions
-        .iter()
-        .filter(|session| session.id.as_str().starts_with(s) || session.name == s)
+    let mut matches: Vec<&T> = items
+        .into_iter()
+        .filter(|item| id(item).starts_with(s) || name(item) == s)
         .collect();
-    matches.sort_by(|a, b| a.id.as_str().cmp(b.id.as_str()));
-    matches.dedup_by(|a, b| a.id == b.id);
+    matches.sort_by(|a, b| id(a).cmp(id(b)));
+    matches.dedup_by(|a, b| id(a) == id(b));
 
-    match matches.len() {
-        0 => Err(format!("no session matches {s:?}")),
-        1 => Ok(matches[0]),
+    match matches.as_slice() {
+        [] => Err(format!("no session matches {s:?}")),
+        [one] => Ok(one),
         _ => {
-            let ids: Vec<&str> = matches.iter().map(|session| session.id.as_str()).collect();
+            let ids: Vec<&str> = matches.iter().map(|m| id(m)).collect();
             Err(format!(
                 "{s:?} matches more than one session: {}",
                 ids.join(", ")

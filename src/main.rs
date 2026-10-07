@@ -1037,7 +1037,7 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
         None => None,
     };
 
-    let (mut conn, token, runtime) = match connect_admin() {
+    let (mut conn, token, _runtime) = match connect_admin() {
         Ok(v) => v,
         Err(code) => return code,
     };
@@ -1064,21 +1064,10 @@ fn cmd_session_renew(id: String, ttl: Option<String>) -> ExitCode {
         }
     }
 
-    let _ = runtime;
     match find_session(&mut conn, &token, &id) {
         Some(info) => {
             let expiry = match info.ends {
-                airlock::protocol::EndsInfo::Ttl { expires_unix } => {
-                    let now = std::time::SystemTime::now()
-                        .duration_since(std::time::UNIX_EPOCH)
-                        .map(|d| d.as_secs())
-                        .unwrap_or(0);
-                    let remaining = expires_unix.saturating_sub(now);
-                    format!(
-                        ", expires in {}",
-                        launcher::format_duration_short(remaining)
-                    )
-                }
+                EndsInfo::Ttl { .. } => format!(", {}", ends_text(&info.ends, now_unix())),
                 _ => String::new(),
             };
             println!("renewed {} {:?}{expiry}", info.id, info.name);
@@ -1500,15 +1489,16 @@ fn connect_admin()
     Ok((conn, token, runtime))
 }
 
+/// The session `id` names, by the same rule the daemon resolved it by.
 fn find_session(
     conn: &mut admin::Connection,
     token: &airlock::protocol::AdminToken,
     id: &str,
 ) -> Option<airlock::protocol::SessionInfo> {
     match conn.admin_request(token, AdminRequest::ListSessions) {
-        Ok(DaemonMessage::Sessions { sessions }) => sessions
-            .into_iter()
-            .find(|s| s.id.as_str() == id || s.id.as_str().starts_with(id) || s.name == id),
+        Ok(DaemonMessage::Sessions { sessions }) => {
+            session::resolve_session_ref(id, &sessions).ok().cloned()
+        }
         _ => None,
     }
 }
