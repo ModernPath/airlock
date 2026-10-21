@@ -8,11 +8,12 @@ mod e2e_helpers;
 
 use std::time::Duration;
 
-use airlock::protocol::{ClientMessage, DaemonMessage};
+use airlock::protocol::{Auth, DaemonMessage, Request, RequestBody, SessionRequest};
 use e2e_helpers::*;
 
 // ─── Tool's process group is killed when client disconnects ─────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn tool_killed_when_client_disconnects() {
     let tmp = tempfile::tempdir().unwrap();
@@ -26,12 +27,17 @@ fn tool_killed_when_client_disconnects() {
     // Start a long-running tool that prints its PID.
     let mut stream = connect_to_daemon(&daemon.socket_path, 30);
 
-    let exec_msg = ClientMessage::Exec {
-        tool: "sh".to_string(),
-        args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
-        cwd: cwd.to_str().unwrap().to_string(),
+    let req = Request {
+        auth: Auth::Session {
+            token: daemon.token.clone(),
+        },
+        body: RequestBody::Session(SessionRequest::Exec {
+            tool: "sh".to_string(),
+            args: vec!["-c".to_string(), "echo $$; exec sleep 600".to_string()],
+            cwd: cwd.clone(),
+        }),
     };
-    send_message(&mut stream, &exec_msg);
+    send_message(&mut stream, &req);
 
     // Read the PID from stdout.
     let mut child_pid: Option<u32> = None;

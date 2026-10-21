@@ -6,9 +6,10 @@ harness hooks, and the examples. The README, SKILL.md and SECURITY.md
 changes are listed in the design doc's
 [Docs to update when this ships](airlock-v2-design.md#docs-to-update-when-this-ships).
 
-**Status:** proposal, companion to [airlock-v2-design.md](airlock-v2-design.md).
-The design doc decides the mechanism. This doc decides the surface. Where
-the surface needed the mechanism to change, the change is listed in
+**Status:** implemented, companion to [airlock-v2-design.md](airlock-v2-design.md).
+The design doc decides the mechanism. This doc decides the surface, and the
+surface described here has shipped. Where the surface needed the mechanism
+to change, the change is listed in
 [Changes to the design](#changes-to-the-design) and marked **(U<n>)** where
 it appears. U1–U16 are accepted and incorporated into the design doc,
 except U14, which is [planned for v2.1](airlock-v2-design.md#planned-for-v21).
@@ -299,6 +300,50 @@ The file is a skeleton like the one `airlock init` writes: a commented
 secret and tool. The user fills it in and runs `airlock run` as usual. It
 is approved like any local file, and nothing lands in the team's
 `.gitignore`.
+
+### A workspace of repos
+
+The user keeps work repos under `~/work` and wants the work tools in each
+of them, with each repo as its own sandbox root.
+
+```
+$ cat ~/work/airlock.toml
+cascade = true
+
+[secrets.GCP_TOKEN]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token"]
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "GCP_TOKEN" }
+
+$ cd ~/work/api && airlock run --profile claude
+~/work/airlock.toml (new):
+    cascade = true
+    ...
+Trust this version and continue? [y/N] y
+trusted ~/work/airlock.toml
+~/work/api/airlock.toml (new):
+    ...
+```
+
+The parent file is approved once; the next repo under `~/work` asks only
+about its own files. `airlock config` lists the parent in `layers` and
+marks what it contributes:
+
+```
+layers
+  global  ~/.config/airlock/airlock.toml  user file
+  parent  ~/work/airlock.toml             trusted
+  repo    ~/work/api/airlock.toml         trusted
+
+tools
+  gcloud  parent  ...
+  gh      repo    ...  (replaces global)
+```
+
+A repo that should not get the work tools sets `inherit = false`, usually
+in its `airlock.local.toml`.
 
 ### Every day
 
@@ -666,8 +711,8 @@ The other outcomes:
 | No session, but the project has `airlock.toml` | "This project uses Airlock, but this agent was not started with `airlock run`, so tools that need credentials are unavailable. Tell the user. Do not look for credentials yourself." | "Airlock: this agent has no session. Start it with `airlock run`." |
 | Session ended, or the daemon does not answer | the `exec` error message, and "tell the user" | the same message |
 | A self-test check fails | "Airlock's sandbox self-test failed: <check>. Do not use `airlock exec` until the user fixes it. Tell the user." No tool list. | "Airlock sandbox self-test failed: <check>" |
-| External sandbox | the tool list, plus "Before your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user." | none |
-| Config changed since the session started | the tool list, plus the config-changed note from [The agent changes the config](#the-agent-changes-the-config) | none |
+| External sandbox | the success context with its first sentence saying the harness provides the sandbox (not self-tested), plus "Before your first `airlock exec`, run `airlock agent check` with your shell tool and report any FAIL to the user." | none |
+| Config changed since the session started | the success context, plus the config-changed note from [The agent changes the config](#the-agent-changes-the-config) | none |
 
 Printing nothing outside Airlock projects means the hook can sit in the
 user-wide `~/.claude/settings.json` without effect elsewhere.
@@ -915,6 +960,8 @@ action, so the agent can relay it without interpreting it.
 | `override = true` on a tool the repo does not define | `error: <local>: tool "gh" sets override, but the repo defines no "gh"` | 125 |
 | Repo label without a binding | lists labels with descriptions + `airlock init --local` hint | 125 |
 | Global item uses a repo label | `error: <global>: tool "x" uses secret "Y", which your global config does not declare` | 125 |
+| `from = "parent"` with nothing to link to | `error: <local>: [secrets.GCP_TOKEN] from = "parent", but no parent config with cascade = true binds it` | 125 |
+| `cascade` or `inherit` in the global file | `error: <global>: cascade has no meaning in the global config, which applies to every project` | 125 |
 | Unapproved file, terminal | diff or full file, `Trust this version and continue? [y/N]` (U1); on `n`, `not trusted; nothing started` | 125 on `n` |
 | Unapproved file, no terminal | diff or full file + `run \`airlock trust\` in a terminal to approve it` | 125 |
 | Anchor redirected | `error: trust store <path> is inside the project root <root> (from XDG_STATE_HOME=…); refusing to use it` | 125 |

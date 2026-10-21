@@ -84,6 +84,10 @@ pub struct ProxyCa {
     leaf_key_der: PrivatePkcs8KeyDer<'static>,
     /// Host name → ready-to-use server config.
     cache: Mutex<HashMap<String, Arc<ServerConfig>>>,
+    /// The DNS names this CA's name constraints permit, kept so a reload
+    /// can tell whether this CA still covers a new config's routes before
+    /// deciding to reuse it rather than mint a fresh one.
+    permitted: Vec<String>,
 }
 
 impl std::fmt::Debug for ProxyCa {
@@ -124,7 +128,11 @@ impl ProxyCa {
         // distinguish those names — remains the gate on what actually gets a
         // certificate minted.
         params.name_constraints = Some(NameConstraints {
-            permitted_subtrees: permitted.into_iter().map(GeneralSubtree::DnsName).collect(),
+            permitted_subtrees: permitted
+                .iter()
+                .cloned()
+                .map(GeneralSubtree::DnsName)
+                .collect(),
             excluded_subtrees: Vec::new(),
         });
 
@@ -141,6 +149,7 @@ impl ProxyCa {
             leaf_key,
             leaf_key_der,
             cache: Mutex::new(HashMap::new()),
+            permitted,
         }))
     }
 
@@ -149,28 +158,65 @@ impl ProxyCa {
         &self.cert_pem
     }
 
+    /// Whether this CA's name constraints still cover exactly the DNS names
+    /// `policies` can reach. A reload whose routes are unchanged can keep
+    /// this CA (same key/cert, no rewrite of the file on disk) instead of
+    /// minting a fresh one; one that adds or drops a route cannot, since
+    /// the old CA's constraints would then permit too little (a new route
+    /// could never get a leaf cert) or — were this check skipped — be
+    /// trusted with a broader reach than the current config grants.
+    pub fn covers<'a>(&self, policies: impl Iterator<Item = &'a ProxyPolicy>) -> bool {
+        self.permitted == permitted_dns_names(policies)
+    }
+
     /// Write the CA certificate where a sandboxed tool can read it.
     ///
-    /// The file is world-readable (it is a public certificate) but is created
-    /// fresh rather than truncated, so a leftover symlink from a crashed
-    /// daemon cannot redirect the write.
+    /// The file is world-readable (it is a public certificate). Written via
+    /// a temp file and `rename` in the same directory, so a tool mid-`exec`
+    /// — reading this path while a reload rewrites it — always sees either
+    /// the old or the new certificate whole, never a moment where the path
+    /// doesn't exist at all (an in-place `remove_file` + fresh `create_new`
+    /// would open exactly that window).
     pub fn write_cert_pem(&self, path: &Path) -> Result<(), CaError> {
         use std::io::Write;
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
+        let dir = path
+            .parent()
+            .expect("CA path always has a parent directory (runtime base's ca/ dir)");
+
         let write = || -> io::Result<()> {
-            let _ = std::fs::remove_file(path);
-            let mut file = std::fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .mode(0o644)
-                .open(path)?;
-            file.write_all(self.cert_pem.as_bytes())?;
-            // `mode` on the open is subject to the process umask, and the
-            // daemon's is whatever the operator's shell handed it. fchmod is
-            // not, so this is what actually fixes the mode.
-            file.set_permissions(std::fs::Permissions::from_mode(0o644))?;
-            file.sync_all()
+            let mut attempt: u32 = 0;
+            let (tmp_path, mut file) = loop {
+                let tmp_path = dir.join(format!(".tmp-{}-{attempt}", std::process::id()));
+                match std::fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o644)
+                    .open(&tmp_path)
+                {
+                    Ok(file) => break (tmp_path, file),
+                    Err(e) if e.kind() == io::ErrorKind::AlreadyExists && attempt < u32::MAX => {
+                        attempt += 1;
+                    }
+                    Err(e) => return Err(e),
+                }
+            };
+
+            let result = file
+                .write_all(self.cert_pem.as_bytes())
+                // `mode` on the open is subject to the process umask, and
+                // the daemon's is whatever the operator's shell handed it.
+                // fchmod is not, so this is what actually fixes the mode.
+                .and_then(|()| file.set_permissions(std::fs::Permissions::from_mode(0o644)))
+                .and_then(|()| file.sync_all());
+            drop(file);
+            if let Err(e) = result {
+                let _ = std::fs::remove_file(&tmp_path);
+                return Err(e);
+            }
+
+            std::fs::rename(&tmp_path, path)
         };
         write().map_err(|source| CaError::Write {
             path: path.to_path_buf(),
@@ -403,6 +449,44 @@ mod tests {
         let ca = test_ca();
         ca.write_cert_pem(&path).unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), ca.cert_pem());
+    }
+
+    /// The write goes through a temp file and `rename`, not a `remove_file`
+    /// followed by a fresh `create_new`: there must never be a moment where
+    /// the path doesn't exist at all, which a concurrent reader (a
+    /// sandboxed tool mid-`exec`) could otherwise observe as the file
+    /// vanishing.
+    #[test]
+    fn cert_pem_write_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("airlock-ca.pem");
+        test_ca().write_cert_pem(&path).unwrap();
+        // A second write (as a reload would do) exercises the "already
+        // exists" rename path too.
+        test_ca().write_cert_pem(&path).unwrap();
+
+        let entries: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .collect();
+        assert_eq!(entries, vec![std::ffi::OsString::from("airlock-ca.pem")]);
+    }
+
+    #[test]
+    fn covers_is_true_for_the_same_routes() {
+        let ca = ProxyCa::generate([policy(&["example.com"])].iter())
+            .unwrap()
+            .unwrap();
+        assert!(ca.covers([policy(&["example.com"])].iter()));
+    }
+
+    #[test]
+    fn covers_is_false_for_a_different_route() {
+        let ca = ProxyCa::generate([policy(&["example.com"])].iter())
+            .unwrap()
+            .unwrap();
+        assert!(!ca.covers([policy(&["other.test"])].iter()));
+        assert!(!ca.covers([policy(&["example.com", "other.test"])].iter()));
     }
 
     #[test]

@@ -23,16 +23,17 @@
 #     --member=user:you@example.com \
 #     --role=roles/iam.serviceAccountTokenCreator
 #
-# Start the daemon — nothing secret in the environment; the token is minted:
+# Use it:
 #
-#   airlock daemon start
+#   cp examples/gcp-impersonation.toml airlock.toml
+#   airlock run --profile claude        # nothing secret in the environment; the token is minted
 #
 # Once, to write a kubeconfig under the sandbox root (the SA needs
 # container.clusters.get, which roles/viewer includes):
 #
 #   airlock exec -- gcloud container clusters get-credentials my-cluster --region europe-north1
 #
-# Use it:
+# Then:
 #
 #   airlock exec -- gcloud container clusters list
 #   airlock exec -- kubectl get pods -A
@@ -72,16 +73,19 @@ refresh_max_backoff = 600
 
 # ─── Tools ──────────────────────────────────────────────────────────────────
 #
-# CLOUDSDK_CONFIG points at a directory under the sandbox root, so the
-# sandboxed gcloud keeps its own state and never reads ~/.config/gcloud.
-# The sandbox root is always read-write; no extra_read/extra_write needed.
+# CLOUDSDK_CONFIG uses {tool_state}, a per-tool cache directory outside the
+# project that only this one tool can read or write, so the sandboxed gcloud
+# keeps its own state and never reads ~/.config/gcloud. KUBECONFIG has to be
+# different: gcloud writes it (get-credentials, above) and kubectl reads it,
+# so it stays under {sandbox_root} — a path every tool can already reach —
+# rather than in either tool's exclusive {tool_state}.
 [tools.gcloud]
 description = "Google Cloud CLI — read-only impersonated SA token"
 timeout = 120
 
 [tools.gcloud.env]
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+CLOUDSDK_CONFIG = "{tool_state}"
 CLOUDSDK_CORE_PROJECT = "my-project"
 CLOUDSDK_COMPUTE_REGION = "europe-north1"
 CLOUDSDK_CORE_DISABLE_PROMPTS = "1"
@@ -96,6 +100,6 @@ timeout = 120
 
 [tools.kubectl.env]
 CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "CLOUDSDK_AUTH_ACCESS_TOKEN" }
-CLOUDSDK_CONFIG = "{sandbox_root}/.config/gcloud"
+CLOUDSDK_CONFIG = "{tool_state}"
 CLOUDSDK_CORE_DISABLE_PROMPTS = "1"
 KUBECONFIG = "{sandbox_root}/.config/kubeconfig"

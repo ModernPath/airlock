@@ -3,11 +3,13 @@
 One daemon per user with sessions, a runtime directory outside the
 project, layered config, and approval of project config.
 
-**Status:** proposal. The blocking items in [Open questions and
-follow-ups](#open-questions-and-follow-ups) are resolved. Nothing here is
-implemented yet. Today's behavior is
-described in [ARCHITECTURE.md](../ARCHITECTURE.md) and
-[SECURITY.md](../SECURITY.md).
+**Status:** implemented. The blocking items in [Open questions and
+follow-ups](#open-questions-and-follow-ups) are resolved, and this design has
+shipped. Current behavior is described in [ARCHITECTURE.md](../ARCHITECTURE.md),
+[SECURITY.md](../SECURITY.md), [README.md](../README.md) and
+[SKILL.md](../SKILL.md); this document and
+[airlock-v2-ux.md](airlock-v2-ux.md) remain the design and surface record of
+why it looks the way it does.
 
 This document is the design record: what changes, why, and which
 alternatives were rejected. The user-facing surface (commands and their
@@ -178,6 +180,35 @@ No sandbox gets write access to the runtime dir.
   the anchor check refuses any config or `--allow-write` that would grant
   the base.
 
+### Tool filesystem access levels
+
+Separately from the runtime dir, a tool's sandbox also gets a *built-in*
+filesystem baseline sized by a new `access` level — `tools.<name>.access`,
+falling back to a top-level `access` default, falling back to
+`ToolAccess::Default` when neither is set (merge rule: highest layer that
+sets it wins, same as `timeout`). It governs only this baseline; the
+project root, `[filesystem]`, `extra_read`/`extra_write`, the tool's own
+binary, and a proxy tool's CA are granted at every level, unchanged.
+
+- **`none`** — the dynamic linker, the shared library cache, and
+  `/dev/null`. The bare minimum to exec and exit.
+- **`system`** — `none` plus the fixed baseline every tool got before this
+  setting existed (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,random,
+  urandom}`, ... on macOS; the Linux equivalent via Landlock).
+- **`default`** — `system` plus read-only toolchain roots (`/nix/store`,
+  `/opt/homebrew`, `/usr/local`, `/opt/local`, `/home/linuxbrew/.linuxbrew`
+  — one shared constant, `TOOLCHAIN_ROOTS` in
+  [src/sandbox.rs](../src/sandbox.rs)). **This is the default when `access`
+  is unset anywhere** — a deliberate widening over the pre-`access`
+  baseline, approved so Nix- and Homebrew-built tools stop failing with
+  `dyld`/`ld.so` "blocked by sandbox" without per-tool `extra_read` entries.
+
+The agent's own profile is never governed by `access` — it keeps the
+`none` + `system` baseline unconditionally, exactly as before. See
+[SECURITY.md](../SECURITY.md#tool-access-levels) for the per-level
+tradeoffs and [README.md](../README.md#access-how-much-of-the-system-a-tools-sandbox-sees)
+for the config surface.
+
 ### Stale state and migration
 
 Stale-state cleanup works as today (`check_and_cleanup_stale_state`), but in
@@ -187,16 +218,18 @@ any more. Users delete leftover `airlock.sock`, `airlock.pid` and
 
 ## Config layers
 
-### The three files
+### The files
 
 | Layer | Path | Approved? | Who writes it |
 |---|---|---|---|
 | global | `$XDG_CONFIG_HOME/airlock/airlock.toml` (default `~/.config/airlock/airlock.toml`, on macOS too) | no | the user |
+| parent | `airlock.toml` / `airlock.local.toml` in a directory above `<root>` that sets `cascade = true` | yes | the user, a monorepo's team |
 | repo | `<root>/airlock.toml` | yes | the team, PR authors, the agent |
 | local | `<root>/airlock.local.toml` | yes | the user, the agent |
 
 The local file sits in the project directory, where the agent can write, so
-it is approved exactly like the repo file.
+it is approved exactly like the repo file. Parent configs are optional; see
+[Parent configs](#parent-configs).
 
 ### Discovery
 
@@ -208,7 +241,8 @@ adopted it. The project root is the sandbox root, with the same meaning as
 now.
 
 With no project file found, Airlock fails as today, however much global
-config exists.
+config exists. A parent config never makes a directory a project on its
+own: it applies only once discovery has found a root below it.
 
 ### `--config <path>`
 
@@ -235,6 +269,61 @@ empty-config mode those provided is removed.
 - The agent finds the daemon through its [session](#sessions), as in every
   other mode, so a working directory that moves does not matter.
 
+### Parent configs
+
+A directory above the project root can apply its config to every project
+below it, the way `mise.toml` files stack. This is for a workspace of
+repos that share work tools and credentials (`~/work/airlock.toml` with
+`kubectl`, `gcloud` and their secrets) without copying them into each repo,
+and without making the workspace the sandbox root of every agent.
+
+```toml
+# ~/work/airlock.toml
+cascade = true        # also applies to projects in subdirectories
+
+[secrets.GCP_TOKEN]
+source  = "command"
+command = ["gcloud", "auth", "print-access-token"]
+
+[tools.gcloud.env]
+CLOUDSDK_AUTH_ACCESS_TOKEN = { secret = "GCP_TOKEN" }
+```
+
+- **Opt-in by the parent.** A directory's files apply below it only if
+  they set `cascade = true` (the local file's value over the repo file's).
+  The flag is part of the approved bytes, so "this applies to every project
+  below" is itself something the user approved. An existing file that was
+  approved as a project root does not start reaching other projects on its
+  own.
+- **Opt-out by the child.** `inherit = false` in a project's files ignores
+  every parent config. In a parent's files it stops the walk there: the
+  parent applies, nothing above it does. Either file may set it, since it
+  only takes access away.
+- **Discovery.** After the root is found, the launcher keeps walking up
+  from the root's parent to just below `$HOME`, reading each directory's
+  files owned by the effective uid. A directory without `cascade = true` is
+  skipped, not a stop. `$HOME` itself is never a parent, since the global
+  file already covers it; a root outside `$HOME` has no parents. A parent's
+  file that fails to read or parse is an error, as for any layer.
+- **The root does not move.** The project root, and so the sandbox root,
+  is still the nearest directory with a config. A parent's files sit
+  outside it, so the agent cannot write them.
+- **Merging is a fold.** The global file is the first base. Each parent's
+  own files merge on top of it by the rules below, with the base in the
+  global layer's place, and the result is the base for the next directory
+  down. The project merges last. So a project tool replaces a parent tool
+  (shown as `replaces parent`), a repo item cannot reference a parent's
+  label, and a parent's own repo and local files follow the repo and local
+  rules among themselves.
+- **Paths.** A relative path in a parent's file resolves against that
+  parent's directory, the way a reader expects. `{sandbox_root}` and
+  `{tool_state}` mean the project's root, in every layer. A parent's
+  `filesystem.write = ["."]` would grant every project below it write access
+  to all of its siblings; `airlock config` shows the resolved path and the
+  layer it came from.
+- **Not with `--config` or `--no-project-config`.** Those name exactly
+  which files apply.
+
 ### Merge rules
 
 Each layer is parsed on its own, then the layers are merged, then the
@@ -250,7 +339,11 @@ must not hold a secret" is checked against the merged tools.
 | `agent.filesystem.read`, `agent.filesystem.write` | union |
 | `agent.env.<VAR>` | per key, highest layer wins |
 | `timeout`, `agent.timeout` | highest layer that sets it |
+| `access` (top-level) | highest layer that sets it; see [Tool filesystem access levels](#tool-filesystem-access-levels) |
 | `allow_home_root` | Honored in global or local. In the repo layer it is a config error. |
+| `agent.kits` | union across layers (see [Kits](#kits)) |
+| `[kits.<name>]` | Honored in global or local, local wins whole by name. In the repo layer it is a config error. Launcher-only — never part of the wire config. |
+| `cascade`, `inherit` | Read during discovery (see [Parent configs](#parent-configs)), the local file's over the repo file's. A config error in the global file. Never on the wire. |
 
 ### Tools across layers
 
@@ -289,6 +382,11 @@ approved file.
 - **The global layer never serves a repo label on its own.** A global
   `[secrets.GH_TOKEN]` and a repo `[secrets.GH_TOKEN]` are two separate
   bindings until the local file links them.
+- **Neither does a parent.** `from = "parent"` in the local file links a
+  repo label to the binding the parent configs give it. `from = "global"`
+  still means the global file's own binding, even when a parent binds the
+  same label. A local item may also reference a parent's label directly,
+  as it may a global one.
 - A repo label with no source and no local binding is a startup error that
   lists each such label and points to `airlock init --local`.
 - `[secrets.<label>]` takes an optional `description` in every layer. A
@@ -297,8 +395,8 @@ approved file.
   `init --local` show it.
 
 `airlock init --local` writes `airlock.local.toml` with a stub per repo
-label that has no source. A label the global layer binds gets
-`from = "global"`; any other gets commented `command` and `env` examples
+label that has no source. A label a parent config binds gets
+`from = "parent"`; one the global layer binds gets `from = "global"`; any other gets commented `command` and `env` examples
 under its description. In a repo without an `airlock.toml`, whose team has
 not adopted Airlock, it writes a standalone skeleton instead: a commented
 secret and tool, as `init` writes for `airlock.toml`. The stub is an
@@ -356,6 +454,8 @@ GH_CONFIG_DIR = "{tool_state}"
 - **The repo and local files, each on its own.** A file is approved when its
   current bytes equal the copy recorded by `airlock trust`. This is the
   whole file: an edited comment needs approval again too.
+- **Each parent's files.** Same rule, approved once for every project below
+  them.
 - **The `--config` file.** Same rule.
 - **Not the global file.** It is the user's own file, outside every
   project. It is protected by the [anchor checks](#protecting-the-anchors)
@@ -366,14 +466,17 @@ GH_CONFIG_DIR = "{tool_state}"
 ```
 $XDG_STATE_HOME/airlock/trust/<id>/     (default ~/.local/state/airlock/trust/<id>/, mode 0700)
     root                  canonical project root
-    airlock.toml          approved copy of the repo file
-    airlock.local.toml    approved copy of the local file
-    <name>.toml           approved copy of a --config file named <name>.toml
+    airlock.toml          approved copy of the repo file, mode 0600
+    airlock.local.toml    approved copy of the local file, mode 0600
+    <name>.toml           approved copy of a --config file named <name>.toml, mode 0600
 ```
 
-Each copy is stored under the approved file's name. Every approved file sits
-in the project root, since `--config` makes the file's parent the root, so
-`<id>` plus the name identify the file's canonical path. A `--config` file
+Each copy is stored under the approved file's name, in the slot of the
+directory it sits in: the project root, or a parent's directory for a
+parent config. `--config` makes the file's parent the root, so `<id>` plus
+the name always identify the file's canonical path. A parent's files keep
+one slot for every project below them, and a parent directory that is
+also a project root of its own shares it. A `--config` file
 that is itself named `airlock.toml` in a project root is the repo file and
 shares its slot.
 
@@ -990,6 +1093,129 @@ A PreToolUse hook that denies a direct `gh` and suggests the `airlock exec`
 form is left out. It costs a daemon round trip per shell command and needs
 a command parser that is never complete.
 
+## Kits
+
+`airlock run`'s agent gets a fixed baseline, plus whatever the harness
+profile (`--profile claude`/`claude-relaxed`) adds. **Kits** are a separate,
+composable layer on top: what a *kind of work* needs — a language
+toolchain and its package caches — independent of the harness. Kits apply
+only to `airlock run`'s agent sandbox and env. They never reach a tool
+sandbox, and never apply to `session start` (an external harness owns that
+sandbox).
+
+```toml
+[agent]
+kits = ["rust", "node"]     # any layer; union across layers
+
+[kits.rust]                 # options for a built-in kit; global or local layer only
+mode = "isolated"           # the default; or "shared"
+
+[kits.bazel]                # a user-defined kit; global or local layer only
+read  = ["~/.bazelrc"]
+write = ["~/.cache/bazel"]
+env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
+```
+
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Their `[kits.<name>]`
+table accepts only `mode`. A user-defined kit's table accepts `read`,
+`write` and `env` instead (no `mode` — it has no isolated/shared concept of
+its own). `[kits.*]` sits in the same restricted slot as `allow_home_root`:
+global or local only, a config error in the repo layer — a teammate's
+checked-in `airlock.toml` must not decide what the agent may write in your
+home. `agent.kits` itself has no such restriction and unions across every
+layer, the same as `agent.passthrough_env`.
+
+**`[kits.*]` is a launcher-only concept and never reaches the wire config
+the daemon runs against** — `layers::merge` validates and resolves it, but
+`MergedConfig::to_wire()` always clears it. `agent.kits` (just the list of
+names) does ride along on `RawAgentConfig`, harmlessly unused by the
+daemon, so that it — and the resolved `[kits.*]` option tables alongside it
+— contribute to the agent hash `session reload` uses to decide whether to
+print "restart the agent to apply them".
+
+### Modes
+
+- **isolated** (the default). Airlock creates a per-project directory,
+  `{kit_state}` = `<tool_state_base>/kits/<project-id>/<kit>` — a sibling
+  tree of [`{tool_state}`](#tool-state-outside-the-project)
+  (`<tool_state_base>/<project-id>/<tool>`; a project id is 16 hex
+  characters, so it can never collide with the literal `kits`) — and points
+  the toolchain's own cache/home env vars at it. The agent gets read-write
+  access to that directory only; it never writes the user's real caches.
+  Created with mode 0700 the way a tool's `{tool_state}` dir is, and
+  validated the same way (refused if it resolves inside the project root or
+  overlaps an anchor).
+- **shared**. No env override; the agent gets write access to the real
+  cache locations instead. Each location is resolved from the launcher's
+  environment snapshot when the user has already set the tool's own
+  variable (`CARGO_HOME`, `npm_config_cache`, `GOPATH`, ...), otherwise the
+  platform default. Missing cache dirs are created (mode 0700) — Landlock
+  can only grant a path that exists.
+
+Kit env (isolated built-ins and user-defined kits; a shared built-in sets
+none) is applied after the environment snapshot and the passthrough env,
+so a `CARGO_HOME` the user passes through cannot defeat isolation.
+
+### Built-in kit definitions
+
+A kit never grants write to binaries or config files — writing to
+`~/.cargo/bin`, `~/.cargo/config.toml` or `~/.npmrc` would hand the agent
+a way to run code the user later runs unsandboxed. In shared mode a kit
+does grant *read* of the toolchain's user config and registry credentials,
+so the user's settings, private registries and publishing work for the
+agent; package-registry tokens are accepted as readable by the agent.
+Isolated mode grants none of these.
+
+| Kit | Reads | Isolated env | Shared writes |
+|---|---|---|---|
+| `rust` | `~/.rustup`, `~/.cargo/bin`; shared mode also `CARGO_HOME/config.toml` and `credentials.toml` (and the legacy extensionless names) | `CARGO_HOME` | `~/.cargo/registry`, `~/.cargo/git`, plus `.package-cache`/`.package-cache-mutate`/`.global-cache`/`.global-cache-journal` as individual files under `CARGO_HOME` |
+| `node` | `~/.nvm`, `~/.volta`, fnm's dir, `~/.bun/bin`; shared mode also the user npmrc (`~/.npmrc` or `NPM_CONFIG_USERCONFIG`) and `~/.yarnrc.yml` | `npm_config_cache`, `YARN_CACHE_FOLDER`, `npm_config_store_dir`, `BUN_INSTALL_CACHE_DIR`, `COREPACK_HOME` | the real dirs for each |
+| `python` | `~/.pyenv`, `~/.local/share/uv/python`; shared mode also `pip.conf` (`PIP_CONFIG_FILE`, the platform location, legacy `~/.pip`), `~/.config/uv/uv.toml` and `~/.pypirc` | `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR` | the platform cache defaults |
+| `go` | `~/go/bin`, `~/sdk` | `GOMODCACHE`, `GOCACHE`, and `GOPATH` (not just the two caches — `go install`'s output and the sumdb cache live under `GOPATH` with no env var of their own) | `$GOPATH/pkg/{mod,sumdb}`, `GOCACHE`'s platform default |
+| `elixir` | `~/.asdf`, `~/.kiex` | `MIX_HOME`, `HEX_HOME`, `REBAR_CACHE_DIR` (plus `MIX_ARCHIVES` pointed read-only at the real `~/.mix/archives`, and `~/.mix/elixir` read-only for the already-installed rebar3 escript, so the agent does not need to `mix local.hex`/`local.rebar` again) | reads real `~/.mix` (never writes it — archives and escripts are code and binaries, like `~/.cargo/bin`); writes `~/.hex/packages` and the rebar3 cache only; reads `~/.hex/hex.config` (repo settings and the Hex API key) but never writes it. |
+
+Missing read paths are skipped; isolated-mode subdirectories are created up
+front. See [`src/kits.rs`](../src/kits.rs) for the exact expansion
+(`expand_all`, a pure function of home, the env snapshot, the platform, the
+project id and `tool_state_base` — unit-tested for every kit, both modes,
+both platforms).
+
+### Config errors
+
+Each with a clear message, checked in `crate::layers::merge` (placement
+and table shape) or `crate::kits` (everything that needs the active kit
+list — called from `crate::launcher::prepare`, and from `airlock config`'s
+own display, which expands kits exactly like `airlock run` does):
+
+- `[kits.*]` in the repo layer.
+- `read`/`write`/`env` on a built-in kit; `mode` on a user-defined kit; an
+  unrecognized `mode` value.
+- `{tool_state}` anywhere in a kit's `read`, `write` or `env` — the agent
+  must never see tool state.
+- An unknown name in `agent.kits` (lists every known kit: the built-ins
+  plus any `[kits.<name>]` table).
+- An `[agent.env]` key a listed kit's env also sets ("set by kit rust; drop
+  one of them").
+
+### Integration points
+
+- `crate::launcher::prepare` validates, resolves the active kit list
+  (`agent.kits` plus `airlock run --kit <name>`, repeatable and additive),
+  and expands it. A kit's write dirs/files are folded into `write_grants`
+  before `anchors::validate` and `exec::filter_path` run, so the existing
+  anchor checks and the [B2](#blocking) binary-location check already cover
+  them — no separate check was needed. Kit dirs are created after trust,
+  like `{tool_state}` dirs.
+- `crate::run` adds the kit's read paths (filtered by existence, like
+  `detect_toolchain_paths`) and read-write paths to the `AgentPolicy`, and
+  applies kit env on top of the already-built agent env. `airlock run -v`
+  names the active kits and their modes.
+- `airlock config` shows the active kits with layer provenance, mode, and
+  the same expanded paths/env `airlock run` would use.
+- `session start` calls the same `prepare`, computing kit expansion for no
+  reason it uses — simpler than branching, and harmless, since an external
+  harness's own sandbox is what actually runs.
+
 ## Threat walkthrough
 
 | Attack | Outcome |
@@ -1201,7 +1427,8 @@ whole config.
 | What approved repo config may do | Everything, as today | No secret sources; suggested sources only | Keeps a single-file setup working. The local layer covers personal bindings. |
 | Personal config location | Global and per-project local | Global only; local only | Global for bindings shared across projects, local for per-project overrides. |
 | Local file location | In the project, approved | Outside the project (`~/.config/airlock/projects/<id>.toml`); in the project with sandbox write denied | Kept next to the repo file where users expect it. Approval handles the agent being able to write it. |
-| Precedence | global < repo < local | repo < global < local | Same order as git config. |
+| Precedence | global < parents (outermost first) < repo < local | repo < global < local | Same order as git config. |
+| Stacking configs up the tree | Parent directories apply below them only with `cascade = true`; the sandbox root stays the nearest config; `inherit = false` opts out | Always stack, as mise does; nearest file only | Shares workspace tools without making the workspace every agent's sandbox root. The opt-in is in the approved bytes, so an existing approval never starts reaching other projects by itself. |
 | Tool collision | A project tool replaces a global one, shown in `config`; repo against local is an error unless the local tool says `override = true` | Always an error; highest layer wins; field merge | A silently shadowed team tool is a security surprise, but an error with no way out breaks every repo that declares the user's global `gh`. Each replacement is either the user's own default giving way, or an approved line. |
 | Secret collision | Local replaces a repo label's spec whole; global reaches a repo label only through local `from = "global"` | Highest layer wins; global rebinds repo labels automatically; approve the cross-layer binding map | A repo label must not resolve to a personal secret without an approved opt-in. Rebinding stays one line per label. |
 | Everything else | Lists union, maps per key, scalars highest | Whole-section replace; additive only | Predictable, and a personal layer can still override a value. |
@@ -1535,6 +1762,11 @@ B7. This is defense in depth, not a guarantee: Linux cannot express it, and
 `core.fsmonitor` in `.git/config` stays open. Worktrees keep hooks in the
 common dir, which may lie outside the root.
 
+**Implemented**, in scope for the first release rather than deferred: see
+[macOS — Apple Seatbelt](../SECURITY.md#macos--apple-seatbelt-sbpl) and
+["`.git/hooks` write denial (F9)"](../SECURITY.md#git-hooks-write-denial-f9)
+in SECURITY.md.
+
 **F10. Run each session's proxy in its own process.** The proxy parses HTTP
 and TLS from sandboxed tools and from upstream servers. In the shared daemon,
 a memory-safety bug there reaches every session's secrets. A per-session
@@ -1651,3 +1883,97 @@ on it, so it adds no risk to v2 by waiting.
 - **CLAUDE.md:** the trust boundary invariant (session token, not the
   socket alone), the session isolation rules, and the socket invariant's
   file references.
+
+## Implementation notes
+
+Points this doc and [airlock-v2-ux.md](airlock-v2-ux.md) left open, or where
+the shipped code settled on something narrower or different from what was
+proposed:
+
+- **Test-only overrides are `cfg(debug_assertions)`, not an environment
+  check at runtime.** `AIRLOCK_TEST_RUNTIME_DIR` (runtime base) and
+  `AIRLOCK_TEST_IDLE_EXIT_SECS` (the automatic daemon's idle-exit grace
+  period) only compile into debug builds
+  ([src/runtime_dir.rs](../src/runtime_dir.rs),
+  [src/daemon.rs](../src/daemon.rs)). A release build has no code path that
+  reads either variable, so "ignores the environment" ([Location](#location))
+  holds even against a build-time environment that controls what a release
+  binary links against.
+- **The launcher starts an automatic daemon by re-executing itself**, not by
+  forking in-process: `std::env::current_exe()` spawns
+  `airlock daemon start --automatic` (a hidden flag) and waits for it to
+  exit, reusing the existing double-fork-and-readiness-pipe sequence
+  unchanged ([src/launcher.rs](../src/launcher.rs)). This keeps the fork
+  sequence to the one path `daemon start` already hardens, instead of a
+  second in-process fork with its own pre-tokio-runtime constraints.
+- **Unknown keys are an error at the top level too**, not only inside
+  `[tools.*]` and `[secrets.*]`. The RawConfig types use
+  `#[serde(deny_unknown_fields)]` at every level including the root, so a v1
+  top-level flatten catch-all does not exist in v2: a typo'd top-level key
+  fails config load instead of being silently dropped.
+- **`{tool_state}` is computed and created by the launcher**, not the
+  daemon, as `$XDG_CACHE_HOME/airlock/<project-id>/<tool>` with mode 0700,
+  before `Register` ([src/launcher.rs](../src/launcher.rs)). The daemon only
+  ever receives the already-resolved, already-created path.
+- **The exec cap is a concurrency limit, not a lifetime count.** 16 is the
+  number of `exec`s a session may have *in flight at once*, enforced with a
+  `tokio::sync::Semaphore` per session ([src/session.rs](../src/session.rs));
+  a 17th concurrent request is refused with `Busy` (exit 125). A session can
+  run far more than 16 execs over its life, serially.
+- **Hook dedup relies on Claude Code deduping identical commands**, so
+  `--profile claude` injects exactly the same `airlock agent hook
+  claude-code` command string as the block `--print-settings` prints,
+  rather than a marker variable or a generated id, so a hand-added hook and
+  the profile's hook collapse into one.
+- **[F9](#git-hooks-write-denial-f9) shipped** as a macOS-only Seatbelt
+  deny on `<root>/.git/hooks`, on both the agent and tool profiles, ordered
+  after every allow alongside the runtime-base and `admin.token` denies.
+- **The [open UX questions](airlock-v2-ux.md#open-ux-questions) resolved
+  mostly as proposed.** Session id and token format shipped exactly as
+  sketched there (6-hex id, `airlock_<id>_<43 base64url characters>`); the
+  idle grace period shipped at the proposed 5 minutes; `airlock trust`
+  stayed separate from `session reload`, as the doc's own leaning; `daemon
+  install` while a daemon runs took the simpler of the two options (it
+  tells the user to run `daemon restart`); long diffs get no pager. The one
+  exception is worktree dedup, which is still open as
+  [F6](#follow-ups) rather than resolved. (This is a different list from the
+  numbered gaps in [airlock-v2-questions.md](airlock-v2-questions.md), which
+  this doc's own worked examples and sections already answer inline.)
+- **`Session::policy` is `RwLock<Arc<SessionPolicy>>`**
+  ([src/session.rs](../src/session.rs)), not the `ArcSwap<SessionPolicy>`
+  sketched in
+  [airlock-v2-technical-guidance.md](airlock-v2-technical-guidance.md#session-state).
+  A `RwLock` needed no extra dependency and reload is rare enough that the
+  write-lock contention `ArcSwap` avoids was never a concern worth the
+  additional crate.
+- **The process-tree anchor for a `session start` session is the *parent*
+  of the `session start` process**, not the process itself — because
+  `eval "$(airlock session start)"` execs `session start` as a direct child
+  of the interactive shell with no extra fork, that parent is ordinarily
+  the shell the user ran it in. Piping the command through anything else
+  (`airlock session start | cat`, or capturing its output in a script that
+  `eval`s it in a different shell) forces bash to fork a pipeline subshell
+  to run `session start` in; that subshell becomes the anchor and is gone
+  the instant the pipe closes, so every later request fails with
+  `OutsideProcessTree` even though the token is otherwise valid. Neither
+  doc called this out explicitly; it follows from [Token
+  binding](#token-binding) but is easy to trip over, so README.md and
+  SECURITY.md now say it directly.
+- **[Kits](#kits)' `[kits.*]` option tables never reach the wire config**,
+  unlike almost everything else `layers::merge` produces. Only `agent.kits`
+  (the plain name list) rides on `RawAgentConfig`, unused by the daemon,
+  solely so it — together with the resolved `[kits.*]` tables, hashed
+  alongside it in `crate::launcher::prepare` — changes the agent hash
+  `session reload` checks. Expansion itself (`crate::kits::expand_all`) is
+  a pure function of home, the env snapshot, the platform, the project id
+  and `tool_state_base`, called only from `prepare` (for `airlock run`) and
+  from `airlock config`'s own display — never from `layers::merge`, which
+  by design never reads the environment.
+- **Tool `access` levels shipped as proposed in [Tool filesystem access
+  levels](#tool-filesystem-access-levels)**, added after the rest of this
+  doc: the macOS `none` baseline (dyld plus the shared cache) was
+  determined empirically with `sandbox-exec`, not derived from any existing
+  Seatbelt documentation — `/usr/lib/dyld` plus
+  `/System/Volumes/Preboot/Cryptexes/OS/System/Library/dyld` (with
+  `/System/Library/dyld` as a pre-cryptex fallback) is both necessary and
+  sufficient for `/bin/echo hi` to run.

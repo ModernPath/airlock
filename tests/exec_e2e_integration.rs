@@ -11,6 +11,7 @@ use e2e_helpers::*;
 
 // ─── Stdout from a tool is received correctly by the client ─────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_stdout_received_correctly() {
     let tmp = tempfile::tempdir().unwrap();
@@ -21,7 +22,7 @@ fn exec_tool_stdout_received_correctly() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo hello world"],
         cwd.to_str().unwrap(),
@@ -39,6 +40,7 @@ fn exec_tool_stdout_received_correctly() {
 
 // ─── Stderr from a tool is received separately from stdout ──────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_stderr_separate_from_stdout() {
     let tmp = tempfile::tempdir().unwrap();
@@ -49,7 +51,7 @@ fn exec_tool_stderr_separate_from_stdout() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "sh",
         &["-c", "echo stdout_data && echo stderr_data >&2"],
         cwd.to_str().unwrap(),
@@ -81,6 +83,7 @@ fn exec_tool_stderr_separate_from_stdout() {
 
 // ─── Non-zero exit codes are propagated faithfully ──────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_tool_nonzero_exit_code_propagated() {
     let tmp = tempfile::tempdir().unwrap();
@@ -90,12 +93,7 @@ fn exec_tool_nonzero_exit_code_propagated() {
     let daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
-    let result = exec_tool(
-        &daemon.socket_path,
-        "sh",
-        &["-c", "exit 42"],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "sh", &["-c", "exit 42"], cwd.to_str().unwrap());
 
     assert_eq!(
         result.exit_code,
@@ -109,6 +107,7 @@ fn exec_tool_nonzero_exit_code_propagated() {
 
 // ─── Unknown tool name produces an error ────────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_unknown_tool_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -118,12 +117,7 @@ fn exec_unknown_tool_produces_error() {
     let daemon = start_daemon(tmp.path());
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
-    let result = exec_tool(
-        &daemon.socket_path,
-        "nonexistent_tool_xyz",
-        &[],
-        cwd.to_str().unwrap(),
-    );
+    let result = exec_tool(&daemon, "nonexistent_tool_xyz", &[], cwd.to_str().unwrap());
 
     assert!(
         result.error.is_some(),
@@ -140,6 +134,7 @@ fn exec_unknown_tool_produces_error() {
 
 // ─── CWD outside sandbox root produces an error ─────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_cwd_outside_sandbox_root_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -148,7 +143,7 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
     let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
     let daemon = start_daemon(tmp.path());
 
-    let result = exec_tool(&daemon.socket_path, "sh", &["-c", "echo hi"], "/tmp");
+    let result = exec_tool(&daemon, "sh", &["-c", "echo hi"], "/tmp");
 
     assert!(
         result.error.is_some(),
@@ -156,8 +151,8 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
     );
     let error = result.error.unwrap();
     assert!(
-        error.contains("CWD") || error.contains("cwd") || error.contains("sandbox"),
-        "error should mention CWD validation failure, got: {error}"
+        error.contains("is outside this session's project"),
+        "error should say the working directory is outside the project, got: {error}"
     );
 
     daemon.shutdown();
@@ -165,6 +160,7 @@ fn exec_cwd_outside_sandbox_root_produces_error() {
 
 // ─── Missing binary produces a clear error ──────────────────────────────────
 
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
 #[test]
 fn exec_missing_binary_produces_error() {
     let tmp = tempfile::tempdir().unwrap();
@@ -181,7 +177,7 @@ fn exec_missing_binary_produces_error() {
 
     let cwd = std::fs::canonicalize(tmp.path()).unwrap();
     let result = exec_tool(
-        &daemon.socket_path,
+        &daemon,
         "nonexistent_binary_xyz",
         &[],
         cwd.to_str().unwrap(),
@@ -196,6 +192,43 @@ fn exec_missing_binary_produces_error() {
         error.contains("binary") || error.contains("not found") || error.contains("resolution"),
         "error should mention binary resolution failure, got: {error}"
     );
+
+    daemon.shutdown();
+}
+
+// ─── The real client with no stdin keeps the connection open ────────────────
+
+// An agent's tool calls usually have stdin at EOF (`/dev/null`, an empty
+// pipe). The client must still keep its write half open until the tool
+// exits: the daemon reads EOF on the connection as "the client went away"
+// and kills the tool. The tool sleeps so it is still running when the
+// client's stdin EOF arrives; the raw-protocol tests above never close
+// their write half, so only the real binary exercises this.
+#[cfg_attr(no_nested_sandbox, ignore = "needs a nestable sandbox")]
+#[test]
+fn real_client_with_stdin_at_eof_waits_for_the_tool() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_config(tmp.path(), &config_with_sh_no_secrets());
+
+    let _guard = EnvGuard::new(&[("HOME", tmp.path().to_str().unwrap())]);
+    let daemon = start_daemon(tmp.path());
+
+    let cwd = std::fs::canonicalize(tmp.path()).unwrap();
+    let output = std::process::Command::new(env!("CARGO_BIN_EXE_airlock"))
+        .env_remove("AIRLOCK_SANDBOX")
+        .env(
+            "AIRLOCK_ADDR",
+            format!("unix://{}", daemon.socket_path.display()),
+        )
+        .env("AIRLOCK_SESSION", daemon.token.expose_secret())
+        .current_dir(&cwd)
+        .args(["exec", "--", "sh", "-c", "sleep 1; echo done"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(String::from_utf8_lossy(&output.stdout), "done\n");
 
     daemon.shutdown();
 }

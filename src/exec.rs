@@ -22,7 +22,7 @@
 //! All callers must use [`kill_process_group`] instead of `Child::kill()`.
 //! `kill_on_drop` must also remain `false` for the same reason.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -36,23 +36,40 @@ use crate::sandbox::SandboxProfile;
 /// Errors that can occur during binary resolution, spawn preparation, or spawn.
 #[derive(Debug, Error)]
 pub enum ExecError {
-    /// The tool name contains a `/` path separator.
-    ///
-    /// Only bare binary names (e.g., `"sh"`, `"python3"`) are accepted;
-    /// absolute or relative paths (e.g., `"/usr/bin/sh"`, `"./script"`) are not.
+    /// A declared tool's binary is not on the session's filtered `PATH`
+    /// ([`resolve_binary_in`]). The message lists the `PATH` entries
+    /// [`filter_path`] dropped and why, per the "Binary not found" row of
+    /// the UX message table.
+    #[error("{0}")]
+    ToolNotOnPath(String),
+
+    /// The resolved tool binary lands inside the project root — a symlink
+    /// on an otherwise-safe `PATH` entry can point here even though the
+    /// entry itself survived filtering.
     #[error(
-        "tool name contains a path separator ('/'): only bare binary names are accepted, \
-         not paths: {0:?}"
+        "tool {tool:?} resolves to {path}, inside the project; refusing to run it. \
+         Install it outside the project (Homebrew, mise, Nix)."
     )]
-    PathSeparatorInName(String),
+    BinaryInsideRoot {
+        /// The declared tool name.
+        tool: String,
+        /// The canonicalized, offending path.
+        path: PathBuf,
+    },
 
-    /// The `PATH` environment variable is not set in the daemon's environment.
-    #[error("PATH environment variable is not set in the daemon's environment")]
-    PathNotSet,
-
-    /// No executable with the given name was found in any directory in `PATH`.
-    #[error("binary {0:?} not found in PATH")]
-    BinaryNotFound(String),
+    /// The resolved tool binary lands inside a write grant. Same rationale
+    /// as [`ExecError::BinaryInsideRoot`], for a path outside the root but
+    /// still writable from some sandbox (e.g. a tool's own state directory).
+    #[error(
+        "tool {tool:?} resolves to {path}, inside a write grant; refusing to run it. \
+         Install it outside the project (Homebrew, mise, Nix)."
+    )]
+    BinaryInsideWriteGrant {
+        /// The declared tool name.
+        tool: String,
+        /// The canonicalized, offending path.
+        path: PathBuf,
+    },
 
     /// The child process could not be spawned.
     ///
@@ -104,6 +121,140 @@ const ESSENTIAL_VARS: &[&str] = &[
     "LC_MESSAGES",
 ];
 
+// ─── Filtered PATH ────────────────────────────────────────────────────────────
+
+/// A `PATH`, filtered of entries that would let a sandboxed tool plant a
+/// binary the daemon later trusts (B2 in the design doc).
+///
+/// `entries` is what tools and secret commands are resolved against and
+/// handed as their own `PATH`. `dropped` records every entry that didn't
+/// survive, and why, so a "binary not found" error can explain itself
+/// instead of leaving the operator to guess.
+#[derive(Debug, Clone, Default)]
+pub struct FilteredPath {
+    /// Surviving entries, in their original relative order, deduplicated.
+    pub entries: Vec<PathBuf>,
+    /// `(entry, reason)` for every entry that was dropped. `reason` is one
+    /// of `"relative"`, `"inside the project"`, or `"writable from a
+    /// sandbox"`.
+    pub dropped: Vec<(String, String)>,
+}
+
+/// Where a resolved binary landed, relative to the anchors that must never
+/// contain one.
+pub(crate) enum Location {
+    /// Outside the root and every write grant — safe to run.
+    Outside,
+    /// Inside the project root.
+    InsideRoot,
+    /// Inside a write grant (but not the root).
+    InsideWriteGrant,
+}
+
+impl Location {
+    /// Why a `PATH` entry at this location is dropped, or `None` to keep it.
+    fn path_drop_reason(&self) -> Option<&'static str> {
+        match self {
+            Location::Outside => None,
+            Location::InsideRoot => Some("inside the project"),
+            Location::InsideWriteGrant => Some("writable from a sandbox"),
+        }
+    }
+}
+
+/// Classify `path` against the root and write grants, root taking priority
+/// so the more specific "inside the project" message wins when both apply.
+pub(crate) fn classify_location(path: &Path, root: &Path, write_grants: &[PathBuf]) -> Location {
+    if crate::anchors::is_inside(path, root) {
+        Location::InsideRoot
+    } else if write_grants
+        .iter()
+        .any(|grant| crate::anchors::is_inside(path, grant))
+    {
+        Location::InsideWriteGrant
+    } else {
+        Location::Outside
+    }
+}
+
+/// Filter a colon-separated `PATH` string down to entries safe to resolve
+/// tool binaries and secret commands against: absolute, outside the
+/// project root, and outside every write grant.
+///
+/// Entries are dropped, not refused — a direnv or mise setup that adds
+/// `node_modules/.bin` to `PATH` is common, and refusing the whole session
+/// over it would break it for no gain. Order is preserved and duplicate
+/// entries (by their original string spelling) are collapsed to the first
+/// occurrence, matching shell `PATH` semantics.
+pub fn filter_path(path_var: &str, root: &Path, write_grants: &[PathBuf]) -> FilteredPath {
+    let mut entries = Vec::new();
+    let mut dropped = Vec::new();
+    let mut seen: HashSet<&str> = HashSet::new();
+
+    for raw in path_var.split(':') {
+        if !seen.insert(raw) {
+            continue;
+        }
+
+        let candidate = Path::new(raw);
+        if candidate.is_relative() {
+            dropped.push((raw.to_string(), "relative".to_string()));
+            continue;
+        }
+        if let Some(reason) = classify_location(candidate, root, write_grants).path_drop_reason() {
+            dropped.push((raw.to_string(), reason.to_string()));
+            continue;
+        }
+        entries.push(candidate.to_path_buf());
+    }
+
+    FilteredPath { entries, dropped }
+}
+
+impl FilteredPath {
+    /// This `PATH` with [`filter_path`]'s project and write-grant checks
+    /// applied again against `write_grants`, for when the grants have grown
+    /// since it was filtered.
+    pub fn refiltered(&self, root: &Path, write_grants: &[PathBuf]) -> FilteredPath {
+        let mut out = FilteredPath {
+            entries: Vec::new(),
+            dropped: self.dropped.clone(),
+        };
+        for entry in &self.entries {
+            match classify_location(entry, root, write_grants).path_drop_reason() {
+                Some(reason) => out
+                    .dropped
+                    .push((entry.to_string_lossy().into_owned(), reason.to_string())),
+                None => out.entries.push(entry.clone()),
+            }
+        }
+        out
+    }
+}
+
+/// Render the entries [`filter_path`] dropped, for the tail of a "binary
+/// not found" message. Empty when nothing was dropped.
+pub(crate) fn format_dropped_suffix(dropped: &[(String, String)]) -> String {
+    if dropped.is_empty() {
+        return String::new();
+    }
+    let mut out = String::from("\ndropped from PATH:");
+    for (entry, reason) in dropped {
+        out.push_str(&format!("\n  {entry}: {reason}"));
+    }
+    out
+}
+
+/// Build the "declared, but not on PATH" message per the UX table's
+/// "Binary not found" row.
+fn format_not_found(tool: &str, dropped: &[(String, String)]) -> String {
+    format!(
+        "tool {tool:?} is declared, but no `{tool}` is on the session's PATH{}\n\
+         install the tool outside the project (Homebrew, mise, Nix)",
+        format_dropped_suffix(dropped)
+    )
+}
+
 // ─── Binary resolution ────────────────────────────────────────────────────────
 
 /// Check whether `path` is executable by the current process.
@@ -121,84 +272,103 @@ fn is_executable(path: &Path) -> bool {
     unsafe { libc::access(cstr.as_ptr(), libc::X_OK) == 0 }
 }
 
-/// Walk a colon-separated `path_var` string to find an executable binary.
+/// If `candidate` exists, is a regular file, and is executable, return its
+/// canonicalized path. `metadata()` follows symlinks and returns `Err` when
+/// the path does not exist or is not accessible, so a missing directory or
+/// binary simply yields `None`.
 ///
-/// This inner function accepts an explicit `path_var` so that tests can drive
-/// it without manipulating the process environment.
-///
-/// Non-existent directories are silently skipped; the search continues to the
-/// next `PATH` entry. An empty `path_var` or a `path_var` that contains only
-/// non-existent directories returns [`ExecError::BinaryNotFound`].
-fn resolve_binary_in(tool_name: &str, path_var: &str) -> Result<PathBuf, ExecError> {
-    for dir in path_var.split(':') {
-        if dir.is_empty() {
-            // Skip empty components produced by leading/trailing colons or
-            // consecutive colons (e.g. "dir1::dir2", ":dir", "dir:").
-            continue;
-        }
-
-        let candidate = Path::new(dir).join(tool_name);
-
-        // `metadata()` follows symlinks and returns `Err` if the path does not
-        // exist or is not accessible — we skip that directory silently.
-        if let Ok(meta) = std::fs::metadata(&candidate)
-            && meta.is_file()
-            && is_executable(&candidate)
-        {
-            // Canonicalize to resolve symlinks and produce a clean absolute path.
-            // If canonicalization fails (e.g., a race where the file was removed
-            // between the metadata check and the canonicalize call), fall back to
-            // the already-absolute candidate path.
-            let resolved = std::fs::canonicalize(&candidate).unwrap_or(candidate);
-            return Ok(resolved);
-        }
-        // Directory did not exist, or the binary was not found / not executable:
-        // silently continue to the next PATH entry.
+/// Canonicalizes first and checks the resolved path, not the candidate: the
+/// caller's location check ([`classify_location`]) runs against this
+/// returned path, so a candidate that can't be resolved to a concrete
+/// location — a dangling symlink, or one that stops resolving to anything
+/// between this call and a caller's use of the result — must never be
+/// treated as usable. There is no safe fallback to the unresolved path: a
+/// symlink's own location can look fine while its (unresolved) target does
+/// not.
+pub(crate) fn probe_executable(candidate: &Path) -> Option<PathBuf> {
+    let canon = std::fs::canonicalize(candidate).ok()?;
+    let meta = std::fs::metadata(&canon).ok()?;
+    if !meta.is_file() || !is_executable(&canon) {
+        return None;
     }
-
-    Err(ExecError::BinaryNotFound(tool_name.to_string()))
+    Some(canon)
 }
 
-/// Resolve a bare binary name to its absolute canonical path by walking `PATH`.
-///
-/// Resolution happens at request time (not at daemon startup), so tools
-/// installed after the daemon starts are found correctly.
+/// Walk a [`FilteredPath`]'s surviving entries to find an executable binary,
+/// without any location check — callers that need one apply
+/// [`classify_location`] to the result themselves. Shared by
+/// [`resolve_binary_in`] (tool binaries) and secret commands' `argv[0]`
+/// resolution ([`crate::secrets`]).
+pub(crate) fn search_path_entries(name: &str, entries: &[PathBuf]) -> Option<PathBuf> {
+    entries
+        .iter()
+        .find_map(|dir| probe_executable(&dir.join(name)))
+}
+
+/// Resolve a declared tool's binary against its session's filtered `PATH`
+/// ([`filter_path`]), and refuse it if it lands inside the project root or a
+/// write grant — the location check that catches a symlink on an otherwise
+/// safe `PATH` entry pointing back into the project (B2 in the design doc).
 ///
 /// # Errors
 ///
-/// - [`ExecError::PathSeparatorInName`] — `tool_name` contains a `'/'`.
-/// - [`ExecError::PathNotSet`] — the `PATH` environment variable is not set.
-/// - [`ExecError::BinaryNotFound`] — no executable with `tool_name` was found
-///   in any directory listed in `PATH`.
-pub fn resolve_binary(tool_name: &str) -> Result<PathBuf, ExecError> {
-    // Reject names that contain a path separator character.
-    if tool_name.contains('/') {
-        return Err(ExecError::PathSeparatorInName(tool_name.to_string()));
-    }
+/// - [`ExecError::ToolNotOnPath`] — no executable named `tool` was found in
+///   any of `path`'s surviving entries. The message lists what was dropped
+///   and why.
+/// - [`ExecError::BinaryInsideRoot`] / [`ExecError::BinaryInsideWriteGrant`] —
+///   found, but its canonicalized location is inside the root or a write
+///   grant.
+pub fn resolve_binary_in(
+    tool: &str,
+    path: &FilteredPath,
+    root: &Path,
+    write_grants: &[PathBuf],
+) -> Result<PathBuf, ExecError> {
+    let Some(canon) = search_path_entries(tool, &path.entries) else {
+        return Err(ExecError::ToolNotOnPath(format_not_found(
+            tool,
+            &path.dropped,
+        )));
+    };
 
-    let path_var = std::env::var("PATH").map_err(|_| ExecError::PathNotSet)?;
-    resolve_binary_in(tool_name, &path_var)
+    match classify_location(&canon, root, write_grants) {
+        Location::Outside => Ok(canon),
+        Location::InsideRoot => Err(ExecError::BinaryInsideRoot {
+            tool: tool.to_string(),
+            path: canon,
+        }),
+        Location::InsideWriteGrant => Err(ExecError::BinaryInsideWriteGrant {
+            tool: tool.to_string(),
+            path: canon,
+        }),
+    }
 }
 
 // ─── Environment construction ─────────────────────────────────────────────────
 
-/// Build a clean, minimal environment map for a child process.
+/// Build a clean, minimal environment map for a child process from an
+/// explicit snapshot and filtered `PATH`, rather than the daemon's own
+/// environment.
 ///
 /// The returned map contains exactly:
 /// - The tool's declared `secrets` (already unwrapped from `Secret<String>`
 ///   by the caller; this function does not interact with the `redact` crate).
-/// - Essential pass-through variables (see `ESSENTIAL_VARS`) — process
-///   basics, terminal, timezone, and the standard locale family — copied
-///   from the daemon's environment. An essential variable absent from the
-///   daemon's environment is silently omitted; this is not an error.
-///
-/// No other variables from the daemon's environment or any other source are
-/// included. Isolation from the daemon's environment is intentional.
+/// - Essential pass-through variables (see `ESSENTIAL_VARS`) other than
+///   `PATH`, copied from `snapshot` — process basics, terminal, timezone,
+///   and the standard locale family. One absent from `snapshot` is silently
+///   omitted; this is not an error.
+/// - `PATH`, always, set to `path`'s surviving entries joined with `':'` —
+///   never `snapshot`'s own `PATH`. A session's filtered `PATH` must win
+///   unconditionally, or a tool could still inherit an unfiltered one.
 ///
 /// If a secret's name collides with an essential variable name (e.g. a secret
-/// named `"PATH"`), the essential variable value from the daemon's environment
-/// takes precedence, ensuring critical runtime variables are never replaced.
-pub fn build_env(secrets: &[(String, String)]) -> HashMap<String, String> {
+/// named `"PATH"`), the essential/`PATH` value takes precedence, so a tool
+/// can never use a secret to override its own `PATH`.
+pub fn build_env_from(
+    snapshot: &BTreeMap<String, String>,
+    path: &FilteredPath,
+    secrets: &[(String, String)],
+) -> HashMap<String, String> {
     let mut env = HashMap::new();
 
     // Insert declared secrets first.
@@ -206,13 +376,24 @@ pub fn build_env(secrets: &[(String, String)]) -> HashMap<String, String> {
         env.insert(name.clone(), value.clone());
     }
 
-    // Layer in essential pass-through variables. Written after secrets so that
-    // essential variables take precedence if their name collides with a secret name.
+    // Layer in essential pass-through variables (other than PATH, handled
+    // below) after secrets so they take precedence on a name collision.
     for var in ESSENTIAL_VARS {
-        if let Ok(value) = std::env::var(var) {
-            env.insert((*var).to_string(), value);
+        if *var == "PATH" {
+            continue;
+        }
+        if let Some(value) = snapshot.get(*var) {
+            env.insert((*var).to_string(), value.clone());
         }
     }
+
+    let joined = path
+        .entries
+        .iter()
+        .map(|p| p.to_string_lossy().into_owned())
+        .collect::<Vec<_>>()
+        .join(":");
+    env.insert("PATH".to_string(), joined);
 
     env
 }
@@ -230,8 +411,13 @@ pub fn build_env(secrets: &[(String, String)]) -> HashMap<String, String> {
 /// duplicated, so cloning would be semantically incorrect.
 pub struct ExecRequest {
     /// Absolute, canonical path to the executable binary (produced by
-    /// [`resolve_binary`]).
+    /// [`resolve_binary_in`]).
     pub binary: PathBuf,
+
+    /// The child's `argv[0]`: the name the binary was looked up under, as a
+    /// shell would pass it. Canonicalizing `binary` loses that name, and
+    /// multicall binaries (coreutils, busybox) dispatch on it.
+    pub arg0: String,
 
     /// Argument list — the full `argv` after the binary name (i.e., `argv[1..]`).
     pub args: Vec<String>,
@@ -242,7 +428,7 @@ pub struct ExecRequest {
     /// this module does not re-validate it.
     pub work_dir: PathBuf,
 
-    /// Clean environment map for the child process (produced by [`build_env`]).
+    /// Clean environment map for the child process (produced by [`build_env_from`]).
     pub env: HashMap<String, String>,
 
     /// Pre-built, platform-specific sandbox profile produced by a
@@ -354,6 +540,7 @@ pub struct SpawnedChild {
 #[allow(unused_mut)]
 pub fn spawn(mut request: ExecRequest) -> Result<SpawnedChild, ExecError> {
     let mut cmd = tokio::process::Command::new(&request.binary);
+    cmd.arg0(&request.arg0);
     cmd.args(&request.args);
     cmd.current_dir(&request.work_dir);
 
@@ -581,20 +768,58 @@ pub fn kill_process_group(child_pid: u32, signal: i32) -> Result<(), ExecError> 
 // ─── Unit tests ──────────────────────────────────────────────────────────────
 
 #[cfg(test)]
+#[allow(
+    clippy::disallowed_methods,
+    reason = "tests may read/set the process environment freely; only request-path code is bound by the session isolation rule"
+)]
 mod tests {
     use std::collections::HashSet;
     use std::path::PathBuf;
     use std::time::Duration;
 
+    use tempfile::tempdir;
+
     use super::*;
     use crate::test_support::ENV_MUTEX;
 
-    /// Hold the crate-wide env lock. The tests below compare `build_env()`'s
+    /// Hold the crate-wide env lock. The tests below compare `test_env()`'s
     /// snapshot of the environment against a second `std::env::var` read of the
     /// same variable; without the lock a concurrent test mutating `HOME` or
     /// `LANG` can change the answer between the two reads.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_MUTEX.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Resolve `name` against the real process `PATH`, for tests that need a
+    /// real binary and aren't exercising `resolve_binary_in`'s own location
+    /// checks (those build a `FilteredPath` and root by hand instead).
+    fn test_resolve(name: &str) -> Result<PathBuf, ExecError> {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let path = FilteredPath {
+            entries: path_var.split(':').map(PathBuf::from).collect(),
+            dropped: Vec::new(),
+        };
+        // No real binary lives under this root, so the location check in
+        // `resolve_binary_in` never fires for anything the real PATH finds.
+        resolve_binary_in(
+            name,
+            &path,
+            Path::new("/airlock-test-root-never-exists"),
+            &[],
+        )
+    }
+
+    /// Build a child environment from the real process environment and
+    /// `PATH`, for tests that exercise `build_env_from`'s shape (which vars
+    /// survive, which don't) rather than its snapshot/`PATH` plumbing.
+    fn test_env(secrets: &[(String, String)]) -> HashMap<String, String> {
+        let path_var = std::env::var("PATH").unwrap_or_default();
+        let path = FilteredPath {
+            entries: path_var.split(':').map(PathBuf::from).collect(),
+            dropped: Vec::new(),
+        };
+        let snapshot: BTreeMap<String, String> = std::env::vars().collect();
+        build_env_from(&snapshot, &path, secrets)
     }
 
     // ── Binary resolution ────────────────────────────────────────────────────
@@ -603,7 +828,7 @@ mod tests {
     /// Verify that it resolves to an absolute path pointing to an executable file.
     #[test]
     fn resolve_sh_returns_absolute_executable_path() {
-        let path = resolve_binary("sh").expect("sh should be found in PATH");
+        let path = test_resolve("sh").expect("sh should be found in PATH");
 
         assert!(
             path.is_absolute(),
@@ -624,7 +849,7 @@ mod tests {
     #[test]
     fn resolve_nonexistent_binary_returns_error_with_name() {
         let name = "binary_that_definitely_does_not_exist_in_any_path_directory_xyzzy42";
-        let err = resolve_binary(name).expect_err("nonexistent binary should not resolve");
+        let err = test_resolve(name).expect_err("nonexistent binary should not resolve");
         let msg = err.to_string();
         assert!(
             msg.contains(name),
@@ -632,59 +857,304 @@ mod tests {
         );
     }
 
-    /// A tool name containing a `'/'` character returns a `PathSeparatorInName`
-    /// error without consulting PATH at all.
+    /// An empty `FilteredPath` returns a "not on PATH" error (no directories
+    /// to search).
     #[test]
-    fn resolve_with_slash_returns_path_separator_error() {
-        // Absolute path — rejected.
-        let result = resolve_binary("/usr/bin/sh");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "absolute path should return PathSeparatorInName, got: {result:?}"
-        );
-
-        // Relative path with directory component — also rejected.
-        let result = resolve_binary("some/relative/path");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "relative path with '/' should return PathSeparatorInName, got: {result:?}"
-        );
-
-        // Bare name with a trailing slash — also rejected.
-        let result = resolve_binary("sh/");
-        assert!(
-            matches!(result, Err(ExecError::PathSeparatorInName(_))),
-            "name with trailing '/' should return PathSeparatorInName, got: {result:?}"
-        );
-    }
-
-    /// An empty PATH string returns an error (no directories to search).
-    #[test]
-    fn empty_path_string_returns_error() {
-        let result = resolve_binary_in("sh", "");
+    fn resolve_in_empty_filtered_path_returns_error() {
+        let root = tempdir().unwrap();
+        let result = resolve_binary_in("sh", &FilteredPath::default(), root.path(), &[]);
         assert!(
             result.is_err(),
-            "empty PATH string should return an error, got: {result:?}"
+            "empty PATH should return an error, got: {result:?}"
         );
     }
 
-    /// A PATH containing a non-existent directory does not panic; that directory
-    /// is skipped and resolution continues to the next entry.
+    /// A `PATH` entry that does not exist does not panic; that directory is
+    /// skipped and resolution continues to the next entry.
     #[test]
     fn nonexistent_dir_in_path_is_skipped_and_binary_found() {
         // Build a custom PATH that has a non-existent directory first, followed
         // by the real PATH (which contains sh).
         let real_path = std::env::var("PATH").unwrap_or_default();
-        let custom_path = format!("/this/directory/does/absolutely/not/exist/xyzzy:{real_path}");
+        let mut entries = vec![PathBuf::from(
+            "/this/directory/does/absolutely/not/exist/xyzzy",
+        )];
+        entries.extend(real_path.split(':').map(PathBuf::from));
+        let path = FilteredPath {
+            entries,
+            dropped: Vec::new(),
+        };
 
         // Must not panic, and should still find sh via the real PATH entries.
-        let result = resolve_binary_in("sh", &custom_path);
+        let result = resolve_binary_in(
+            "sh",
+            &path,
+            Path::new("/airlock-test-root-never-exists"),
+            &[],
+        );
         assert!(
             result.is_ok(),
             "should find sh despite a non-existent leading directory, got: {result:?}"
         );
         let path = result.unwrap();
         assert!(path.is_absolute(), "resolved path must be absolute");
+    }
+
+    // ── Filtered PATH ─────────────────────────────────────────────────────────
+
+    /// A relative entry is dropped with reason `"relative"`, including the
+    /// empty-string entry produced by a leading/trailing/doubled colon
+    /// (POSIX treats it as the current directory, which is relative too).
+    #[test]
+    fn filter_path_drops_relative_entries() {
+        let root = tempdir().unwrap();
+        let filtered = filter_path("relative/bin::/usr/bin", root.path(), &[]);
+
+        assert_eq!(filtered.entries, vec![PathBuf::from("/usr/bin")]);
+        assert!(
+            filtered
+                .dropped
+                .iter()
+                .any(|(entry, reason)| entry == "relative/bin" && reason == "relative"),
+            "should drop the relative entry, got: {:?}",
+            filtered.dropped
+        );
+        assert!(
+            filtered
+                .dropped
+                .iter()
+                .any(|(entry, reason)| entry.is_empty() && reason == "relative"),
+            "should drop the empty entry as relative, got: {:?}",
+            filtered.dropped
+        );
+    }
+
+    /// An absolute entry inside the project root is dropped with reason
+    /// `"inside the project"`.
+    #[test]
+    fn filter_path_drops_entries_inside_root() {
+        let root = tempdir().unwrap();
+        let inside = root.path().join("node_modules/.bin");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let path_var = format!("{}:/usr/bin", inside.display());
+        let filtered = filter_path(&path_var, root.path(), &[]);
+
+        assert_eq!(filtered.entries, vec![PathBuf::from("/usr/bin")]);
+        assert_eq!(filtered.dropped.len(), 1);
+        assert_eq!(filtered.dropped[0].1, "inside the project");
+    }
+
+    /// An absolute entry inside a write grant (but outside the root) is
+    /// dropped with reason `"writable from a sandbox"`.
+    #[test]
+    fn filter_path_drops_entries_inside_write_grant() {
+        let root = tempdir().unwrap();
+        let grant_dir = tempdir().unwrap();
+        let inside_grant = grant_dir.path().join("bin");
+        std::fs::create_dir_all(&inside_grant).unwrap();
+
+        let path_var = format!("{}:/usr/bin", inside_grant.display());
+        let filtered = filter_path(&path_var, root.path(), &[grant_dir.path().to_path_buf()]);
+
+        assert_eq!(filtered.entries, vec![PathBuf::from("/usr/bin")]);
+        assert_eq!(filtered.dropped.len(), 1);
+        assert_eq!(filtered.dropped[0].1, "writable from a sandbox");
+    }
+
+    /// A `PATH` entry exactly equal to a write grant is dropped too — the
+    /// grant need not be a strict ancestor.
+    #[test]
+    fn filter_path_drops_entry_equal_to_write_grant() {
+        let root = tempdir().unwrap();
+        let grant_dir = tempdir().unwrap();
+
+        let path_var = format!("{}:/usr/bin", grant_dir.path().display());
+        let filtered = filter_path(&path_var, root.path(), &[grant_dir.path().to_path_buf()]);
+
+        assert_eq!(filtered.entries, vec![PathBuf::from("/usr/bin")]);
+        assert_eq!(filtered.dropped.len(), 1);
+        assert_eq!(filtered.dropped[0].1, "writable from a sandbox");
+    }
+
+    /// A `PATH` entry that is lexically outside the root, but is a symlink
+    /// resolving into it, is still dropped as inside the project.
+    #[test]
+    fn filter_path_drops_symlinked_dir_into_root() {
+        let root = tempdir().unwrap();
+        let real_target = root.path().join("real-bin");
+        std::fs::create_dir_all(&real_target).unwrap();
+
+        let outside = tempdir().unwrap();
+        let symlink_path = outside.path().join("bin-link");
+        std::os::unix::fs::symlink(&real_target, &symlink_path).unwrap();
+
+        let path_var = format!("{}:/usr/bin", symlink_path.display());
+        let filtered = filter_path(&path_var, root.path(), &[]);
+
+        assert_eq!(filtered.entries, vec![PathBuf::from("/usr/bin")]);
+        assert_eq!(filtered.dropped.len(), 1);
+        assert_eq!(filtered.dropped[0].1, "inside the project");
+    }
+
+    /// Surviving entries keep their original relative order, and a
+    /// duplicate entry (by string spelling) is collapsed to its first
+    /// occurrence rather than appearing twice or being reported as dropped.
+    #[test]
+    fn filter_path_preserves_order_and_dedupes() {
+        let root = tempdir().unwrap();
+        let filtered = filter_path("/usr/bin:/bin:/usr/bin:/opt/tool/bin", root.path(), &[]);
+
+        assert_eq!(
+            filtered.entries,
+            vec![
+                PathBuf::from("/usr/bin"),
+                PathBuf::from("/bin"),
+                PathBuf::from("/opt/tool/bin"),
+            ]
+        );
+        assert!(
+            filtered.dropped.is_empty(),
+            "the duplicate should be silently collapsed, not reported as dropped: {:?}",
+            filtered.dropped
+        );
+    }
+
+    // ── resolve_binary_in ───────────────────────────────────────────────────
+
+    /// A tool present on the filtered `PATH`, outside the root and every
+    /// write grant, resolves successfully.
+    #[test]
+    fn resolve_binary_in_finds_tool() {
+        let root = tempdir().unwrap();
+        let path = filter_path("/bin:/usr/bin", root.path(), &[]);
+
+        let resolved = resolve_binary_in("sh", &path, root.path(), &[]).expect("sh should resolve");
+        assert!(resolved.is_absolute());
+        assert!(resolved.is_file());
+    }
+
+    /// A tool absent from every surviving `PATH` entry reports the entries
+    /// that [`filter_path`] dropped, and why, in its error message.
+    #[test]
+    fn resolve_binary_in_not_found_lists_dropped_entries() {
+        let root = tempdir().unwrap();
+        let inside = root.path().join("bin");
+        std::fs::create_dir_all(&inside).unwrap();
+
+        let path_var = format!("relative/bin:{}", inside.display());
+        let path = filter_path(&path_var, root.path(), &[]);
+
+        let err = resolve_binary_in("totally_missing_tool_xyzzy", &path, root.path(), &[])
+            .expect_err("tool should not resolve: PATH filtered to nothing");
+        let msg = err.to_string();
+
+        assert!(matches!(err, ExecError::ToolNotOnPath(_)));
+        assert!(msg.contains("totally_missing_tool_xyzzy"));
+        assert!(msg.contains("session's PATH"));
+        assert!(msg.contains("relative/bin"));
+        assert!(msg.contains("relative"));
+        assert!(msg.contains(&inside.display().to_string()));
+        assert!(msg.contains("inside the project"));
+        assert!(msg.contains("Homebrew, mise, Nix"));
+    }
+
+    /// A `PATH` entry that survives filtering (lexically outside the root)
+    /// but contains a symlink pointing the tool name back into the root is
+    /// refused once resolved, not just dropped up front.
+    #[test]
+    fn resolve_binary_in_refuses_symlink_into_root() {
+        let root = tempdir().unwrap();
+        let real_binary = root.path().join("fake-tool");
+        std::fs::write(&real_binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            &real_binary,
+            std::os::unix::fs::PermissionsExt::from_mode(0o755),
+        )
+        .unwrap();
+
+        let safe_dir = tempdir().unwrap();
+        std::os::unix::fs::symlink(&real_binary, safe_dir.path().join("mytool")).unwrap();
+
+        let path_var = safe_dir.path().display().to_string();
+        let path = filter_path(&path_var, root.path(), &[]);
+        assert!(path.dropped.is_empty(), "safe_dir should survive filtering");
+
+        let err = resolve_binary_in("mytool", &path, root.path(), &[])
+            .expect_err("symlink into the root must be refused");
+        match err {
+            ExecError::BinaryInsideRoot { tool, path } => {
+                assert_eq!(tool, "mytool");
+                assert_eq!(path, real_binary.canonicalize().unwrap());
+            }
+            other => panic!("expected BinaryInsideRoot, got: {other:?}"),
+        }
+    }
+
+    /// `probe_executable` must never hand back a dangling symlink's own
+    /// (unresolved) path — there is no safe fallback when canonicalization
+    /// fails.
+    #[test]
+    fn probe_executable_skips_a_dangling_symlink() {
+        let dir = tempdir().unwrap();
+        let dangling = dir.path().join("mytool");
+        std::os::unix::fs::symlink(dir.path().join("does-not-exist"), &dangling).unwrap();
+
+        assert_eq!(probe_executable(&dangling), None);
+    }
+
+    /// A `PATH` entry containing a dangling symlink for the tool name is
+    /// skipped, not treated as a match on its own unresolved path — the
+    /// search continues (and here finds nothing), rather than resolving to
+    /// a binary that doesn't actually exist.
+    #[test]
+    fn resolve_binary_in_skips_dangling_symlink() {
+        let root = tempdir().unwrap();
+        let bin_dir = tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            bin_dir.path().join("does-not-exist"),
+            bin_dir.path().join("mytool"),
+        )
+        .unwrap();
+
+        let path_var = bin_dir.path().display().to_string();
+        let path = filter_path(&path_var, root.path(), &[]);
+
+        let err = resolve_binary_in("mytool", &path, root.path(), &[])
+            .expect_err("a dangling symlink must never resolve to a usable binary");
+        assert!(matches!(err, ExecError::ToolNotOnPath(_)), "{err:?}");
+    }
+
+    /// A tool resolved to a location inside a write grant (but outside the
+    /// root) is refused with [`ExecError::BinaryInsideWriteGrant`].
+    #[test]
+    fn resolve_binary_in_refuses_binary_inside_write_grant() {
+        let root = tempdir().unwrap();
+        let grant_dir = tempdir().unwrap();
+        let binary = grant_dir.path().join("mytool");
+        std::fs::write(&binary, "#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(&binary, std::os::unix::fs::PermissionsExt::from_mode(0o755))
+            .unwrap();
+
+        // The grant directory itself must be on PATH to be found at all;
+        // filter_path would drop it (it IS the grant), so build the
+        // FilteredPath by hand to exercise resolve_binary_in's own check in
+        // isolation from filter_path's up-front filtering.
+        let path = FilteredPath {
+            entries: vec![grant_dir.path().to_path_buf()],
+            dropped: Vec::new(),
+        };
+        let write_grants = vec![grant_dir.path().to_path_buf()];
+
+        let err = resolve_binary_in("mytool", &path, root.path(), &write_grants)
+            .expect_err("binary inside a write grant must be refused");
+        match err {
+            ExecError::BinaryInsideWriteGrant { tool, path } => {
+                assert_eq!(tool, "mytool");
+                assert_eq!(path, binary.canonicalize().unwrap());
+            }
+            other => panic!("expected BinaryInsideWriteGrant, got: {other:?}"),
+        }
     }
 
     // ── Environment construction ─────────────────────────────────────────────
@@ -696,7 +1166,7 @@ mod tests {
             ("MY_API_KEY".to_string(), "secret_value_123".to_string()),
             ("DB_PASSWORD".to_string(), "hunter2".to_string()),
         ];
-        let env = build_env(&secrets);
+        let env = test_env(&secrets);
 
         assert_eq!(
             env.get("MY_API_KEY").map(String::as_str),
@@ -721,7 +1191,7 @@ mod tests {
             return;
         };
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
         assert_eq!(
             env.get("PATH").map(String::as_str),
             Some(expected_path.as_str()),
@@ -735,7 +1205,7 @@ mod tests {
     fn build_env_contains_essential_vars_when_present_in_daemon_env() {
         let _guard = env_lock();
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         for var in &["HOME", "TERM", "LANG", "USER"] {
             match std::env::var(var) {
@@ -771,7 +1241,7 @@ mod tests {
             ("SECRET_ALPHA".to_string(), "value_a".to_string()),
             ("SECRET_BETA".to_string(), "value_b".to_string()),
         ];
-        let env = build_env(&secrets);
+        let env = test_env(&secrets);
 
         let secret_names: HashSet<&str> = secrets.iter().map(|(n, _)| n.as_str()).collect();
         let essential_names: HashSet<&str> = ESSENTIAL_VARS.iter().copied().collect();
@@ -810,7 +1280,7 @@ mod tests {
     /// beyond the declared secrets and the essential set.
     #[test]
     fn build_env_does_not_leak_daemon_environment() {
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         // A sample of well-known environment variables that are commonly set in
         // daemon/CI/developer environments but must not appear in the child env.
@@ -854,7 +1324,7 @@ mod tests {
     fn build_env_omits_absent_essential_vars_without_error() {
         let _guard = env_lock();
 
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         match std::env::var("TERM") {
             Ok(val) => {
@@ -877,7 +1347,7 @@ mod tests {
     /// essential variables that are present in the daemon's environment.
     #[test]
     fn build_env_no_secrets_produces_only_essential_vars() {
-        let env = build_env(&[]);
+        let env = test_env(&[]);
 
         let essential_names: HashSet<&str> = ESSENTIAL_VARS.iter().copied().collect();
 
@@ -887,6 +1357,68 @@ mod tests {
                 "with no secrets, env should only contain essential vars; found unexpected key: {key:?}"
             );
         }
+    }
+
+    // ── build_env_from ───────────────────────────────────────────────────────
+
+    /// `build_env_from` reads `ESSENTIAL_VARS` from the explicit snapshot, not
+    /// the process environment — proven by a value absent from the real
+    /// process env, which only the snapshot could have supplied.
+    #[test]
+    fn build_env_from_uses_snapshot_not_process_env() {
+        let mut snapshot = BTreeMap::new();
+        snapshot.insert("HOME".to_string(), "/snapshot/home".to_string());
+        snapshot.insert("TERM".to_string(), "snapshot-term".to_string());
+        let path = FilteredPath {
+            entries: vec![PathBuf::from("/usr/bin")],
+            dropped: Vec::new(),
+        };
+
+        let env = build_env_from(&snapshot, &path, &[]);
+
+        assert_eq!(env.get("HOME").map(String::as_str), Some("/snapshot/home"));
+        assert_eq!(env.get("TERM").map(String::as_str), Some("snapshot-term"));
+    }
+
+    /// `PATH` always comes from the filtered entries, joined with `':'`,
+    /// even when the snapshot carries its own (unfiltered) `PATH` — the
+    /// filtered `PATH` must win unconditionally (B2).
+    #[test]
+    fn build_env_from_path_overrides_snapshot_path() {
+        let mut snapshot = BTreeMap::new();
+        snapshot.insert(
+            "PATH".to_string(),
+            "/some/unfiltered/path:/also/unfiltered".to_string(),
+        );
+        let path = FilteredPath {
+            entries: vec![PathBuf::from("/usr/bin"), PathBuf::from("/bin")],
+            dropped: Vec::new(),
+        };
+
+        let env = build_env_from(&snapshot, &path, &[]);
+
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin:/bin"));
+    }
+
+    /// Declared secrets are present, and essential variables (including
+    /// `PATH`) still win over a secret that collides with an essential
+    /// variable's name.
+    #[test]
+    fn build_env_from_secret_named_path_does_not_override_filtered_path() {
+        let snapshot = BTreeMap::new();
+        let path = FilteredPath {
+            entries: vec![PathBuf::from("/usr/bin")],
+            dropped: Vec::new(),
+        };
+        let secrets = vec![
+            ("API_KEY".to_string(), "secret-value".to_string()),
+            ("PATH".to_string(), "/attacker/controlled".to_string()),
+        ];
+
+        let env = build_env_from(&snapshot, &path, &secrets);
+
+        assert_eq!(env.get("API_KEY").map(String::as_str), Some("secret-value"));
+        assert_eq!(env.get("PATH").map(String::as_str), Some("/usr/bin"));
     }
 
     // ── ExecRequest construction (compile-time verification) ─────────────────
@@ -908,6 +1440,7 @@ mod tests {
             read_write_paths: vec![],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         // Build a sandbox profile using the platform-specific backend.
@@ -925,9 +1458,10 @@ mod tests {
 
         let _request = ExecRequest {
             binary: PathBuf::from("/bin/sh"),
+            arg0: "sh".to_string(),
             args: vec!["-c".to_string(), "true".to_string()],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&secrets),
+            env: test_env(&secrets),
             sandbox_profile,
             timeout: Duration::from_secs(30),
         };
@@ -1026,10 +1560,11 @@ mod tests {
         let profile = SandboxProfile::new_for_test(fd);
 
         let request = ExecRequest {
-            binary: resolve_binary("true").expect("true should be in PATH"),
+            binary: test_resolve("true").expect("true should be in PATH"),
+            arg0: "true".to_string(),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&[]),
+            env: test_env(&[]),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };
@@ -1081,6 +1616,7 @@ mod tests {
             read_write_paths: vec![PathBuf::from("/tmp")],
             network: NetworkAccess::None,
             binary_path: None,
+            ..Default::default()
         };
 
         let profile = LinuxLandlock
@@ -1093,10 +1629,11 @@ mod tests {
         let probe = FdClosedProbe::arm(raw_fd);
 
         let request = ExecRequest {
-            binary: resolve_binary("true").expect("true should be in PATH"),
+            binary: test_resolve("true").expect("true should be in PATH"),
+            arg0: "true".to_string(),
             args: vec![],
             work_dir: PathBuf::from("/tmp"),
-            env: build_env(&[]),
+            env: test_env(&[]),
             sandbox_profile: profile,
             timeout: Duration::from_secs(10),
         };

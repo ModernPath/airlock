@@ -24,11 +24,12 @@
 #     --member=user:you@example.com \
 #     --role=roles/iam.serviceAccountTokenCreator
 #
-# Start the daemon:
+# Use it:
 #
-#   airlock daemon start
+#   cp examples/gcp-observability-curl.toml airlock.toml
+#   airlock run --profile claude
 #
-# Use it with plain https:// URLs and no Authorization header. A header the
+# Then, with plain https:// URLs and no Authorization header. A header the
 # agent sets is replaced, and the agent has no token to put in it anyway:
 #
 #   airlock exec -- curl -s 'https://cloudtrace.googleapis.com/v1/projects/my-project/traces?pageSize=5'
@@ -84,8 +85,8 @@ refresh_max_backoff = 600
 #
 # `proxy = true` means: no secrets in `env`, network only through the proxy,
 # and only to the hosts routed below. Any other host gets a 403 from the
-# proxy. The description is what the agent sees in `airlock list`, so say
-# which APIs are reachable and that auth is automatic.
+# proxy. The description is what the agent sees in `airlock tools list`, so
+# say which APIs are reachable and that auth is automatic.
 [tools.curl]
 description = "curl for Google Cloud Trace / Monitoring / Logging REST APIs in my-project, read-only. Auth is injected by airlock; do not pass tokens."
 proxy = true

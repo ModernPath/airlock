@@ -285,7 +285,7 @@ Consequences, all accepted deliberately:
   redactor makes of the whole input. It runs inside `poll_frame` with no thread
   and no channel behind it, so hyper's own polling is the backpressure and
   dropping the response stops the upstream read. The `spawn_blocking` bridge the
-  stdout path uses would have cost a thread per response and would have had to
+  stdout path used then would have cost a thread per response and would have had to
   be cancelled by hand.
 - **The redactor is taken per response from the live handle**, not snapshotted
   at session start. A tool runs for minutes, the proxy injects whatever the

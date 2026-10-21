@@ -1,24 +1,32 @@
-//! CLI entry point for Airlock.
+//! CLI entry point for Airlock v2.
 //!
 //! Parses CLI arguments using clap subcommands and dispatches to the
-//! appropriate module functions. The `main()` function is synchronous —
-//! no `#[tokio::main]` attribute — because the daemon module must perform
-//! fork-unsafe operations before any tokio runtime is created. Commands
-//! that need async I/O create their own tokio runtime internally.
+//! appropriate module. `main()` is synchronous — no `#[tokio::main]` — the
+//! daemon's own startup (`airlock daemon start`) performs fork-unsafe
+//! operations that must complete before any tokio runtime exists
+//! (CLAUDE.md). Commands that need async I/O create their own tokio runtime
+//! internally.
 
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
+use std::time::Duration;
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 
-use airlock::client;
-use airlock::config;
+use airlock::admin::{self, AdminError};
 use airlock::daemon;
-use airlock::run;
+use airlock::inspect;
+use airlock::launcher::{self, DiscoverOpts, LauncherError, PrepareOptions};
+use airlock::protocol::{
+    AdminRequest, DaemonMessage, DaemonMode, EndsInfo, SandboxKind, SessionEnds, SessionInfo,
+    WireMode,
+};
+use airlock::run::{self, RunOptions};
+use airlock::runtime_dir::RuntimeDir;
+use airlock::session;
 
 // ─── Version string ──────────────────────────────────────────────────────────
 
-/// Build a version string like "0.1.0 (a1b2c3d dirty)".
 fn long_version() -> &'static str {
     use std::sync::LazyLock;
     static VERSION: LazyLock<String> = LazyLock::new(|| {
@@ -38,627 +46,1325 @@ fn long_version() -> &'static str {
 
 /// Airlock — sandboxed tool execution with secret injection and output redaction.
 #[derive(Parser)]
-#[command(name = "airlock", version = long_version(), about)]
+#[command(
+    name = "airlock",
+    version = long_version(),
+    about,
+    help_template = HELP_TEMPLATE,
+    arg_required_else_help = true
+)]
 struct Cli {
-    /// Path to an explicit config file, bypassing directory-walk discovery.
-    #[arg(long, global = true, value_name = "PATH")]
-    config: Option<PathBuf>,
-
     #[command(subcommand)]
     command: Commands,
 }
 
-/// Top-level subcommands.
 #[derive(Subcommand)]
 enum Commands {
+    /// Start an agent with a session, sandboxed.
+    Run {
+        #[arg(long, value_enum, value_name = "NAME")]
+        profile: Option<run::Profile>,
+        #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+        allow_read: Vec<PathBuf>,
+        #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
+        allow_write: Vec<PathBuf>,
+        #[arg(long = "passthrough-env", value_name = "VAR", action = clap::ArgAction::Append)]
+        passthrough_env: Vec<String>,
+        /// Add a kit (built-in or user-defined) to the agent sandbox,
+        /// additive to `agent.kits`. Repeatable.
+        #[arg(long = "kit", value_name = "NAME", action = clap::ArgAction::Append)]
+        kits: Vec<String>,
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long)]
+        no_session: bool,
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        no_project_config: bool,
+        #[arg(short = 'v', long)]
+        verbose: bool,
+        #[arg(short = 'q', long)]
+        quiet: bool,
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+
+    /// Write a starter config.
+    Init {
+        #[arg(long)]
+        local: bool,
+        #[arg(long)]
+        global: bool,
+    },
+
+    /// Review and approve project config.
+    Trust {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(short = 'y', long)]
+        yes: bool,
+        #[arg(long = "expect-sha256", value_name = "HASH", action = clap::ArgAction::Append)]
+        expect_sha256: Vec<String>,
+    },
+
+    /// Merged config, with the layer each part comes from.
+    Config {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        no_project_config: bool,
+        #[arg(long)]
+        paths: bool,
+    },
+
+    /// Daemon, project config and sessions.
+    Status {
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        no_project_config: bool,
+    },
+
+    /// Run a declared tool through the session.
+    ///
+    /// Everything after `--` is passed to the tool unchanged.
+    Exec {
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
+        args: Vec<String>,
+    },
+
+    /// Tools a session serves.
+    Tools {
+        #[command(subcommand)]
+        action: Option<ToolsAction>,
+    },
+
+    /// Commands run by the agent and its harness, not the user.
+    Agent {
+        #[command(subcommand)]
+        action: AgentAction,
+    },
+
+    /// Manage sessions.
+    Session {
+        #[command(subcommand)]
+        action: SessionAction,
+    },
+
     /// Manage the Airlock daemon.
     Daemon {
         #[command(subcommand)]
         action: DaemonAction,
     },
-
-    /// Execute a tool through the daemon.
-    ///
-    /// Everything after `--` is passed to the tool unchanged.
-    Exec {
-        /// The tool name and its arguments (pass after `--`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true, required = true)]
-        args: Vec<String>,
-    },
-
-    /// Check whether the daemon is running.
-    Status,
-
-    /// List configured tools and their declared secrets.
-    List,
-
-    /// Show recent daemon log entries.
-    Logs,
-
-    /// Run an AI agent inside an OS-level sandbox.
-    ///
-    /// Everything after `--` is the agent command and its arguments.
-    Run {
-        /// Do not start an embedded daemon. When set, `airlock exec` calls
-        /// from within the agent will fail.
-        #[arg(long)]
-        no_daemon: bool,
-
-        /// Skip `airlock.toml` discovery entirely.
-        ///
-        /// When set, `AIRLOCK_SANDBOX_ROOT` must be set to the path of an
-        /// existing directory to use as the sandbox root. All other config
-        /// fields (filesystem paths, secrets, tools) are left at their empty
-        /// defaults. Use this flag when running in an arbitrary project
-        /// directory that has no `airlock.toml`.
-        #[arg(long)]
-        no_config: bool,
-
-        /// Built-in filesystem profile to extend the sandbox with common
-        /// paths for a well-known agent (e.g. `claude`, `claude-relaxed`).
-        #[arg(long, value_enum, value_name = "NAME")]
-        profile: Option<run::Profile>,
-
-        /// Grant read-only access to PATH in addition to config/profile
-        /// permissions. May be specified multiple times.
-        #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
-        allow_read: Vec<PathBuf>,
-
-        /// Grant read-write access to PATH in addition to config/profile
-        /// permissions. May be specified multiple times.
-        #[arg(long, value_name = "PATH", action = clap::ArgAction::Append)]
-        allow_write: Vec<PathBuf>,
-
-        /// Forward the named host environment variable to the sandboxed agent.
-        /// The variable is silently skipped if it is not set on the host.
-        /// May be supplied multiple times.
-        #[arg(long = "passthrough-env", value_name = "VAR", action = clap::ArgAction::Append)]
-        passthrough_env: Vec<String>,
-
-        /// The agent command and its arguments (pass after `--`).
-        ///
-        /// Optional when `--profile <NAME>` supplies a default command
-        /// (e.g. `--profile claude` runs `claude --dangerously-skip-permissions`).
-        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
-        args: Vec<String>,
-    },
-
-    /// Create a new airlock.toml in the current directory.
-    Init,
 }
 
-/// Subcommands for `airlock daemon`.
+#[derive(Subcommand)]
+enum ToolsAction {
+    /// Tools a session serves.
+    List {
+        /// A session id, a unique id prefix or a unique name. Needs the
+        /// user's terminal.
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum AgentAction {
+    /// (agent) verify the session, self-test the sandbox.
+    Check {
+        #[arg(short = 'q', long)]
+        quiet: bool,
+    },
+    /// (harness) adapts `check` and `tools list` to one harness's hook
+    /// protocol.
+    Hook {
+        #[arg(value_enum)]
+        harness: airlock::agent::Harness,
+        #[arg(long)]
+        print_settings: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SessionAction {
+    /// Start an unsandboxed session for a harness with its own sandbox.
+    Start {
+        #[arg(long)]
+        name: Option<String>,
+        #[arg(long, value_name = "DURATION", default_value = "12h")]
+        ttl: String,
+        #[arg(long, value_enum, default_value = "sh")]
+        format: ExportFormat,
+        #[arg(long, value_name = "PATH")]
+        config: Option<PathBuf>,
+        #[arg(long)]
+        no_project_config: bool,
+        #[arg(short = 'q', long)]
+        quiet: bool,
+    },
+    /// Restart a session's TTL clock.
+    Renew {
+        id: String,
+        #[arg(long, value_name = "DURATION")]
+        ttl: Option<String>,
+    },
+    /// Sessions on the daemon.
+    List {
+        #[arg(long)]
+        here: bool,
+    },
+    /// Apply approved config to running sessions.
+    Reload {
+        ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+    },
+    /// End sessions.
+    Revoke {
+        ids: Vec<String>,
+        #[arg(long)]
+        here: bool,
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(ValueEnum, Clone, Copy)]
+enum ExportFormat {
+    Sh,
+    Fish,
+    Json,
+}
+
 #[derive(Subcommand)]
 enum DaemonAction {
-    /// Start the daemon in the background (daemonize).
-    Start,
-    /// Run the daemon in the foreground.
-    Run,
-    /// Stop a running daemon.
-    Stop,
-    /// Stop the daemon if running, then start a new one.
-    Restart,
+    /// Start the daemon.
+    Start {
+        #[arg(long)]
+        foreground: bool,
+        /// Started on demand by a launcher. Hidden: not for interactive use.
+        #[arg(long, hide = true)]
+        automatic: bool,
+        /// Started by `daemon install`'s service unit. Hidden: not for
+        /// interactive use.
+        #[arg(long, hide = true)]
+        service: bool,
+    },
+    /// Stop the daemon.
+    Stop {
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Stop then start the daemon.
+    Restart {
+        #[arg(short = 'y', long)]
+        yes: bool,
+    },
+    /// Recent daemon log entries.
+    Logs {
+        #[arg(long, value_name = "ID")]
+        session: Option<String>,
+    },
+    /// Install an always-on daemon service.
+    Install,
+    /// Remove the always-on daemon service.
+    Uninstall,
+}
+
+// ─── Sandbox refusal (U16 / "Commands refused inside the sandbox") ──────────
+
+/// `true` when this process is itself running inside an Airlock sandbox.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary checking its own environment, not daemon request-path code"
+)]
+fn in_sandbox() -> bool {
+    std::env::var("AIRLOCK_SANDBOX").as_deref() == Ok("1")
+}
+
+/// If this command is refused inside the sandbox, prints the UX message and
+/// returns the exit code to use. `None` means proceed.
+fn sandbox_refusal(command: &Commands) -> Option<ExitCode> {
+    if !in_sandbox() {
+        return None;
+    }
+    let message = match command {
+        Commands::Run { .. } => Some(
+            "`airlock run` cannot run inside an Airlock sandbox; run it from your own terminal",
+        ),
+        Commands::Trust { .. } => Some(
+            "`airlock trust` cannot run inside an Airlock sandbox; run it from your own terminal",
+        ),
+        Commands::Status { .. } => Some(
+            "`airlock status` needs your own terminal. Inside a session, `airlock agent check` shows this session.",
+        ),
+        Commands::Session { .. } => Some(
+            "`airlock session` cannot run inside an Airlock sandbox; run it from your own terminal",
+        ),
+        Commands::Daemon { .. } => Some(
+            "`airlock daemon` cannot run inside an Airlock sandbox; run it from your own terminal",
+        ),
+        Commands::Init { global: true, .. } => Some(
+            "`airlock init --global` cannot run inside an Airlock sandbox; run it from your own terminal",
+        ),
+        Commands::Tools {
+            action: Some(ToolsAction::List { session: Some(_) }),
+        } => Some(
+            "`airlock tools list --session` needs the user's terminal; run it from your own terminal",
+        ),
+        _ => None,
+    };
+    message.map(|m| {
+        eprintln!("error: {m}");
+        ExitCode::from(125)
+    })
+}
+
+// ─── Help grouping (U5) and sandboxed help restriction (U16) ────────────────
+
+/// Top-level command groups, by who runs them (U5), in the order shown in
+/// `airlock --help`. Each name must be a subcommand of [`Commands`].
+const HELP_GROUPS: &[(&str, &[&str])] = &[
+    (
+        "Start an agent",
+        &["run", "init", "trust", "config", "status"],
+    ),
+    ("Use tools", &["exec", "tools"]),
+    ("Manage", &["session", "daemon"]),
+    ("For the agent and its harness", &["agent"]),
+];
+
+/// Visible with `AIRLOCK_SANDBOX=1` (U16): the commands that work from
+/// inside an Airlock sandbox. Everything else is hidden from `--help` and a
+/// bare `airlock`, though each hidden command's own `--help` still works.
+const SANDBOX_VISIBLE: &[&str] = &["exec", "tools", "agent", "init", "config"];
+
+/// Every top-level command name in [`HELP_GROUPS`] that is not in
+/// [`SANDBOX_VISIBLE`] — hidden from help under `AIRLOCK_SANDBOX=1`.
+fn hidden_in_sandbox() -> impl Iterator<Item = &'static str> {
+    HELP_GROUPS
+        .iter()
+        .flat_map(|(_, names)| names.iter().copied())
+        .filter(|n| !SANDBOX_VISIBLE.contains(n))
+}
+
+/// The line a hidden command's own `--help` starts with (U16): "a hidden
+/// command's own `--help` still works and starts with a line saying it
+/// needs the user's terminal."
+fn hidden_command_notice(name: &str) -> String {
+    let why = match name {
+        "status" => {
+            "needs your own terminal. Inside a session, `airlock agent check` shows this session."
+        }
+        _ => "needs your own terminal; it cannot run inside an Airlock sandbox.",
+    };
+    format!("`airlock {name}` {why}\n")
+}
+
+/// Leaves out `{subcommands}`/`{options}`: [`build_after_help`] renders both
+/// itself, grouped (clap has no notion of subcommand headings), so the
+/// listing can differ between a normal and a sandboxed invocation (U16).
+const HELP_TEMPLATE: &str = "{about-with-newline}\n{usage-heading} {usage}{after-help}";
+
+/// One line per name in `names`, padded to the widest, with the one-line
+/// description read back off `cmd` (each variant's doc comment, which clap
+/// already turned into its `about`) so this can never drift from the real
+/// subcommand list.
+fn render_command_list(cmd: &clap::Command, names: &[&str]) -> String {
+    let width = names.iter().map(|n| n.len()).max().unwrap_or(0);
+    let mut out = String::new();
+    for name in names {
+        let about = cmd
+            .find_subcommand(name)
+            .and_then(|c| c.get_about())
+            .map(|s| s.to_string())
+            .unwrap_or_default();
+        out.push_str(&format!("  {name:<width$}  {about}\n"));
+    }
+    out
+}
+
+/// The body `--help` prints below the usage line: the command groups (or,
+/// inside the sandbox, the restricted list and which commands are hidden),
+/// a static `Options:` block (every top-level flag besides the subcommand
+/// is `-h`/`-V`, which clap adds itself, so this can't drift), and the
+/// footer pointing a new user at `init` then `run`.
+fn build_after_help(cmd: &clap::Command, sandboxed: bool) -> String {
+    let mut out = String::new();
+    if sandboxed {
+        let hidden: Vec<&str> = hidden_in_sandbox().collect();
+        out.push_str("Running inside an Airlock sandbox: only the commands below work here.\n");
+        out.push_str(&format!(
+            "Hidden (run these from your own terminal): {}.\n\n",
+            hidden.join(", ")
+        ));
+        out.push_str(&render_command_list(cmd, SANDBOX_VISIBLE));
+        out.push('\n');
+    } else {
+        for (title, names) in HELP_GROUPS {
+            out.push_str(title);
+            out.push_str(":\n");
+            out.push_str(&render_command_list(cmd, names));
+            out.push('\n');
+        }
+    }
+    out.push_str("Options:\n  -h, --help     Print help\n  -V, --version  Print version\n\n");
+    out.push_str("Start with `airlock init`, then `airlock run --profile claude`.\n");
+    out
+}
+
+/// Applies the help grouping (U5) and, with `AIRLOCK_SANDBOX=1`, the help
+/// restriction (U16) to a freshly built [`Cli::command`]: hides the
+/// commands that need the user's own terminal and gives each a
+/// `before_help` line saying so, gives `daemon --help` its lifecycle note,
+/// and replaces the flat subcommand listing with the grouped one.
+fn customize_help(mut cmd: clap::Command, sandboxed: bool) -> clap::Command {
+    if sandboxed {
+        for name in hidden_in_sandbox() {
+            let notice = hidden_command_notice(name);
+            cmd = cmd.mut_subcommand(name, |c| c.hide(true).before_help(notice));
+        }
+        // `init` itself works inside the sandbox, but `--global` needs the
+        // user's own terminal (sandbox_refusal refuses it) — hide the arg
+        // so a sandboxed `init --help` doesn't list a flag it then refuses.
+        cmd = cmd.mut_subcommand("init", |c| c.mut_arg("global", |a| a.hide(true)));
+    }
+    cmd = cmd.mut_subcommand("daemon", |c| {
+        c.after_help(
+            "`run` and `session start` start the daemon when it is not running; a daemon \
+             started that way exits after 5 minutes with no sessions.\n",
+        )
+    });
+    let after_help = build_after_help(&cmd, sandboxed);
+    cmd.after_help(after_help)
 }
 
 // ─── Shared helpers ──────────────────────────────────────────────────────────
 
-/// Get the current working directory, printing an error and returning
-/// `ExitCode::FAILURE` if it cannot be determined.
-fn current_dir_or_fail() -> Result<std::path::PathBuf, ExitCode> {
-    std::env::current_dir().map_err(|e| {
-        eprintln!("error: failed to determine current directory: {e}");
-        ExitCode::FAILURE
-    })
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving its own cwd before talking to the daemon"
+)]
+fn current_dir() -> Result<PathBuf, CliError> {
+    std::env::current_dir()
+        .map_err(|e| CliError::new(format!("failed to determine current directory: {e}")))
 }
 
-/// Create a single-use tokio runtime, printing an error and returning
-/// `ExitCode::FAILURE` if creation fails.
-fn tokio_runtime_or_fail() -> Result<tokio::runtime::Runtime, ExitCode> {
-    tokio::runtime::Runtime::new().map_err(|e| {
-        eprintln!("error: failed to create async runtime: {e}");
-        ExitCode::FAILURE
-    })
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving the user's home directory, not daemon request-path code"
+)]
+fn home_dir() -> Result<PathBuf, CliError> {
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .ok_or_else(|| CliError::new("HOME is not set"))
 }
 
-/// The result of reading a PID file and checking whether the daemon is alive.
-enum PidCheckResult {
-    /// The process with the given PID is alive.
-    Alive(i32),
-    /// A PID file exists but the process is dead (stale state).
-    Stale,
-    /// No PID file exists.
-    NoPidFile,
+fn now_unix() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
 }
 
-/// Read the PID file at `pid_path`, parse its contents, and check process
-/// liveness via `kill(pid, 0)`. Returns `Err(ExitCode::FAILURE)` for
-/// unrecoverable errors (unreadable file, unparseable PID).
-fn read_pid_and_check_liveness(pid_path: &Path) -> Result<PidCheckResult, ExitCode> {
-    let pid_contents = match std::fs::read_to_string(pid_path) {
-        Ok(c) => c,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            return Ok(PidCheckResult::NoPidFile);
-        }
-        Err(e) => {
-            eprintln!("error: failed to read PID file {}: {e}", pid_path.display());
-            return Err(ExitCode::FAILURE);
-        }
-    };
+fn tokio_runtime() -> Result<tokio::runtime::Runtime, CliError> {
+    tokio::runtime::Runtime::new()
+        .map_err(|e| CliError::new(format!("failed to create async runtime: {e}")))
+}
 
-    let pid: i32 = match pid_contents.trim().parse() {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: invalid PID in {}: {e}", pid_path.display());
-            return Err(ExitCode::FAILURE);
-        }
-    };
+/// The line [`eprint_error`] prints, split out so the escaping itself is
+/// testable without capturing real stderr.
+fn format_error_line(message: impl std::fmt::Display) -> String {
+    format!(
+        "error: {}",
+        airlock::trust::escape_for_terminal(&message.to_string())
+    )
+}
 
-    let alive = unsafe { libc::kill(pid, 0) } == 0;
-    if alive {
-        Ok(PidCheckResult::Alive(pid))
-    } else {
-        Ok(PidCheckResult::Stale)
+/// Prints an error whose text can carry content the user running this
+/// command never chose — a tool name or secret label from a project config
+/// not yet trusted, or a session name echoed back by the daemon. These
+/// reach the terminal before (or instead of) the trust prompt that would
+/// otherwise be the user's first look at that content, so they get the
+/// same escaping `airlock trust`'s review already gives it
+/// ([`airlock::trust::escape_for_terminal`]) rather than going out raw.
+fn eprint_error(message: impl std::fmt::Display) {
+    eprintln!("{}", format_error_line(message));
+}
+
+/// Prints a `LauncherError`'s message, unless it is `Aborted` (the launcher
+/// already printed everything the user needs to see).
+fn report_launcher_error(e: &LauncherError) {
+    if !matches!(e, LauncherError::Aborted) {
+        eprint_error(e);
     }
 }
 
-/// Remove the files a dead daemon left behind, ignoring errors.
-fn cleanup_stale_files(paths: &airlock::config::DiscoveredPaths) {
-    let _ = airlock::daemon::remove_runtime_files(paths.runtime_files());
+/// Why a command stopped early. [`finish`] is the one place it is printed,
+/// so every message gets [`eprint_error`]'s escaping.
+enum CliError {
+    /// Already reported to the user (the launcher's `Aborted`).
+    Reported,
+    /// Print `message` and exit with `code`.
+    Failed { message: String, code: u8 },
+}
+
+impl CliError {
+    fn new(message: impl std::fmt::Display) -> Self {
+        CliError::Failed {
+            message: message.to_string(),
+            code: 125,
+        }
+    }
+}
+
+impl From<LauncherError> for CliError {
+    fn from(e: LauncherError) -> Self {
+        match e {
+            LauncherError::Aborted => CliError::Reported,
+            e => CliError::new(e),
+        }
+    }
+}
+
+impl From<run::RunError> for CliError {
+    fn from(e: run::RunError) -> Self {
+        match e {
+            run::RunError::Aborted => CliError::Reported,
+            e => CliError::new(e),
+        }
+    }
+}
+
+/// The daemon's own [`ErrorKind`](airlock::protocol::ErrorKind) picks the
+/// exit code when it answered with one.
+impl From<AdminError> for CliError {
+    fn from(e: AdminError) -> Self {
+        let code = match &e {
+            AdminError::Daemon { kind, .. } => kind.exit_code(),
+            _ => 125,
+        };
+        CliError::Failed {
+            message: e.to_string(),
+            code,
+        }
+    }
+}
+
+impl From<airlock::runtime_dir::RuntimeDirError> for CliError {
+    fn from(e: airlock::runtime_dir::RuntimeDirError) -> Self {
+        CliError::new(e)
+    }
+}
+
+type CliResult = Result<ExitCode, CliError>;
+
+fn finish(result: CliResult) -> ExitCode {
+    match result {
+        Ok(code) => code,
+        Err(CliError::Reported) => ExitCode::from(125),
+        Err(CliError::Failed { message, code }) => {
+            eprint_error(message);
+            ExitCode::from(code)
+        }
+    }
+}
+
+fn discover_opts(config: Option<PathBuf>, no_project_config: bool) -> DiscoverOpts {
+    DiscoverOpts {
+        config,
+        no_project_config,
+    }
 }
 
 // ─── Main ────────────────────────────────────────────────────────────────────
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
-    let config_path = cli.config.as_deref();
+    let sandboxed = in_sandbox();
+    let cmd = customize_help(Cli::command(), sandboxed);
+    let matches = cmd.get_matches();
+    let cli = match Cli::from_arg_matches(&matches) {
+        Ok(cli) => cli,
+        Err(e) => e.exit(),
+    };
 
-    match cli.command {
-        Commands::Daemon { action } => match action {
-            DaemonAction::Start => cmd_daemon_start(config_path),
-            DaemonAction::Run => cmd_daemon_run(config_path),
-            DaemonAction::Stop => cmd_daemon_stop(config_path),
-            DaemonAction::Restart => cmd_daemon_restart(config_path),
-        },
-        Commands::Exec { args } => cmd_exec(args, config_path),
-        Commands::Status => cmd_status(config_path),
-        Commands::List => cmd_list(config_path),
-        Commands::Logs => cmd_logs(config_path),
-        Commands::Init => cmd_init(),
+    if let Some(code) = sandbox_refusal(&cli.command) {
+        return code;
+    }
+
+    finish(match cli.command {
         Commands::Run {
-            no_daemon,
-            no_config,
             profile,
             allow_read,
             allow_write,
             passthrough_env,
+            kits,
+            name,
+            no_session,
+            config,
+            no_project_config,
+            verbose,
+            quiet,
             args,
         } => cmd_run(
             args,
-            run::RunOptions {
-                no_daemon,
-                no_config,
+            RunOptions {
                 profile,
                 allow_read,
                 allow_write,
                 passthrough_env,
+                kits,
+                name,
+                no_session,
+                discover: discover_opts(config, no_project_config),
+                verbose,
+                quiet,
             },
-            config_path,
         ),
-    }
-}
-
-// ─── Command: daemon start ──────────────────────────────────────────────────
-
-fn cmd_daemon_start(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let state = match daemon::synchronous_startup(&cwd, config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match daemon::daemonize(state) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ─── Command: daemon run ────────────────────────────────────────────────────
-
-fn cmd_daemon_run(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let state = match daemon::synchronous_startup(&cwd, config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match daemon::run_foreground(state) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ─── Command: daemon stop ───────────────────────────────────────────────────
-
-/// Timeout for waiting for the daemon to exit after SIGTERM.
-const STOP_TIMEOUT_SECS: u64 = 10;
-
-/// Poll interval when waiting for the daemon process to exit.
-const STOP_POLL_INTERVAL_MS: u64 = 100;
-
-fn cmd_daemon_stop(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    match stop_daemon(&cwd, config_path) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(code) => code,
-    }
-}
-
-/// Stop the daemon if it is running, cleaning up stale state. Prints
-/// user-visible status to stderr. Returns `Ok(())` whether the daemon was
-/// running or not — only unrecoverable errors produce `Err`.
-fn stop_daemon(cwd: &Path, config_path: Option<&Path>) -> Result<(), ExitCode> {
-    let paths = match config_path {
-        Some(p) => config::discover_paths_from_file(p),
-        None => config::discover_paths(cwd),
-    }
-    .map_err(|e| {
-        eprintln!("error: failed to discover airlock config: {e}");
-        ExitCode::FAILURE
-    })?;
-
-    let pid = match read_pid_and_check_liveness(&paths.pid_path)? {
-        PidCheckResult::NoPidFile => {
-            eprintln!("daemon is not running");
-            return Ok(());
-        }
-        PidCheckResult::Stale => {
-            cleanup_stale_files(&paths);
-            eprintln!("cleaned up stale PID file");
-            return Ok(());
-        }
-        PidCheckResult::Alive(pid) => pid,
-    };
-
-    // Process is alive — send SIGTERM.
-    let kill_result = unsafe { libc::kill(pid, libc::SIGTERM) };
-    if kill_result != 0 {
-        let err = std::io::Error::last_os_error();
-        if err.raw_os_error() == Some(libc::ESRCH) {
-            // Race condition: process exited between liveness check and SIGTERM.
-            cleanup_stale_files(&paths);
-            eprintln!("daemon stopped");
-            return Ok(());
-        }
-        eprintln!("error: failed to send SIGTERM to PID {pid}: {err}");
-        return Err(ExitCode::FAILURE);
-    }
-
-    // Wait for the process to exit.
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(STOP_TIMEOUT_SECS);
-
-    loop {
-        std::thread::sleep(std::time::Duration::from_millis(STOP_POLL_INTERVAL_MS));
-
-        let still_alive = unsafe { libc::kill(pid, 0) } == 0;
-        if !still_alive {
-            eprintln!("daemon stopped");
-            return Ok(());
-        }
-
-        if std::time::Instant::now() >= deadline {
-            eprintln!("daemon did not stop; PID {pid} may require manual intervention");
-            return Err(ExitCode::FAILURE);
-        }
-    }
-}
-
-// ─── Command: daemon restart ────────────────────────────────────────────────
-
-fn cmd_daemon_restart(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    if let Err(code) = stop_daemon(&cwd, config_path) {
-        return code;
-    }
-
-    let state = match daemon::synchronous_startup(&cwd, config_path) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    match daemon::daemonize(state) {
-        Ok(()) => ExitCode::SUCCESS,
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ─── Command: exec ──────────────────────────────────────────────────────────
-
-fn cmd_exec(args: Vec<String>, config_path: Option<&Path>) -> ExitCode {
-    if args.is_empty() {
-        eprintln!("error: no tool specified\n\nUsage: airlock exec -- <tool> [args...]");
-        return ExitCode::FAILURE;
-    }
-
-    let tool = args[0].clone();
-    let tool_args: Vec<String> = args[1..].to_vec();
-
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let rt = match tokio_runtime_or_fail() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-
-    let result = rt.block_on(client::exec(tool, tool_args, &cwd, config_path));
-
-    // `client::exec` may have spawned `forward_stdin`, which reads stdin via
-    // `tokio::io::stdin()` on a blocking thread that `JoinHandle::abort` cannot
-    // wake. If our stdin is a pipe whose write end never closes (common when
-    // invoked from a non-interactive harness), the thread parks forever in
-    // `read(2)` and the default `Runtime` drop waits for it. Detach instead;
-    // the kernel reaps the thread when this process exits.
-    rt.shutdown_background();
-
-    match result {
-        Ok(exit_code) => {
-            if exit_code == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::from(exit_code as u8)
-            }
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
-        }
-    }
-}
-
-// ─── Command: status ────────────────────────────────────────────────────────
-
-fn cmd_status(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let discover_result = match config_path {
-        Some(p) => config::discover_paths_from_file(p),
-        None => config::discover_paths(&cwd),
-    };
-    let paths = match discover_result {
-        Ok(p) => p,
-        Err(e) => {
-            eprintln!("error: failed to discover airlock config: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    // The socket is the ground truth for liveness: a daemon is running if and
-    // only if something accepts connections on it. The PID file is only a
-    // kill-handle for a standalone daemon — an embedded `airlock run` daemon
-    // writes none — so it is consulted purely to enrich the output, never to
-    // decide whether the daemon is up.
-    if std::os::unix::net::UnixStream::connect(&paths.socket_path).is_err() {
-        eprintln!("daemon is not running");
-        return ExitCode::FAILURE;
-    }
-
-    // Enrich with the standalone daemon's PID when the file is present and
-    // parseable. Stay silent otherwise: an embedded daemon writes no PID file,
-    // and a corrupt one must not turn a healthy `status` into an error.
-    match std::fs::read_to_string(&paths.pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse::<i32>().ok())
-    {
-        Some(pid) => println!("daemon is running (PID: {pid})"),
-        None => println!("daemon is running"),
-    }
-    ExitCode::SUCCESS
-}
-
-// ─── Command: list ──────────────────────────────────────────────────────────
-
-fn cmd_list(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let load_result = match config_path {
-        Some(p) => config::load_config_from_file(p),
-        None => config::load_config(&cwd),
-    };
-    let cfg = match load_result {
-        Ok(c) => c,
-        Err(e) => {
-            eprintln!("error: failed to load airlock config: {e}");
-            return ExitCode::FAILURE;
-        }
-    };
-
-    if cfg.tools.is_empty() {
-        println!("No tools configured.");
-        return ExitCode::SUCCESS;
-    }
-
-    // Sort tool names for deterministic output.
-    let mut tool_names: Vec<&String> = cfg.tools.keys().collect();
-    tool_names.sort();
-
-    for name in tool_names {
-        let tool = &cfg.tools[name];
-        println!("{name}");
-
-        if let Some(desc) = &tool.description {
-            println!("  {desc}");
-        }
-
-        if tool.env.is_empty() {
-            println!("  (no environment)");
-        } else {
-            for (var, value) in &tool.env {
-                match value {
-                    config::EnvValue::Static(s) => println!("  {var} = {s:?}"),
-                    config::EnvValue::SecretRef(label) => {
-                        println!("  {var} = <secret {label:?}>")
-                    }
-                }
-            }
-        }
-
-        if let Some(policy) = &tool.proxy {
-            println!("  proxy tool; reachable hosts:");
-            for route in &policy.routes {
-                match &route.inject {
-                    Some(inject) => println!(
-                        "    {} ({} injected from <secret {:?}>)",
-                        route.host, inject.header, inject.secret
-                    ),
-                    None => println!("    {} (no credential)", route.host),
-                }
-            }
-        }
-    }
-
-    ExitCode::SUCCESS
+        Commands::Init { local, global } => cmd_init(local, global),
+        Commands::Trust {
+            config,
+            yes,
+            expect_sha256,
+        } => cmd_trust(config, yes, expect_sha256),
+        Commands::Config {
+            config,
+            no_project_config,
+            paths,
+        } => cmd_config(config, no_project_config, paths),
+        Commands::Status {
+            config,
+            no_project_config,
+        } => cmd_status(config, no_project_config),
+        Commands::Exec { args } => cmd_exec(args),
+        Commands::Tools { action } => cmd_tools(action),
+        Commands::Agent { action } => cmd_agent(action),
+        Commands::Session { action } => cmd_session(action),
+        Commands::Daemon { action } => cmd_daemon(action),
+    })
 }
 
 // ─── Command: run ───────────────────────────────────────────────────────────
 
-fn cmd_run(args: Vec<String>, opts: run::RunOptions, config_path: Option<&Path>) -> ExitCode {
-    // When no command was passed after `--`, fall back to the profile's
-    // default command (if any). Without both, we have nothing to run.
+fn cmd_run(args: Vec<String>, opts: RunOptions) -> CliResult {
     let resolved_args: Vec<String> = if args.is_empty() {
         match opts.profile {
             Some(p) => p.default_command(),
             None => {
-                eprintln!(
-                    "error: no command specified\n\n\
-                     Usage: airlock run [--profile <NAME>] -- <command> [args...]"
-                );
-                return ExitCode::FAILURE;
+                return Err(CliError::new(
+                    "no command specified\n\n\
+                     Usage: airlock run [--profile <NAME>] -- <command> [args...]",
+                ));
             }
         }
     } else {
         args
     };
 
-    let command = &resolved_args[0];
-    let command_args = &resolved_args[1..];
+    let command = resolved_args[0].clone();
+    let command_args = resolved_args[1..].to_vec();
 
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
+    let cwd = current_dir()?;
+    Ok(run::run_agent(&cwd, &command, &command_args, opts)?)
+}
+
+// ─── Command: init ───────────────────────────────────────────────────────────
+
+/// `main.rs`'s own inputs for [`inspect::init_cmd`]: `cwd`/`HOME` from the
+/// process, the global config path every other command reads, and the real
+/// `git check-ignore` for `--local`'s ignore-file note. `--global` inside
+/// the sandbox is already refused by `sandbox_refusal` before this runs.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: gathers the CLI's own cwd/HOME/XDG_CONFIG_HOME to hand to inspect::init_cmd"
+)]
+fn cmd_init(local: bool, global: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
+    let (global_config, _) =
+        airlock::anchors::global_config_path(&|k| std::env::var(k).ok(), &home);
+    let kind = if global {
+        inspect::InitKind::Global
+    } else if local {
+        inspect::InitKind::Local
+    } else {
+        inspect::InitKind::Plain
+    };
+    let mut stdout = std::io::stdout();
+    Ok(inspect::init_cmd(
+        kind,
+        &cwd,
+        &home,
+        &global_config,
+        &inspect::RealGitRunner,
+        &mut stdout,
+    ))
+}
+
+// ─── Command: config ─────────────────────────────────────────────────────────
+
+/// `airlock config [--config] [--no-project-config] [--paths]`: gathers the
+/// real `cwd`, `HOME`, anchors (`anchors::resolve` over the real
+/// environment) and runtime dir, then hands them to [`inspect::config_cmd`],
+/// which does the actual file reading and rendering.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::config_cmd"
+)]
+fn cmd_config(config: Option<PathBuf>, no_project_config: bool, paths: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
+    let runtime = RuntimeDir::locate()?;
+    let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
+
+    let opts = inspect::ConfigOptions {
+        config,
+        no_project_config,
+        paths,
+    };
+    let paths_report = inspect::ConfigPaths {
+        global_config: anchors.global_config.clone(),
+        trust_store: anchors.trust_store.clone(),
+        runtime_dir: runtime.base().to_path_buf(),
+        socket: runtime.socket_path(),
+        tool_state_base: anchors.tool_state_base.clone(),
     };
 
-    match run::run_agent(&cwd, config_path, command, command_args, opts) {
-        Ok(exit_code) => exit_code,
-        Err(run::RunError::ConfigNotFound) => {
-            eprintln!(
-                "error: no airlock.toml found\n\nHint: run `airlock init` to create one in the current directory"
+    let env_snapshot: std::collections::BTreeMap<String, String> = std::env::vars().collect();
+    let mut stdout = std::io::stdout();
+    Ok(inspect::config_cmd(
+        &opts,
+        &cwd,
+        &home,
+        &anchors.global_config,
+        &anchors.tool_state_base,
+        &env_snapshot,
+        &paths_report,
+        in_sandbox(),
+        &mut stdout,
+    ))
+}
+
+// ─── Command: status ─────────────────────────────────────────────────────────
+
+/// Reads the daemon's admin family (`Hello`, then `ListSessions`) for
+/// [`inspect::status_cmd`]'s [`inspect::DaemonProbe`]. The daemon's `Hello`
+/// carries no start time, so an automatic daemon's age is read off the
+/// runtime dir's PID file mtime instead — written once, at startup, by the
+/// same process `Hello.pid` names.
+struct AdminProbe {
+    runtime: RuntimeDir,
+    conn: Option<admin::Connection>,
+    token: Option<airlock::protocol::AdminToken>,
+}
+
+impl AdminProbe {
+    fn new(runtime: RuntimeDir) -> Self {
+        Self {
+            runtime,
+            conn: None,
+            token: None,
+        }
+    }
+}
+
+fn pid_file_started_unix(pid_path: &std::path::Path) -> Option<u64> {
+    std::fs::metadata(pid_path)
+        .and_then(|m| m.modified())
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs())
+}
+
+impl inspect::DaemonProbe for AdminProbe {
+    fn hello(&mut self) -> Option<inspect::DaemonStatus> {
+        let conn = admin::Connection::connect(&self.runtime.socket_path()).ok()?;
+        let started_unix = (conn.hello.mode == DaemonMode::Automatic)
+            .then(|| pid_file_started_unix(&self.runtime.pid_path()))
+            .flatten();
+        let status = inspect::DaemonStatus {
+            pid: conn.hello.pid,
+            version: conn.hello.version.clone(),
+            mode: conn.hello.mode,
+            started_unix,
+            addr: self.runtime.addr(),
+        };
+        self.token = admin::read_admin_token(&self.runtime).ok();
+        self.conn = Some(conn);
+        Some(status)
+    }
+
+    fn list_sessions(&mut self) -> Vec<SessionInfo> {
+        let (Some(conn), Some(token)) = (self.conn.as_mut(), self.token.as_ref()) else {
+            return Vec::new();
+        };
+        match conn.admin_request(token, AdminRequest::ListSessions) {
+            Ok(DaemonMessage::Sessions { sessions }) => sessions,
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// `airlock status [--config] [--no-project-config]`. Refused inside the
+/// sandbox before this runs (`sandbox_refusal`, with a hint to `agent
+/// check`).
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side inspect wrapper: resolves anchors from the CLI's own environment to hand to inspect::status_cmd"
+)]
+fn cmd_status(config: Option<PathBuf>, no_project_config: bool) -> CliResult {
+    let cwd = current_dir()?;
+    let home = home_dir()?;
+    let runtime = RuntimeDir::locate()?;
+    let anchors = airlock::anchors::resolve(&|k| std::env::var(k).ok(), &home, &runtime);
+
+    let opts = inspect::StatusOptions {
+        config,
+        no_project_config,
+    };
+    let mut probe = AdminProbe::new(runtime);
+    let mut stdout = std::io::stdout();
+    Ok(inspect::status_cmd(
+        &opts,
+        &cwd,
+        &home,
+        &anchors.global_config,
+        &anchors.trust_store,
+        &mut probe,
+        now_unix(),
+        &mut stdout,
+    ))
+}
+
+// ─── Command: trust ──────────────────────────────────────────────────────────
+
+fn cmd_trust(config: Option<PathBuf>, yes: bool, expect_sha256: Vec<String>) -> CliResult {
+    let cwd = current_dir()?;
+    airlock::launcher::run_trust(&cwd, config, yes, &expect_sha256)?;
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─── Command: exec ───────────────────────────────────────────────────────────
+
+fn cmd_exec(args: Vec<String>) -> CliResult {
+    if args.is_empty() {
+        return Err(CliError::new(
+            "no tool specified\n\nUsage: airlock exec -- <tool> [args...]",
+        ));
+    }
+    let tool = args[0].clone();
+    let tool_args: Vec<String> = args[1..].to_vec();
+
+    let cwd = current_dir()?;
+    let canonical_cwd = std::fs::canonicalize(&cwd).unwrap_or(cwd);
+
+    let rt = tokio_runtime()?;
+
+    let code = rt.block_on(airlock::client::exec(tool, tool_args, &canonical_cwd));
+    // `client::exec` may have spawned `forward_stdin`, which reads stdin on a
+    // blocking thread that `JoinHandle::abort` cannot wake. If stdin is a
+    // pipe whose write end never closes (common under a non-interactive
+    // harness), that thread parks in `read(2)` forever and the default
+    // `Runtime` drop waits for it. Detach instead; the kernel reaps the
+    // thread when this process exits.
+    rt.shutdown_background();
+    Ok(ExitCode::from(code as u8))
+}
+
+// ─── Command: tools ──────────────────────────────────────────────────────────
+
+fn cmd_tools(action: Option<ToolsAction>) -> CliResult {
+    let session = match action {
+        None => None,
+        Some(ToolsAction::List { session }) => session,
+    };
+    let rt = tokio_runtime()?;
+    let code = rt.block_on(airlock::client::tools_list(session));
+    Ok(ExitCode::from(code as u8))
+}
+
+// ─── Command: agent ──────────────────────────────────────────────────────────
+
+fn cmd_agent(action: AgentAction) -> CliResult {
+    Ok(match action {
+        AgentAction::Check { quiet } => airlock::agent::check_cmd(quiet),
+        AgentAction::Hook {
+            harness,
+            print_settings,
+        } => airlock::agent::hook_cmd(harness, print_settings),
+    })
+}
+
+// ─── Command: session ────────────────────────────────────────────────────────
+
+fn cmd_session(action: SessionAction) -> CliResult {
+    let cwd = current_dir()?;
+    match action {
+        SessionAction::Start {
+            name,
+            ttl,
+            format,
+            config,
+            no_project_config,
+            quiet,
+        } => cmd_session_start(&cwd, name, ttl, format, config, no_project_config, quiet),
+        SessionAction::Renew { id, ttl } => cmd_session_renew(id, ttl),
+        SessionAction::List { here } => cmd_session_list(&cwd, here),
+        SessionAction::Reload { ids, all } => cmd_session_reload(&cwd, ids, all),
+        SessionAction::Revoke { ids, here, all } => cmd_session_revoke(&cwd, ids, here, all),
+    }
+}
+
+fn cmd_session_start(
+    cwd: &std::path::Path,
+    name: Option<String>,
+    ttl: String,
+    format: ExportFormat,
+    config: Option<PathBuf>,
+    no_project_config: bool,
+    quiet: bool,
+) -> CliResult {
+    let ttl_secs = launcher::parse_ttl(&ttl).map_err(CliError::new)?;
+    let name = name.unwrap_or_else(launcher::default_session_start_name);
+
+    let prepared = launcher::prepare(
+        cwd,
+        &PrepareOptions {
+            discover: discover_opts(config, no_project_config),
+            verbose: false,
+            quiet,
+            extra_write_grants: Vec::new(),
+            cli_kits: Vec::new(),
+        },
+    )?;
+
+    let (mut conn, _started_new) = launcher::ensure_daemon(&prepared.runtime, false, quiet)?;
+    let admin_token = admin::read_admin_token(&prepared.runtime)?;
+    let (id, token, _ca_path) = launcher::register(
+        &mut conn,
+        &admin_token,
+        &prepared,
+        name.clone(),
+        SandboxKind::External,
+        SessionEnds::Ttl { secs: ttl_secs },
+    )?;
+
+    let addr = prepared.runtime.addr();
+    let session = token.expose_secret();
+    match format {
+        ExportFormat::Sh => {
+            println!("export AIRLOCK_ADDR='{addr}'");
+            println!("export AIRLOCK_SESSION='{session}'");
+        }
+        ExportFormat::Fish => {
+            println!("set -gx AIRLOCK_ADDR '{addr}'");
+            println!("set -gx AIRLOCK_SESSION '{session}'");
+        }
+        ExportFormat::Json => {
+            println!(
+                "{}",
+                serde_json::json!({ "addr": addr, "session": session })
             );
-            ExitCode::FAILURE
-        }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
         }
     }
-}
 
-// ─── Command: init ──────────────────────────────────────────────────────────
-
-fn cmd_init() -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
-    };
-
-    let config_path = cwd.join(config::config_filename());
-
-    if config_path.exists() {
+    if !quiet {
+        let expiry = if ttl_secs == 0 {
+            String::new()
+        } else {
+            format!(", expires in {}", launcher::format_duration_short(ttl_secs))
+        };
         eprintln!(
-            "error: {} already exists in {}",
-            config::config_filename(),
-            cwd.display()
+            "session {id} {name:?} for {}{expiry}",
+            prepared.root.display()
         );
-        return ExitCode::FAILURE;
+        eprintln!(
+            "note: this harness runs in its own sandbox, or none. It must deny reads of\n      \
+             {} and keep the agent away from your credential stores; see\n      \
+             https://github.com/ModernPath/airlock/blob/main/SECURITY.md#external-sandboxes",
+            prepared.anchors.runtime_base.display()
+        );
     }
 
-    match std::fs::write(&config_path, config::default_config_template()) {
-        Ok(()) => {
-            println!("Created {}", config_path.display());
-            ExitCode::SUCCESS
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_session_renew(id: String, ttl: Option<String>) -> CliResult {
+    let ttl_secs = ttl
+        .as_deref()
+        .map(launcher::parse_ttl)
+        .transpose()
+        .map_err(CliError::new)?;
+
+    let (mut conn, token, _runtime) = connect_admin()?;
+    conn.request_ok(
+        &token,
+        AdminRequest::Renew {
+            session: id.clone(),
+            ttl_secs,
+        },
+    )?;
+
+    match find_session(&mut conn, &token, &id) {
+        Some(info) => {
+            let expiry = match info.ends {
+                EndsInfo::Ttl { .. } => format!(", {}", ends_text(&info.ends, now_unix())),
+                _ => String::new(),
+            };
+            println!("renewed {} {:?}{expiry}", info.id, info.name);
         }
-        Err(e) => {
-            eprintln!("error: failed to write {}: {e}", config_path.display());
-            ExitCode::FAILURE
-        }
+        None => println!("renewed {id}"),
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// What ends a session, per "Options" in `docs/airlock-v2-ux.md`
+/// (`session list`'s "what ends it" column): `"held by airlock run, PID
+/// 4821"`, `"expires in 6h"`, or `"never expires"`.
+fn ends_text(ends: &EndsInfo, now: u64) -> String {
+    match ends {
+        EndsInfo::Lease { pid } => format!("held by airlock run, PID {pid}"),
+        EndsInfo::Ttl { expires_unix } => format!(
+            "expires in {}",
+            launcher::format_duration_short(expires_unix.saturating_sub(now))
+        ),
+        EndsInfo::Never => "never expires".to_string(),
     }
 }
 
-// ─── Command: logs ──────────────────────────────────────────────────────────
+fn cmd_session_list(cwd: &std::path::Path, here: bool) -> CliResult {
+    let home = home_dir()?;
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
 
-fn cmd_logs(config_path: Option<&Path>) -> ExitCode {
-    let cwd = match current_dir_or_fail() {
-        Ok(d) => d,
-        Err(code) => return code,
+    let project_root = discover_root_quietly(cwd);
+    let now = now_unix();
+    let rows: Vec<Vec<String>> = sessions
+        .iter()
+        .filter(|s| !here || project_root.as_deref() == Some(s.root.as_path()))
+        .map(|s| {
+            vec![
+                s.id.to_string(),
+                s.name.clone(),
+                inspect::display_path(&s.root, &home),
+                inspect::format_hhmm_local(s.started_unix),
+                format!("{} execs", s.execs),
+                ends_text(&s.ends, now),
+                if airlock::client::layers_changed(&s.layers) {
+                    "config changed".to_string()
+                } else {
+                    String::new()
+                },
+            ]
+        })
+        .collect();
+    print!("{}", inspect::table(&rows));
+    Ok(ExitCode::SUCCESS)
+}
+
+fn cmd_session_reload(cwd: &std::path::Path, ids: Vec<String>, all: bool) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
+
+    let project_root = discover_root_quietly(cwd);
+    let targets: Vec<SessionInfo> = if all {
+        sessions
+    } else if !ids.is_empty() {
+        // Resolve each ref exactly once, by the same rule the daemon's own
+        // handlers use (exact id, unique id prefix, or unique name) — never
+        // silently reload every session an ambiguous ref happens to match.
+        ids.iter()
+            .map(|id| session::resolve_session_ref(id, &sessions).cloned())
+            .collect::<Result<_, _>>()
+            .map_err(CliError::new)?
+    } else {
+        sessions
+            .into_iter()
+            .filter(|s| project_root.as_deref() == Some(s.root.as_path()))
+            .collect()
     };
 
-    let rt = match tokio_runtime_or_fail() {
-        Ok(r) => r,
-        Err(code) => return code,
-    };
-
-    match rt.block_on(client::logs(&cwd, config_path)) {
-        Ok(exit_code) => {
-            if exit_code == 0 {
-                ExitCode::SUCCESS
-            } else {
-                ExitCode::FAILURE
+    let mut exit = ExitCode::SUCCESS;
+    for session in targets {
+        let discover = match &session.mode {
+            WireMode::Default => DiscoverOpts::default(),
+            WireMode::ConfigFile { path } => DiscoverOpts {
+                config: Some(path.clone()),
+                no_project_config: false,
+            },
+            WireMode::NoProjectConfig => DiscoverOpts {
+                config: None,
+                no_project_config: true,
+            },
+        };
+        let prepared = match launcher::prepare(
+            &session.root,
+            &PrepareOptions {
+                discover,
+                verbose: false,
+                quiet: true,
+                extra_write_grants: session.write_grants.clone(),
+                cli_kits: Vec::new(),
+            },
+        ) {
+            Ok(p) => p,
+            Err(e) => {
+                report_launcher_error(&e);
+                exit = ExitCode::from(125);
+                continue;
+            }
+        };
+        match launcher::reload(&mut conn, &token, session.id.as_str(), &prepared) {
+            Ok((id, changes, agent_changed)) => {
+                let summary = if changes.is_empty() {
+                    "no changes".to_string()
+                } else {
+                    changes.join(", ")
+                };
+                println!("reloaded {id} {:?}: {summary}", session.name);
+                if agent_changed {
+                    println!("note: agent settings changed; restart the agent to apply them");
+                }
+            }
+            Err(e) => {
+                report_launcher_error(&e);
+                exit = ExitCode::from(125);
             }
         }
-        Err(e) => {
-            eprintln!("error: {e}");
-            ExitCode::FAILURE
+    }
+    Ok(exit)
+}
+
+fn cmd_session_revoke(cwd: &std::path::Path, ids: Vec<String>, here: bool, all: bool) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    let sessions = conn.list_sessions(&token)?;
+
+    // Refs resolve by the daemon's rule (exact id, unique id prefix, unique
+    // name), so an ambiguous ref is refused instead of ending every session
+    // it matches. Resolving here also gives the id and name to report.
+    let targets: Vec<&SessionInfo> = if all || here {
+        let project_root = discover_root_quietly(cwd);
+        sessions
+            .iter()
+            .filter(|s| all || project_root.as_deref() == Some(s.root.as_path()))
+            .collect()
+    } else {
+        ids.iter()
+            .map(|id| session::resolve_session_ref(id, &sessions))
+            .collect::<Result<_, _>>()
+            .map_err(CliError::new)?
+    };
+
+    if targets.is_empty() {
+        return Err(CliError::new("no matching session"));
+    }
+
+    conn.request_ok(
+        &token,
+        AdminRequest::Revoke {
+            sessions: targets.iter().map(|s| s.id.to_string()).collect(),
+        },
+    )?;
+
+    for s in &targets {
+        println!("ended {} {:?}", s.id, s.name);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+// ─── Command: daemon ─────────────────────────────────────────────────────────
+
+fn report_daemon_start_result(result: Result<(), daemon::DaemonError>) -> CliResult {
+    match result {
+        Ok(()) => Ok(ExitCode::SUCCESS),
+        Err(daemon::DaemonError::StartInProgress) => {
+            eprintln!("note: another process is already starting or running the daemon");
+            Ok(ExitCode::from(daemon::START_IN_PROGRESS_EXIT_CODE))
         }
+        Err(e) => Err(CliError::new(e)),
+    }
+}
+
+fn cmd_daemon(action: DaemonAction) -> CliResult {
+    match action {
+        DaemonAction::Start {
+            foreground,
+            automatic,
+            service,
+        } => {
+            let mode = if service {
+                DaemonMode::Service
+            } else if automatic {
+                DaemonMode::Automatic
+            } else {
+                DaemonMode::Manual
+            };
+            report_daemon_start_result(daemon::start(mode, foreground))
+        }
+        DaemonAction::Stop { yes } => cmd_daemon_stop(yes),
+        DaemonAction::Restart { yes } => {
+            let stop_code = cmd_daemon_stop(yes)?;
+            if stop_code != ExitCode::SUCCESS {
+                return Ok(stop_code);
+            }
+            report_daemon_start_result(daemon::start(DaemonMode::Manual, false))
+        }
+        DaemonAction::Logs { session } => cmd_daemon_logs(session),
+        DaemonAction::Install => Ok(cmd_daemon_install()),
+        DaemonAction::Uninstall => Ok(airlock::service::uninstall_cmd()),
+    }
+}
+
+/// Probes the socket (`docs/airlock-v2-design.md`'s "Commands refused..."
+/// wording aside, this is the one place `daemon install` needs to know
+/// whether a daemon is already up, per `install_cmd`'s doc comment) and
+/// hands the result to [`airlock::service::install_cmd`].
+fn cmd_daemon_install() -> ExitCode {
+    let daemon_running = RuntimeDir::locate()
+        .map(|runtime| admin::Connection::connect(&runtime.socket_path()).is_ok())
+        .unwrap_or(false);
+    airlock::service::install_cmd(daemon_running)
+}
+
+const DAEMON_STOP_TIMEOUT: Duration = Duration::from_secs(10);
+const DAEMON_STOP_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+fn cmd_daemon_stop(yes: bool) -> CliResult {
+    let runtime = RuntimeDir::locate()?;
+    let mut conn = match admin::Connection::connect(&runtime.socket_path()) {
+        Ok(c) => c,
+        Err(AdminError::Unreachable { .. }) => {
+            eprintln!("daemon is not running");
+            return Ok(ExitCode::SUCCESS);
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let token = admin::read_admin_token(&runtime)?;
+
+    if conn.hello.sessions > 0 {
+        let interactive = airlock::trust::is_interactive();
+        if interactive {
+            if let Ok(DaemonMessage::Sessions { sessions }) =
+                conn.admin_request(&token, AdminRequest::ListSessions)
+            {
+                let names: Vec<String> = sessions
+                    .iter()
+                    .map(|s| format!("{} {:?} ({})", s.id, s.name, s.root.display()))
+                    .collect();
+                eprintln!(
+                    "this ends {} session{}: {}",
+                    conn.hello.sessions,
+                    if conn.hello.sessions == 1 { "" } else { "s" },
+                    names.join(", ")
+                );
+            }
+            let approved = airlock::trust::prompt_yes_no("Stop the daemon? [y/N]").unwrap_or(false);
+            if !approved {
+                eprintln!("not stopped");
+                return Ok(ExitCode::from(125));
+            }
+        } else if !yes {
+            return Err(CliError::new(format!(
+                "the daemon has {} active session(s); pass --yes to stop it anyway",
+                conn.hello.sessions
+            )));
+        }
+    }
+
+    let pid = conn.hello.pid;
+    conn.request_ok(&token, AdminRequest::Stop)?;
+    drop(conn);
+
+    let deadline = std::time::Instant::now() + DAEMON_STOP_TIMEOUT;
+    while std::time::Instant::now() < deadline {
+        if unsafe { libc::kill(pid as i32, 0) } != 0 {
+            eprintln!("daemon stopped");
+            return Ok(ExitCode::SUCCESS);
+        }
+        std::thread::sleep(DAEMON_STOP_POLL_INTERVAL);
+    }
+    eprintln!("daemon did not stop; PID {pid} may require manual intervention");
+    Ok(ExitCode::from(125))
+}
+
+fn cmd_daemon_logs(session: Option<String>) -> CliResult {
+    let (mut conn, token, _runtime) = connect_admin()?;
+    match conn.admin_request(&token, AdminRequest::Logs { session })? {
+        DaemonMessage::LogsResponse { entries } => {
+            for entry in &entries {
+                println!("{} {}", entry.timestamp, entry.message);
+            }
+            Ok(ExitCode::SUCCESS)
+        }
+        _ => Err(AdminError::UnexpectedResponse.into()),
+    }
+}
+
+// ─── Shared admin helpers ─────────────────────────────────────────────────────
+
+fn connect_admin()
+-> Result<(admin::Connection, airlock::protocol::AdminToken, RuntimeDir), CliError> {
+    let runtime = RuntimeDir::locate()?;
+    let (conn, token) = admin::connect_with_token(&runtime)?;
+    Ok((conn, token, runtime))
+}
+
+/// The session `id` names, by the same rule the daemon resolved it by.
+fn find_session(
+    conn: &mut admin::Connection,
+    token: &airlock::protocol::AdminToken,
+    id: &str,
+) -> Option<airlock::protocol::SessionInfo> {
+    let sessions = conn.list_sessions(token).ok()?;
+    session::resolve_session_ref(id, &sessions).ok().cloned()
+}
+
+/// Best-effort project root discovery for `--here` filtering: walks up from
+/// `cwd` the same way `DiscoveryMode::Default` does, but never fails — a
+/// project with no config simply matches no session.
+#[allow(
+    clippy::disallowed_methods,
+    reason = "client-side: the CLI binary resolving its own HOME/anchors for best-effort `--here` filtering"
+)]
+fn discover_root_quietly(cwd: &std::path::Path) -> Option<PathBuf> {
+    let home = std::env::var("HOME").ok()?;
+    let runtime = RuntimeDir::locate().ok()?;
+    let anchors =
+        airlock::anchors::resolve(&|k| std::env::var(k).ok(), &PathBuf::from(&home), &runtime);
+    let loaded = airlock::layers::load_layers(
+        &airlock::layers::DiscoveryMode::Default,
+        cwd,
+        &PathBuf::from(&home),
+        &anchors.global_config,
+    )
+    .ok()?;
+    Some(loaded.root)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A `ConfigError`/`LauncherError`/`AdminError`'s text can echo a tool
+    /// name, secret label or session name the user hasn't trusted yet; the
+    /// terminal must not run it. `escape_for_terminal` keeps newlines (an
+    /// error is allowed to span lines) but neutralizes a control sequence.
+    #[test]
+    fn format_error_line_escapes_terminal_hostile_text() {
+        let line = format_error_line(format!(
+            "invalid tool name {:?}: tool names may only contain ASCII letters, digits, '.', '_', '+' and '-'",
+            "tool\u{1b}[31mname"
+        ));
+        assert!(!line.contains('\u{1b}'), "{line:?}");
+        assert!(line.starts_with("error: "), "{line:?}");
+    }
+
+    #[test]
+    fn format_error_line_keeps_newlines() {
+        let line = format_error_line("first line\nsecond line");
+        assert_eq!(line, "error: first line\nsecond line");
     }
 }

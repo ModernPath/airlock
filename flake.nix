@@ -51,6 +51,9 @@
           # Only the unit tests: the suites under tests/ start a daemon and nest
           # an OS sandbox inside the Nix build sandbox, which is unavailable there.
           cargoTestFlags = [ "--lib" ];
+          # The unit tests that apply a sandbox cannot nest one inside the
+          # build sandbox either; build.rs ignores them under this flag.
+          AIRLOCK_NO_NESTED_SANDBOX = "1";
 
           meta = {
             description = "Credential broker for AI agents — tools get your secrets, the agent never does";

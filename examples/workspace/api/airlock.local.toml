@@ -1,0 +1,12 @@
+# ~/work/api/airlock.local.toml — one user's bindings, never checked in.
+# `airlock init --local` writes the `from = "parent"` line itself, since a
+# parent config binds that label.
+
+# GCP token with deploy access to acme-api
+[secrets.CLOUDSDK_AUTH_ACCESS_TOKEN]
+from = "parent"   # the binding in ~/work/airlock.toml
+
+# GitHub token with read access to acme/api
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["gh", "auth", "token"]

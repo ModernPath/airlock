@@ -135,7 +135,11 @@ impl Drop for ProxySession {
 /// What every proxy session in one daemon shares. Built once, when the
 /// daemon publishes its CA, so per-exec setup is only a listener and a token.
 pub struct ProxyShared {
-    ca: ProxyCa,
+    /// Shared (not owned) so a reload whose routes are unchanged can carry
+    /// the same CA — same key/cert, same file on disk — into the new
+    /// `ProxyShared` it otherwise rebuilds fresh (new secrets, new
+    /// redactor) rather than mint a new one and rewrite the file.
+    ca: Arc<ProxyCa>,
     ca_path: PathBuf,
     secrets: SecretStore,
     /// The daemon's live redactor, not a snapshot of it. A tool runs for
@@ -150,7 +154,7 @@ pub struct ProxyShared {
 impl ProxyShared {
     /// `ca_path` is where the CA certificate the tools must trust was written.
     pub fn new(
-        ca: ProxyCa,
+        ca: Arc<ProxyCa>,
         ca_path: PathBuf,
         secrets: SecretStore,
         redactor: RedactorSwap,
@@ -164,6 +168,13 @@ impl ProxyShared {
             ring_buffer,
             upstream: Upstream::public(),
         }
+    }
+
+    /// The CA this session's tools trust — shared with a previous
+    /// generation's `ProxyShared` when a reload decided to keep it
+    /// ([`crate::proxy::ca::ProxyCa::covers`]).
+    pub fn ca(&self) -> &Arc<ProxyCa> {
+        &self.ca
     }
 }
 

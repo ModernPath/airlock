@@ -1,0 +1,24 @@
+# This user's global config: ~/.config/airlock/airlock.toml (default
+# location; $XDG_CONFIG_HOME/airlock/airlock.toml if set). Applies to every
+# project on this machine, not just acme/app. Needs no approval — it's the
+# user's own file, outside every project.
+
+[secrets.GH_TOKEN]
+source  = "command"
+command = ["op", "read", "op://Private/GitHub/token"]
+
+# A tool this user wants everywhere, independent of any one repo's config.
+[tools.aws]
+description = "AWS CLI"
+
+[tools.aws.env]
+AWS_PROFILE = "personal"
+
+[agent]
+passthrough_env = ["COLORTERM"]
+kits = ["rust"]   # cargo's caches, isolated per project by default
+
+# Only global or airlock.local.toml may set a built-in kit's mode — never a
+# project's own airlock.toml. isolated (the default) is left unset here.
+[kits.rust]
+mode = "isolated"
