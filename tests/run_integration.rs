@@ -331,6 +331,10 @@ stty -icanon -echo min 0 time 5; printf 'LEFT['; cat -v; printf ']'; sleep 2"#;
         });
     }
     let mut child = cmd.spawn().unwrap();
+    // `Command` keeps its copies of the slave until dropped. Linux reports
+    // EOF on the master only once every slave fd is closed, so holding them
+    // would keep the read loop below from ever ending.
+    drop(cmd);
 
     // The terminal emulator: types a line, answers a cursor-position query
     // late (after the agent is gone) and a status query at once, in order.
