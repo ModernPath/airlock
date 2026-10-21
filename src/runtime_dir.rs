@@ -173,6 +173,25 @@ impl RuntimeDir {
     pub fn addr(&self) -> String {
         format!("unix://{}", self.socket_path().display())
     }
+
+    /// Sets the access and modification times of everything under `<base>`
+    /// (not following symlinks) to now.
+    ///
+    /// The base lives in a temp directory the OS sweeps by age: macOS's
+    /// `dirhelper` deletes files under `_CS_DARWIN_USER_TEMP_DIR` untouched
+    /// for 3 days, and `systemd-tmpfiles` ages out the Linux `/tmp`
+    /// fallback. The daemon writes `admin.token` and `airlock.pid` once at
+    /// startup, so a daemon that outlives the threshold loses them: every
+    /// admin request and new `airlock run` then fails, and since `daemon
+    /// stop` needs the token too, the only way out is killing the daemon
+    /// and every session with it. Session CA files and tool shims age out
+    /// the same way under a long-lived session. The daemon calls this
+    /// periodically to keep all of it looking fresh.
+    ///
+    /// An entry vanishing mid-walk (a session ending) is not an error.
+    pub fn touch_tree(&self) -> io::Result<()> {
+        touch_recursive(&self.base)
+    }
 }
 
 /// Parses a daemon address. Only `unix://` addresses are accepted; the
@@ -218,6 +237,50 @@ fn run_user_dir_usable(path: &Path, uid: u32) -> bool {
     match std::fs::symlink_metadata(path) {
         Ok(meta) => meta.is_dir() && meta.uid() == uid && meta.mode() & 0o777 == 0o700,
         Err(_) => false,
+    }
+}
+
+fn touch_recursive(path: &Path) -> io::Result<()> {
+    let meta = match std::fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    touch_no_follow(path)?;
+    if meta.is_dir() {
+        let entries = match std::fs::read_dir(path) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(()),
+            Err(e) => return Err(e),
+        };
+        for entry in entries {
+            touch_recursive(&entry?.path())?;
+        }
+    }
+    Ok(())
+}
+
+/// `utimensat` with null times sets both to now, and works on sockets and
+/// symlinks, which cannot be opened for `File::set_times`.
+fn touch_no_follow(path: &Path) -> io::Result<()> {
+    let c_path = std::ffi::CString::new(path.as_os_str().as_bytes())
+        .map_err(|e| io::Error::new(io::ErrorKind::InvalidInput, e))?;
+    let rc = unsafe {
+        libc::utimensat(
+            libc::AT_FDCWD,
+            c_path.as_ptr(),
+            std::ptr::null(),
+            libc::AT_SYMLINK_NOFOLLOW,
+        )
+    };
+    if rc == 0 {
+        return Ok(());
+    }
+    let err = io::Error::last_os_error();
+    if err.kind() == io::ErrorKind::NotFound {
+        Ok(())
+    } else {
+        Err(err)
     }
 }
 
@@ -346,6 +409,70 @@ mod tests {
 
     fn tempdir() -> tempfile::TempDir {
         tempfile::tempdir().expect("tempdir")
+    }
+
+    #[test]
+    fn touch_tree_refreshes_every_entry_without_following_symlinks() {
+        let dir = tempdir();
+        let rt = RuntimeDir::at(dir.path().join("airlock"));
+        rt.create_and_validate().unwrap();
+        std::fs::write(rt.admin_token_path(), "t").unwrap();
+        std::fs::write(rt.ca_path("abc"), "pem").unwrap();
+        std::fs::create_dir_all(rt.shims_dir("abc")).unwrap();
+        std::fs::write(rt.shims_dir("abc").join("gh"), "#!/bin/sh").unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(rt.socket_path()).unwrap();
+        let outside = dir.path().join("outside");
+        std::fs::write(&outside, "x").unwrap();
+        symlink(&outside, rt.base().join("link")).unwrap();
+
+        let old = std::time::SystemTime::UNIX_EPOCH + std::time::Duration::from_secs(1_000_000);
+        let old_times = std::fs::FileTimes::new()
+            .set_accessed(old)
+            .set_modified(old);
+        let files = [
+            rt.admin_token_path(),
+            rt.ca_path("abc"),
+            rt.shims_dir("abc").join("gh"),
+            outside.clone(),
+        ];
+        for path in &files {
+            std::fs::File::options()
+                .write(true)
+                .open(path)
+                .unwrap()
+                .set_times(old_times)
+                .unwrap();
+        }
+
+        rt.touch_tree().unwrap();
+
+        for path in &files[..3] {
+            let meta = std::fs::metadata(path).unwrap();
+            assert!(
+                meta.modified().unwrap() > old,
+                "{} not refreshed",
+                path.display()
+            );
+            assert!(
+                meta.accessed().unwrap() > old,
+                "{} not refreshed",
+                path.display()
+            );
+        }
+        let socket_meta = std::fs::symlink_metadata(rt.socket_path()).unwrap();
+        assert!(socket_meta.modified().unwrap() > old);
+        assert_eq!(
+            std::fs::metadata(&outside).unwrap().modified().unwrap(),
+            old
+        );
+    }
+
+    #[test]
+    fn touch_tree_tolerates_missing_base() {
+        let dir = tempdir();
+        RuntimeDir::at(dir.path().join("gone"))
+            .touch_tree()
+            .unwrap();
     }
 
     #[test]

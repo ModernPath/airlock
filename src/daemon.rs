@@ -69,6 +69,13 @@ const TTL_SWEEP_INTERVAL: Duration = Duration::from_secs(30);
 /// (an `Instant` comparison) and a no-op for a `Manual`/`Service` daemon.
 const IDLE_CHECK_INTERVAL: Duration = Duration::from_secs(1);
 
+/// How often the serve loop refreshes the runtime dir's timestamps so the
+/// OS temp-dir sweeper never ages out `admin.token` and friends (see
+/// [`RuntimeDir::touch_tree`]). Far below the 3-day macOS threshold because
+/// tokio's clock is monotonic and stops while a Mac sleeps: a long interval
+/// could span several wall-clock days of a closed lid.
+const RUNTIME_TOUCH_INTERVAL: Duration = Duration::from_secs(60 * 60);
+
 /// Default idle-exit grace period for an automatic daemon with no sessions
 /// and no open connections.
 const DEFAULT_IDLE_EXIT: Duration = Duration::from_secs(300);
@@ -965,6 +972,8 @@ impl Daemon {
         ttl_sweep.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let mut idle_check = tokio::time::interval(IDLE_CHECK_INTERVAL);
         idle_check.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let mut runtime_touch = tokio::time::interval(RUNTIME_TOUCH_INTERVAL);
+        runtime_touch.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
         loop {
             tokio::select! {
@@ -983,6 +992,13 @@ impl Daemon {
                 }
                 _ = ttl_sweep.tick() => {
                     state.sweep_expired_sessions();
+                }
+                _ = runtime_touch.tick() => {
+                    if let Err(e) = state.runtime.touch_tree() {
+                        state.ring_buffer.log(format!(
+                            "failed to refresh runtime dir timestamps: {e}"
+                        ));
+                    }
                 }
                 _ = idle_check.tick() => {
                     if state.should_idle_exit() {

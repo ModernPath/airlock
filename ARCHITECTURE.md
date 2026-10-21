@@ -196,6 +196,8 @@ Three locations decide what the daemon trusts and how clients reach it, each res
 
 Each is checked before use: owned by the effective uid, mode 0700 (or non-group/other-writable for the global file), not a symlink, outside the project root, and outside every sandbox write grant from every layer — including unapproved ones, and including `--allow-write` and built-in profile paths. The one exception is macOS `$TMPDIR`, which the runtime base may sit under, because the Seatbelt deny rule (below) carves it back out. The same check runs the other way at config load: a write grant that covers an anchor is a config error. This closes the path where a repo's `mise.toml` or `.envrc` redirects `XDG_STATE_HOME` into the project on `cd` — the redirect lands somewhere the agent still can't write.
 
+The runtime base sits in a directory the OS sweeps by age (macOS `dirhelper` deletes files under the per-user temp dir untouched for 3 days; `systemd-tmpfiles` ages out the Linux `/tmp` fallback). Since the daemon writes `admin.token` and the PID file only once, at startup, the serve loop refreshes the timestamps of everything under the base every hour (`RuntimeDir::touch_tree`). Without that, a daemon running longer than 3 days would lose its admin token and could only be killed.
+
 ## Daemon internals (within one session)
 
 Everything in this section is unchanged in substance from a single-tenant daemon; it now runs per-session rather than per-process.
