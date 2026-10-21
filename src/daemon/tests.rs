@@ -918,7 +918,7 @@ async fn lease_eof_revokes_the_session() {
     // The daemon learns about the EOF asynchronously; poll briefly.
     wait_until(
         Duration::from_secs(2),
-        || !daemon.state.sessions.get(&id).is_some(),
+        || daemon.state.sessions.get(&id).is_none(),
         "lease EOF did not revoke the session in time",
     )
     .await;

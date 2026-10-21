@@ -4422,9 +4422,7 @@ pub mod linux {
                 requires_network: true,
                 requires_terminal: false,
                 runtime_base: Some(base.clone()),
-                tmpdir: None,
-                home: None,
-                git_hooks_deny: None,
+                ..Default::default()
             };
             let profile = LinuxLandlock
                 .build_agent(&policy, None)
