@@ -306,10 +306,11 @@ pub fn start_daemon_with_config(project_dir: &Path, toml_src: &str) -> DaemonHan
         std::thread::sleep(Duration::from_millis(50));
     }
 
-    let daemon_pid: u32 = std::fs::read_to_string(&pid_path)
-        .ok()
-        .and_then(|s| s.trim().parse().ok())
-        .unwrap_or(0);
+    // Not read from the PID file: the daemon writes it after the socket and
+    // admin token, so it can still be missing here, and a fallback of 0
+    // turns `kill(daemon_pid, SIGTERM)` into a signal to the whole test
+    // process group. `--foreground` never forks, so the child is the daemon.
+    let daemon_pid = process.id();
     let admin_token = read_admin_token(&admin_token_path).expect("admin token should be readable");
 
     let (session_id, token, ca_path) =
