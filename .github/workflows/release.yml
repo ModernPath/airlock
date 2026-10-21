@@ -72,8 +72,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
+      # Dev profile on purpose: the integration tests point the daemon at a
+      # temp runtime dir through hooks that exist only under
+      # debug_assertions, so they can never ship in the release binary.
       - name: Run tests
-        run: cargo test --release --target ${{ matrix.target }}
+        run: cargo test --target ${{ matrix.target }}
 
       - name: Package artifact
         run: |

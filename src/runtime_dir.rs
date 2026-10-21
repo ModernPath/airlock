@@ -404,7 +404,6 @@ pub enum RuntimeDirError {
 )]
 mod tests {
     use super::*;
-    use crate::test_support::ENV_MUTEX;
     use std::os::unix::fs::symlink;
 
     fn tempdir() -> tempfile::TempDir {
@@ -614,9 +613,10 @@ mod tests {
         ));
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn locate_honors_debug_test_override() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
         let dir = tempdir();
         let path = dir.path().join("override-base");
 
@@ -631,9 +631,10 @@ mod tests {
         assert_eq!(result.unwrap().base(), path.as_path());
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn locate_rejects_relative_test_override() {
-        let _guard = ENV_MUTEX.lock().unwrap();
+        let _guard = crate::test_support::ENV_MUTEX.lock().unwrap();
 
         unsafe {
             std::env::set_var(TEST_OVERRIDE_VAR, "relative/path");
