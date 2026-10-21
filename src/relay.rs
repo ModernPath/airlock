@@ -467,12 +467,17 @@ mod tests {
                 break;
             };
             let mut fds = [PollFd::new(fd, PollFlags::IN)];
-            if rustix::event::poll(&mut fds, Some(&Timespec::try_from(left).unwrap())).unwrap() == 0
-            {
-                break;
+            // Other tests in this process install signal handlers (tokio's
+            // SIGCHLD), and poll(2) is never restarted after one runs.
+            match rustix::event::poll(&mut fds, Some(&Timespec::try_from(left).unwrap())) {
+                Ok(0) => break,
+                Ok(_) => {}
+                Err(rustix::io::Errno::INTR) => continue,
+                Err(e) => panic!("poll: {e}"),
             }
             match rustix::io::read(fd, &mut buf) {
                 Ok(n) => got.extend_from_slice(&buf[..n]),
+                Err(rustix::io::Errno::INTR) => {}
                 Err(_) => break,
             }
         }
