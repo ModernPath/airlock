@@ -4,7 +4,7 @@ Credential broker for AI agents — tools get your secrets, the agent never does
 
 An AI coding agent needs `gh`, `tofu`, `gcloud`, `kubectl` to do real work, and those tools need credentials. Hand the agent a token and it sits in the agent's environment, its shell history, and every line of output it reads. Airlock takes the token out of the agent's reach: a per-user daemon holds secrets in memory and injects them only into the specific tool processes that need them, runs each tool in an OS sandbox, and redacts its output before the agent sees it.
 
-Airlock brokers credentials for the tools your agent *runs*, not just the APIs it *calls*. The CLI authenticates exactly as it always has — the agent simply never holds the key.
+Airlock brokers credentials for the tools your agent *runs*, not just the APIs it *calls*. The CLI authenticates exactly as it always has — the agent simply never holds the key. For an API with no CLI, a [proxy tool](#proxy-tools) lets `curl` reach it: Airlock attaches the API key to the request after it leaves the tool, only for the hosts, methods and paths you allowed.
 
 ## Contents
 
@@ -33,6 +33,7 @@ Airlock brokers credentials for the tools your agent *runs*, not just the APIs i
 
 - **Tool secrets never reach the agent.** They exist in the daemon's memory (zeroized on drop) and in the tool process's environment — nowhere else. Not in the agent's env, not in its output.
 - **Scoped, short-lived credentials without long-lived keys.** The daemon can *mint* a token from your own session — impersonate a read-only service account, for instance — and re-mint it before it expires. Your admin login never enters the sandbox; the tool gets a token that can only do what you decided; the agent gets neither. See [Minting scoped credentials](#minting-scoped-credentials).
+- **API keys for HTTP APIs, injected on the wire.** A [proxy tool](#proxy-tools) such as `curl` never holds the key at all: a per-exec proxy in the daemon adds the credential header to requests for allowed hosts, enforces `METHOD /path` allow/deny rules, and redacts the response before the tool sees it.
 - **Redacted output.** Secret values are stripped from stdout/stderr — raw, base64, URL-encoded, and hex forms — and replaced with `[REDACTED:NAME]`.
 - **Sandboxed tools and agent.** Every tool, and the agent itself under `airlock run`, gets deny-by-default filesystem access (macOS Seatbelt, Linux Landlock) and a minimal environment.
 - **Nothing in the project but config.** The daemon's socket, PID file and proxy CA live in a per-user runtime directory outside any project. `git status` shows only `airlock.toml` and, if you forgot to ignore it, `airlock.local.toml`.
@@ -336,7 +337,7 @@ prints the exact JSON block to paste in, so the docs and the binary can't drift 
 
 ## An always-on daemon
 
-By default the daemon starts on the first `airlock run` or `session start` and exits a few minutes after its last session ends. For a daemon that survives across sessions — useful if you use `session start` from several shells across a day — install it as a service:
+By default the daemon starts on the first `airlock run` or `session start` and exits five minutes after its last session ends. A daemon you start yourself with `airlock daemon start` or `daemon restart` never exits on idle; stop it with `airlock daemon stop`. For a daemon that survives across sessions — useful if you use `session start` from several shells across a day — install it as a service:
 
 ```bash
 $ airlock daemon install
@@ -393,7 +394,7 @@ The pattern fits any CLI that prints one short-lived token to stdout — GitHub 
 
 ## Configuration
 
-A project needs `airlock.toml` or `airlock.local.toml` somewhere between the current directory and `$HOME` (discovery walks up, as today); its directory is the **sandbox root** — always read-write for tools, and the base every relative path in the config resolves against. `--no-project-config` runs with only your global config, for a directory with no project file.
+A project needs an `airlock.toml` or `airlock.local.toml`, owned by you, in the current directory or a directory above it (discovery walks up, stopping at `$HOME`, or at `/` outside your home); its directory is the **sandbox root** — always read-write for tools, and the base every relative path in the config resolves against. `--no-project-config` runs with only your global config, for a directory with no project file.
 
 > Don't put `airlock.toml` directly in `$HOME` — that makes your entire home directory the sandbox root. Airlock refuses to start unless the config sets `allow_home_root = true` (only honored in the global or local layer).
 
@@ -471,8 +472,8 @@ Every tool's sandbox always gets its own binary, the project root (read-write), 
 
 | Level       | Gets |
 |-------------|------|
-| `"none"`    | Just the dynamic linker and shared library cache (so the binary can start) plus `/dev/null`. Nothing else of the system. |
-| `"system"`  | `"none"` plus today's baseline: system libraries, binaries, shared data, and configuration (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,zero,random,urandom}`, ...). |
+| `"none"`    | Just what the binary needs to start — the dynamic linker and shared libraries (on Linux, all of `/lib*` and `/usr/lib*`) and the library cache — plus `/dev/null`. Nothing else of the system. |
+| `"system"`  | `"none"` plus system libraries, binaries, shared data, and configuration (`/usr/lib`, `/usr/bin`, `/etc`, `/dev/{null,random,urandom}`, ...). |
 | `"default"` | `"system"` plus read-only `/nix/store`, `/opt/homebrew`, `/usr/local`, `/opt/local`, and `/home/linuxbrew/.linuxbrew` — the common toolchain install roots. **The default when `access` is unset**, at the top level or per tool. |
 
 Set the top-level `access` to change the project default, or a tool's own `access` to override it for just that tool — a config error names the three valid levels if either is misspelled.
@@ -537,8 +538,8 @@ A complete, read-only setup for Cloud Trace, Monitoring (including PromQL) and L
 For each `airlock exec` of a proxy tool, the daemon:
 
 1. Starts a proxy on a random loopback port.
-2. Points the tool at the proxy with `HTTPS_PROXY`. Points it at the Airlock CA with `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`.
-3. Limits the tool's network access to that one port with Seatbelt (macOS) or Landlock (Linux).
+2. Points the tool at the proxy with `HTTPS_PROXY` (and the other `*_PROXY` spellings, with `NO_PROXY` cleared). Points it at the Airlock CA with `CURL_CA_BUNDLE`, `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE` and `NODE_EXTRA_CA_CERTS`. A proxy tool's own `env` may not set any of these.
+3. Limits the tool's network access to that one port with Seatbelt (macOS) or Landlock (Linux 6.7+ — an older kernel refuses to run proxy tools rather than run them unpinned).
 4. Stops the proxy when the tool exits.
 
 For each request, the proxy:
@@ -552,7 +553,9 @@ The proxy redacts the response before the tool sees it, both header values and b
 
 Limits to know before you start:
 
-- HTTP/1.1 only. gRPC and HTTP/2-only endpoints do not work.
+- HTTPS on port 443 only, over HTTP/1.1. Plain-HTTP requests, other ports, gRPC and HTTP/2-only endpoints do not work.
+- One credential header per route. Query-parameter API keys and request signing (AWS SigV4) are not supported.
+- A route's `host` is a DNS name. `*.example.com` matches exactly one label (`api.example.com`, not `example.com` or `a.b.example.com`); an exact host beats a wildcard. Rules match the path only, never the query string.
 - Clients that pin certificates fail, because the proxy intercepts TLS.
 - The agent gets the full API permissions of the credential on the routed hosts. Give the service account the smallest scope that works.
 
@@ -566,6 +569,7 @@ Threat model and remaining risks: [SECURITY.md](SECURITY.md#proxy-tools). Design
 | `passthrough_env` | Host env var names forwarded to the agent (skipped if unset). |
 | `env`             | `NAME = value` map, same syntax as tool `env`. |
 | `filesystem`      | `read = [...]` / `write = [...]` paths beyond the sandbox root. |
+| `kits`            | Toolchain kits for the agent sandbox, unioned across layers. See [Kits](#kits). |
 | `terminal`        | `[agent.terminal]`: how the agent gets its terminal. See below. |
 
 #### `[agent.terminal]`
@@ -585,8 +589,8 @@ See [SECURITY.md](SECURITY.md#the-agents-terminal) for what each one protects ag
 ### Paths and templating
 
 - `~/foo` → `$HOME/foo`; relative paths resolve against the sandbox root (an error in the global layer, since it applies to every project); absolute paths are used as-is.
-- Static `env` strings may use `{sandbox_root}` (the canonicalized project directory), or `{tool_state}` (a per-project, per-tool directory under `$XDG_CACHE_HOME/airlock`, created on first use, writable only by that one tool — nothing else, not even another tool or the agent, can reach it). Use `{tool_state}` for a tool's own config directory (`GH_CONFIG_DIR`, `CLOUDSDK_CONFIG`); use `{sandbox_root}` only when two tools genuinely need to share a path, as `KUBECONFIG` does above. Escape literal braces as `\{` `\}`. No other placeholders exist; this is not shell interpolation.
-- **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System` and `/Library` on macOS, `/usr/bin`, `/bin`, `/lib*` on Linux) — except `/dev/null`, which is also writable, so `2>/dev/null` works. Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
+- Static `env` strings may use `{sandbox_root}` (the canonicalized project directory), or `{tool_state}` (a per-project, per-tool directory under `$XDG_CACHE_HOME/airlock`, created on first use, writable only by that one tool — nothing else, not even another tool or the agent, can reach it). Use `{tool_state}` for a tool's own config directory (`GH_CONFIG_DIR`, `CLOUDSDK_CONFIG`); use `{sandbox_root}` only when two tools genuinely need to share a path, as `KUBECONFIG` does above. `{tool_state}` works only in `[tools.<name>.env]`. Escape literal braces as `\{` `\}`. Apart from `{kit_state}` (see [Kits](#kits)) and `{secret}` in a proxy route's `inject.value`, no other placeholders exist; this is not shell interpolation.
+- **Filesystem baseline:** the sandbox root is read-write; system paths needed to run at all are read-only (`/usr/lib`, `/usr/share`, `/usr/bin`, `/bin`, `/etc`, `/dev/null`, `/dev/random`, `/dev/urandom`, plus `/System`, `/Library` and `/sbin` on macOS, `/lib*` on Linux) — except `/dev/null`, which is also writable, so `2>/dev/null` works. Nothing else — `/tmp`, `~/.config/<tool>`, caches — is reachable unless declared.
 
 ## Kits
 
@@ -605,7 +609,7 @@ Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Each has two modes:
 - **isolated** (the default). Airlock creates a directory private to this project (`$XDG_CACHE_HOME/airlock/kits/<id>/<kit>`) and points the toolchain's cache env vars (`CARGO_HOME`, `GOPATH`, ...) at it. The agent can read/write that directory and nothing else of the toolchain's; your real `~/.cargo`, `~/go`, etc. are untouched.
 - **shared**. No env override — the agent gets write access to your real cache locations instead (honoring `CARGO_HOME`/`GOPATH`/etc. if you've already set them). **This lets the agent poison a cache an unsandboxed build later trusts without re-verifying** — e.g. `~/.cargo/registry/src` is extracted once and not re-checked per build. Prefer isolated; reach for shared only when you understand that tradeoff. See [SECURITY.md](SECURITY.md#kits).
 
-`--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` and `airlock config` both show the active kits, their mode, and the exact paths/env each one resolved to.
+`--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` lists the active kits and their mode; `airlock config` shows the exact paths and env each configured kit resolves to.
 
 A kit never grants write to binaries or config files — not `~/.cargo/bin`, not `~/.cargo/config.toml`, not `~/.npmrc` — since either would let the agent run code outside the sandbox later. In shared mode a kit does *read* the toolchain's user config and registry credentials, so your settings, private registries and publishing work for the agent too: `~/.cargo/config.toml` and `credentials.toml`, `~/.npmrc` and `~/.yarnrc.yml`, `pip.conf`, uv's `uv.toml` and `~/.pypirc`, `~/.hex/hex.config`. Isolated mode reads none of them. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
 
@@ -623,8 +627,9 @@ env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
 ```bash
 # Start an agent
 airlock run [--profile NAME] [-- CMD...]     # start an agent with a session, sandboxed
+            [--kit NAME] [--allow-read PATH] [--allow-write PATH] [--name NAME] [-v]
 airlock init [--local | --global]            # write a starter config
-airlock trust [-y]                           # review and approve project config
+airlock trust [-y | --expect-sha256 HASH]    # review and approve project config
 airlock config                               # merged config, with the layer each part comes from
 airlock status                               # daemon, project config and sessions
 
@@ -634,16 +639,18 @@ airlock tools list [--session ID]            # tools a session serves
 
 # For the agent and its harness
 airlock agent check                          # verify the session, self-test the sandbox
-airlock agent hook claude-code               # SessionStart hook
+airlock agent hook claude-code [--print-settings]  # SessionStart hook
 
 # Manage
 airlock session start | renew | list | reload | revoke
 airlock daemon start [--foreground] | stop | restart | logs | install | uninstall
 ```
 
-`airlock run` and `session start` always sandbox the agent, or hand it a session for its own; there is no flag that runs an agent with neither. `--config <path>` works only on commands that discover config (`run`, `trust`, `config`, `status`, `session start`/`reload`) — `exec` and `tools list` use their session and ignore it.
+`airlock run` and `session start` always sandbox the agent, or hand it a session for its own; there is no flag that runs an agent with neither. `--config <path>` works only on commands that discover config (`run`, `trust`, `config`, `status`, `session start`) — `exec` and `tools list` use their session and ignore it, and `session reload` reuses the config each session was started with.
 
-Inside the agent's own sandbox, `--help` lists only the commands that work there (`exec`, `tools`, `agent`, `init`, `config`) and names the ones it hides; `run`, `trust`, `status`, `session` and `daemon` refuse there even if called directly, since approval and registration need your own terminal.
+`--profile` is `claude` or `claude-relaxed`. Both grant Claude Code's own state directories and install the [hook](#harness-hooks); `claude-relaxed` adds clipboard access, `open <url>`, shell dotfile reads and `~/Library/Keychains` (macOS) — see [SECURITY.md](SECURITY.md#built-in-agent-profiles) for that tradeoff.
+
+Inside the agent's own sandbox, `--help` lists only the commands that work there (`exec`, `tools`, `agent`, `init`, `config`) and names the ones it hides; `run`, `trust`, `status`, `session`, `daemon`, `init --global` and `tools list --session` refuse there even if called directly, since approval and registration need your own terminal.
 
 ## Troubleshooting
 
@@ -676,7 +683,7 @@ cargo build --release
 cargo test
 ```
 
-Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](https://landlock.io/) (kernel 5.13+). A `nix develop` shell provides the toolchain if you use Nix. Release tarballs for Linux amd64 and macOS arm64 are attached to each GitHub release.
+Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](https://landlock.io/) (kernel 5.13+; 6.7+ for [proxy tools](#proxy-tools)). A `nix develop` shell provides the toolchain if you use Nix. Release tarballs for Linux amd64 and macOS arm64 are attached to each GitHub release.
 
 ## Further reading
 
@@ -686,21 +693,23 @@ Requires Rust 2024 edition. macOS uses Apple Seatbelt; Linux needs [Landlock](ht
 
 ## How Airlock compares
 
-Most tools in this space are **HTTP proxies**: the agent sends a placeholder token, the proxy swaps in the real one on the wire. That works for API calls but can't broker a credential a CLI reads from its environment (`gh`, `gcloud`, `kubectl`, `tofu`, `git` signing). Airlock works at the **process layer** instead: it spawns the tool itself, sandboxed, with the secret injected, and redacts the output.
+Most tools in this space are **HTTP proxies**: the agent holds a placeholder token, and a proxy swaps in the real one on the wire. That covers anything that speaks HTTPS. It can't cover a credential a CLI uses itself: a GPG key for signed commits, a database password, request signing such as AWS SigV4. Airlock works at the **process layer** first. It spawns the tool itself, sandboxed, with the secret in the tool's environment, and redacts the output. For APIs with no CLI, a [proxy tool](#proxy-tools) adds the credential on the wire like the HTTP proxies do. That proxy is scoped to one declared tool and one `exec`, never the agent's whole network.
 
-| | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox MCP](https://fnox.jdx.dev/guide/mcp.html) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
+Compared as of October 2026; these projects move fast, so check their docs.
+
+| | Airlock | [claw-wrap](https://github.com/dedene/claw-wrap) | [fnox](https://fnox.jdx.dev/) | [Infisical Agent Vault](https://github.com/Infisical/agent-vault) | [nono](https://github.com/nolabs-ai/nono) |
 |---|---|---|---|---|---|
-| Model | Local CLI exec broker | Local CLI exec broker | MCP `exec` tool in a secrets manager | HTTPS MITM proxy | Kernel sandbox + HTTP credential proxy |
-| Brokers local CLIs (env-var creds) | ✅ | ✅ | ✅ | ❌ | ❌ (network only) |
-| Brokers HTTP API calls | via the CLI | via the CLI, or MITM proxy mode | via the CLI | ✅ | ✅ |
-| OS sandbox for the tool | ✅ Seatbelt / Landlock | ❌ (tool runs with daemon privileges) | ❌ | ❌ | ✅ Seatbelt / Landlock |
-| Redacts tool stdout/stderr (incl. base64/hex/URL-encoded) | ✅ | user-supplied regex only | raw value only (docs: encoded forms leak) | ❌ | ❌ |
-| Per-tool allowlist | ✅ | ✅ + blocked-arg patterns | ❌ (global secret allowlist) | egress filter | policy-as-code |
-| Scoped / short-lived creds | ✅ | ✅ | ❌ | ❌ | ❌ |
+| Model | Local CLI exec broker + per-tool HTTPS proxy | Local CLI exec broker + HTTPS MITM proxy | Secrets manager with an MCP `exec` tool and a credential proxy | HTTPS MITM proxy, placeholder tokens | Kernel sandbox + L7 credential proxy, phantom tokens |
+| Real credential handed to a CLI (non-HTTP, request signing) | ✅ | ✅ | ✅ via MCP `exec` | ❌ (HTTP only) | ❌ (HTTP only) |
+| HTTP API key injected on the wire | ✅ proxy tools | ✅ proxy mode | ✅ credential proxy | ✅ | ✅ |
+| OS sandbox | ✅ the agent, and each tool in its own (Seatbelt / Landlock) | ❌ (pair it with firejail or nono) | opt-in `proxy run --sandbox` (Seatbelt / bubblewrap); `exec` is unsandboxed | ❌ | ✅ the agent (Seatbelt / Landlock) |
+| Output redaction | ✅ stdout/stderr and proxied responses, incl. base64/hex/URL-encoded | user-supplied regex only | literal value only (docs: encoded forms leak) | ❌ | ❌ |
+| Access policy | declared tools only; per-route host + `METHOD /path` allow/deny | per-tool + blocked-arg patterns; per-route allow/deny | secret and tool allowlists; domain/method/path rules | per-service egress rules | policy profiles: files, network, method/path, commands |
+| Scoped / short-lived creds | ✅ any minting command, re-minted by the daemon | GitHub App tokens | ✅ leases (AWS, GCP, Azure, GitHub, Vault) | ❌ | ❌ |
 | Runs offline, no account | ✅ | ✅ | ✅ | ✅ | ✅ |
-| License | Open source | MIT | MIT | Open source | Open source |
+| License | MIT | MIT | MIT | MIT (+ enterprise dir) | Apache-2.0 |
 
-[claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative — same daemon/socket/exec shape — but leaves sandboxing to an external tool and redacts only what you write regexes for. Airlock complements the proxy tools rather than replacing them: use a proxy for pure-API agents, Airlock for the tools the agent *runs*.
+[claw-wrap](https://github.com/dedene/claw-wrap) is the nearest relative. It has the same daemon/socket/exec shape and now a proxy mode too. But it leaves sandboxing to an external tool, and it redacts only what you write regexes for. fnox and nono start from the other end, as a secrets manager and as a sandbox, and each adds a credential proxy. Airlock's proxy covers the tools the agent *runs*, not the agent's own traffic. An agent that calls an API from its own process still wants a network-level proxy such as Agent Vault or nono alongside Airlock.
 
 Commercial identity gateways such as [Aembit](https://aembit.io/) and [1Password Unified Access](https://1password.com/blog/introducing-1password-unified-access) solve the same problem as a central, cloud-hosted service that vends short-lived credentials to workloads; hosted integration layers like [Arcade](https://www.arcade.dev/), [Composio](https://composio.dev/) and [Nango](https://nango.dev/) do it for SaaS APIs via OAuth. Neither brokers local CLI tools.
 
