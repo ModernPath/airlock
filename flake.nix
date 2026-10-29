@@ -54,6 +54,9 @@
           # The unit tests that apply a sandbox cannot nest one inside the
           # build sandbox either; build.rs ignores them under this flag.
           AIRLOCK_NO_NESTED_SANDBOX = "1";
+          # The proxy unit tests bind listeners on 127.0.0.1, which the Darwin
+          # build sandbox refuses with EPERM unless the derivation opts in.
+          __darwinAllowLocalNetworking = true;
 
           meta = {
             description = "Credential broker for AI agents — tools get your secrets, the agent never does";
