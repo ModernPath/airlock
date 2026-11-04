@@ -620,7 +620,7 @@ write = ["~/.cache/bazel"]
 env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
 ```
 
-`{kit_state}` expands to that kit's own directory under `$XDG_CACHE_HOME/airlock/kits` — the same idea as `{tool_state}` above, but for a kit instead of a tool. A kit's `[kits.<name>]` table sits in the same restricted slot as `allow_home_root`: your global config or `airlock.local.toml` only, never a project's own `airlock.toml` — a teammate's checked-in file must not decide what the agent may write in your home. `agent.kits` itself has no such restriction.
+`{kit_state}` expands to that kit's own directory under `$XDG_CACHE_HOME/airlock/kits`, created on first use and writable by the agent — the same idea as `{tool_state}` above, but for a kit instead of a tool. A kit's `[kits.<name>]` table sits in the same restricted slot as `allow_home_root`: your global config or `airlock.local.toml` only, never a project's own `airlock.toml` — a teammate's checked-in file must not decide what the agent may write in your home. `agent.kits` itself has no such restriction.
 
 ## Command reference
 

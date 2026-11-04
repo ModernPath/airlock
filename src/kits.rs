@@ -339,9 +339,13 @@ pub fn expand_all(
                 .get(name)
                 .expect("resolve_active already checked every non-builtin name has a table");
             let one = expand_user(name, def, inputs, &state)?;
-            out.state_dirs.push(state);
             out.read.extend(one.read);
             out.write.extend(one.write);
+            // `{kit_state}` is only usable in `env`, so the kit can't name
+            // it in its own `write` list; grant it here, the way an
+            // isolated built-in's subdirectories are.
+            out.write.push(state.clone());
+            out.state_dirs.push(state);
             out.env.extend(one.env);
             out.active.push((name.clone(), None));
         }
@@ -1489,7 +1493,13 @@ mod tests {
         );
         let expanded = expand_all(&["bazel".to_string()], &kit_defs, &inp).unwrap();
         assert_eq!(expanded.read, vec![home.join(".bazelrc")]);
-        assert_eq!(expanded.write, vec![home.join(".cache/bazel")]);
+        assert_eq!(
+            expanded.write,
+            vec![
+                home.join(".cache/bazel"),
+                PathBuf::from("/cache/airlock/kits/deadbeefdeadbeef/bazel"),
+            ]
+        );
         assert_eq!(
             expanded
                 .env

@@ -1142,6 +1142,8 @@ print "restart the agent to apply them".
   characters, so it can never collide with the literal `kits`) — and points
   the toolchain's own cache/home env vars at it. The agent gets read-write
   access to that directory only; it never writes the user's real caches.
+  A user-defined kit gets read-write access to its whole `{kit_state}`,
+  since it can name it only in `env`, not in its own `write` list.
   Created with mode 0700 the way a tool's `{tool_state}` dir is, and
   validated the same way (refused if it resolves inside the project root or
   overlaps an anchor).
