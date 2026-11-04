@@ -1116,7 +1116,7 @@ write = ["~/.cache/bazel"]
 env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
 ```
 
-Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Their `[kits.<name>]`
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`. Their `[kits.<name>]`
 table accepts only `mode`. A user-defined kit's table accepts `read`,
 `write` and `env` instead (no `mode` — it has no isolated/shared concept of
 its own). `[kits.*]` sits in the same restricted slot as `allow_home_root`:
@@ -1142,6 +1142,8 @@ print "restart the agent to apply them".
   characters, so it can never collide with the literal `kits`) — and points
   the toolchain's own cache/home env vars at it. The agent gets read-write
   access to that directory only; it never writes the user's real caches.
+  A user-defined kit gets read-write access to its whole `{kit_state}`,
+  since it can name it only in `env`, not in its own `write` list.
   Created with mode 0700 the way a tool's `{tool_state}` dir is, and
   validated the same way (refused if it resolves inside the project root or
   overlaps an anchor).
@@ -1173,6 +1175,7 @@ Isolated mode grants none of these.
 | `python` | `~/.pyenv`, `~/.local/share/uv/python`; shared mode also `pip.conf` (`PIP_CONFIG_FILE`, the platform location, legacy `~/.pip`), `~/.config/uv/uv.toml` and `~/.pypirc` | `PIP_CACHE_DIR`, `UV_CACHE_DIR`, `POETRY_CACHE_DIR` | the platform cache defaults |
 | `go` | `~/go/bin`, `~/sdk` | `GOMODCACHE`, `GOCACHE`, and `GOPATH` (not just the two caches — `go install`'s output and the sumdb cache live under `GOPATH` with no env var of their own) | `$GOPATH/pkg/{mod,sumdb}`, `GOCACHE`'s platform default |
 | `elixir` | `~/.asdf`, `~/.kiex` | `MIX_HOME`, `HEX_HOME`, `REBAR_CACHE_DIR` (plus `MIX_ARCHIVES` pointed read-only at the real `~/.mix/archives`, and `~/.mix/elixir` read-only for the already-installed rebar3 escript, so the agent does not need to `mix local.hex`/`local.rebar` again) | reads real `~/.mix` (never writes it — archives and escripts are code and binaries, like `~/.cargo/bin`); writes `~/.hex/packages` and the rebar3 cache only; reads `~/.hex/hex.config` (repo settings and the Hex API key) but never writes it. |
+| `mise` | `MISE_DATA_DIR` (installs, shims, plugins), `MISE_CONFIG_DIR` and `MISE_STATE_DIR`, each falling back to its `XDG_*_HOME` and then mise's default — in both modes, since mise can't resolve the user's global tool versions without its config. Never written: installs and shims are executables the user's shell runs, and the state dir holds `mise trust` decisions, so a writable one would let the agent trust a hostile `mise.toml` the user's shell then applies on `cd`. mise runs with a read-only state dir; it only warns that it can't track a config it hasn't seen before. | `MISE_CACHE_DIR` | the real cache (`MISE_CACHE_DIR`, `$XDG_CACHE_HOME/mise`, or the platform default) |
 
 Missing read paths are skipped; isolated-mode subdirectories are created up
 front. See [`src/kits.rs`](../src/kits.rs) for the exact expansion

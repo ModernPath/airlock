@@ -604,14 +604,16 @@ kits = ["rust", "node"]     # any config layer; unioned across them
 mode = "isolated"           # the default; or "shared"
 ```
 
-Built-in kits: `rust`, `node`, `python`, `go`, `elixir`. Each has two modes:
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`. Each has two modes:
 
 - **isolated** (the default). Airlock creates a directory private to this project (`$XDG_CACHE_HOME/airlock/kits/<id>/<kit>`) and points the toolchain's cache env vars (`CARGO_HOME`, `GOPATH`, ...) at it. The agent can read/write that directory and nothing else of the toolchain's; your real `~/.cargo`, `~/go`, etc. are untouched.
 - **shared**. No env override — the agent gets write access to your real cache locations instead (honoring `CARGO_HOME`/`GOPATH`/etc. if you've already set them). **This lets the agent poison a cache an unsandboxed build later trusts without re-verifying** — e.g. `~/.cargo/registry/src` is extracted once and not re-checked per build. Prefer isolated; reach for shared only when you understand that tradeoff. See [SECURITY.md](SECURITY.md#kits).
 
+The `mise` kit lets the agent use the tool versions you've already installed with [mise](https://mise.jdx.dev): it reads mise's data dir (installs, shims, plugins), its global config dir and its state dir, honoring `MISE_*_DIR` and `XDG_*_HOME`. Its two modes differ only in the cache (`MISE_CACHE_DIR`). The agent can never write installs, shims or state, so it can't `mise install` a new version or `mise trust` a config: a project's `mise.toml` works for the agent only once you've trusted it yourself. Until you've run mise in a project once, mise warns that it can't record the config there; the warning is harmless.
+
 `--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` lists the active kits and their mode; `airlock config` shows the exact paths and env each configured kit resolves to.
 
-A kit never grants write to binaries or config files — not `~/.cargo/bin`, not `~/.cargo/config.toml`, not `~/.npmrc` — since either would let the agent run code outside the sandbox later. In shared mode a kit does *read* the toolchain's user config and registry credentials, so your settings, private registries and publishing work for the agent too: `~/.cargo/config.toml` and `credentials.toml`, `~/.npmrc` and `~/.yarnrc.yml`, `pip.conf`, uv's `uv.toml` and `~/.pypirc`, `~/.hex/hex.config`. Isolated mode reads none of them. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
+A kit never grants write to binaries or config files — not `~/.cargo/bin`, not `~/.cargo/config.toml`, not `~/.npmrc` — since either would let the agent run code outside the sandbox later. In shared mode a kit does *read* the toolchain's user config and registry credentials, so your settings, private registries and publishing work for the agent too: `~/.cargo/config.toml` and `credentials.toml`, `~/.npmrc` and `~/.yarnrc.yml`, `pip.conf`, uv's `uv.toml` and `~/.pypirc`, `~/.hex/hex.config`. Isolated mode reads none of them, except mise's global config dir, which mise can't resolve your global tool versions without. You can also define your own kit instead of (or alongside) the built-ins — same idea, your own paths:
 
 ```toml
 [kits.bazel]                # global or local layer only; no mode (always these paths)
@@ -620,7 +622,7 @@ write = ["~/.cache/bazel"]
 env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
 ```
 
-`{kit_state}` expands to that kit's own directory under `$XDG_CACHE_HOME/airlock/kits` — the same idea as `{tool_state}` above, but for a kit instead of a tool. A kit's `[kits.<name>]` table sits in the same restricted slot as `allow_home_root`: your global config or `airlock.local.toml` only, never a project's own `airlock.toml` — a teammate's checked-in file must not decide what the agent may write in your home. `agent.kits` itself has no such restriction.
+`{kit_state}` expands to that kit's own directory under `$XDG_CACHE_HOME/airlock/kits`, created on first use and writable by the agent — the same idea as `{tool_state}` above, but for a kit instead of a tool. A kit's `[kits.<name>]` table sits in the same restricted slot as `allow_home_root`: your global config or `airlock.local.toml` only, never a project's own `airlock.toml` — a teammate's checked-in file must not decide what the agent may write in your home. `agent.kits` itself has no such restriction.
 
 ## Command reference
 
