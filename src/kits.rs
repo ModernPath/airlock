@@ -25,7 +25,7 @@ use crate::config::{self, ConfigError, RawAgentConfig, RawConfig, RawKitConfig};
 // ─── Built-in kits ──────────────────────────────────────────────────────────
 
 /// The built-in kit names, in the order they're documented.
-pub const BUILTIN_KITS: &[&str] = &["rust", "node", "python", "go", "elixir"];
+pub const BUILTIN_KITS: &[&str] = &["rust", "node", "python", "go", "elixir", "mise"];
 
 /// Whether `name` is one of [`BUILTIN_KITS`].
 pub fn is_builtin(name: &str) -> bool {
@@ -360,6 +360,7 @@ fn expand_builtin(kit: &str, mode: Mode, inputs: &Inputs<'_>, state: &Path) -> E
         "python" => expand_python(mode, inputs, state),
         "go" => expand_go(mode, inputs, state),
         "elixir" => expand_elixir(mode, inputs, state),
+        "mise" => expand_mise(mode, inputs, state),
         _ => Expanded::default(),
     }
 }
@@ -638,6 +639,53 @@ fn expand_elixir(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
                 "REBAR_CACHE_DIR",
                 home.join(".cache/rebar3"),
             ));
+        }
+    }
+    out
+}
+
+/// mise's installs, shims and plugins (all under `MISE_DATA_DIR`) are
+/// executables the user's own shell runs, so neither mode ever writes
+/// them: the agent uses tool versions already installed and can't `mise
+/// install` new ones. Its state dir holds `mise trust` decisions, so it is
+/// read-only in both modes too — a writable one would let the agent trust a
+/// hostile `mise.toml` that the user's shell then applies on `cd`. mise
+/// works with a read-only state dir; it just doesn't record the configs
+/// the agent touched. The global config dir is read in both modes because
+/// mise can't resolve the user's global tool versions without it.
+fn expand_mise(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
+    let home = inputs.home;
+    let xdg = |var: &str, default: &str| env_or(inputs, var, home.join(default)).join("mise");
+    let mut out = Expanded {
+        read: vec![
+            env_or(
+                inputs,
+                "MISE_DATA_DIR",
+                xdg("XDG_DATA_HOME", ".local/share"),
+            ),
+            env_or(inputs, "MISE_CONFIG_DIR", xdg("XDG_CONFIG_HOME", ".config")),
+            env_or(
+                inputs,
+                "MISE_STATE_DIR",
+                xdg("XDG_STATE_HOME", ".local/state"),
+            ),
+        ],
+        ..Default::default()
+    };
+    match mode {
+        Mode::Isolated => {
+            let cache = state.join("cache");
+            out.env
+                .insert("MISE_CACHE_DIR".to_string(), cache.display().to_string());
+            out.write.push(cache);
+        }
+        Mode::Shared => {
+            let default_cache = match inputs.env.get("XDG_CACHE_HOME") {
+                Some(dir) => PathBuf::from(dir).join("mise"),
+                None => inputs.home_path("Library/Caches/mise", ".cache/mise"),
+            };
+            out.write
+                .push(env_or(inputs, "MISE_CACHE_DIR", default_cache));
         }
     }
     out
@@ -931,6 +979,7 @@ mod tests {
                         "bazel".to_string(),
                         "elixir".to_string(),
                         "go".to_string(),
+                        "mise".to_string(),
                         "node".to_string(),
                         "python".to_string(),
                         "rust".to_string(),
@@ -1466,6 +1515,103 @@ mod tests {
                 .write
                 .contains(&PathBuf::from("/custom/hex/packages"))
         );
+    }
+
+    // ── expand_all: mise ──────────────────────────────────────────────
+
+    fn shared(kit: &str) -> BTreeMap<String, RawKitConfig> {
+        let mut kit_defs = BTreeMap::new();
+        kit_defs.insert(
+            kit.to_string(),
+            RawKitConfig {
+                mode: Some("shared".to_string()),
+                ..Default::default()
+            },
+        );
+        kit_defs
+    }
+
+    #[test]
+    fn expand_mise_isolated_redirects_only_the_cache() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let expanded = expand_all(&["mise".to_string()], &BTreeMap::new(), &inp).unwrap();
+        let cache = PathBuf::from("/cache/airlock/kits/deadbeefdeadbeef/mise/cache");
+        assert_eq!(
+            expanded.env.get("MISE_CACHE_DIR").map(String::as_str),
+            Some(cache.to_str().unwrap())
+        );
+        assert_eq!(expanded.env.len(), 1);
+        assert_eq!(expanded.write, vec![cache]);
+        assert_eq!(
+            expanded.read,
+            vec![
+                home.join(".local/share/mise"),
+                home.join(".config/mise"),
+                home.join(".local/state/mise"),
+            ]
+        );
+    }
+
+    #[test]
+    fn expand_mise_shared_writes_only_the_platform_cache() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        for (platform, cache) in [
+            (Platform::MacOs, "Library/Caches/mise"),
+            (Platform::Linux, ".cache/mise"),
+        ] {
+            let inp = inputs(&home, &env, platform, &root);
+            let expanded = expand_all(&["mise".to_string()], &shared("mise"), &inp).unwrap();
+            assert!(expanded.env.is_empty());
+            assert_eq!(expanded.write, vec![home.join(cache)]);
+            assert!(expanded.write_files.is_empty());
+        }
+    }
+
+    #[test]
+    fn expand_mise_honors_mise_and_xdg_overrides() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let mut env = empty_env();
+        env.insert("MISE_DATA_DIR".to_string(), "/opt/mise".to_string());
+        env.insert("XDG_CONFIG_HOME".to_string(), "/xdg/config".to_string());
+        env.insert("XDG_STATE_HOME".to_string(), "/xdg/state".to_string());
+        env.insert("XDG_CACHE_HOME".to_string(), "/xdg/cache".to_string());
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let expanded = expand_all(&["mise".to_string()], &shared("mise"), &inp).unwrap();
+        assert_eq!(
+            expanded.read,
+            vec![
+                PathBuf::from("/opt/mise"),
+                PathBuf::from("/xdg/config/mise"),
+                PathBuf::from("/xdg/state/mise"),
+            ]
+        );
+        assert_eq!(expanded.write, vec![PathBuf::from("/xdg/cache/mise")]);
+
+        env.insert("MISE_CACHE_DIR".to_string(), "/custom/cache".to_string());
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let expanded = expand_all(&["mise".to_string()], &shared("mise"), &inp).unwrap();
+        assert_eq!(expanded.write, vec![PathBuf::from("/custom/cache")]);
+    }
+
+    #[test]
+    fn expand_mise_never_writes_data_or_state() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        let inp = inputs(&home, &env, Platform::Linux, &root);
+        for kit_defs in [BTreeMap::new(), shared("mise")] {
+            let expanded = expand_all(&["mise".to_string()], &kit_defs, &inp).unwrap();
+            for w in &expanded.write {
+                assert!(!w.starts_with(home.join(".local")), "{w:?}");
+                assert!(!w.starts_with(home.join(".config")), "{w:?}");
+            }
+        }
     }
 
     // ── expand_all: user-defined kit ──────────────────────────────────

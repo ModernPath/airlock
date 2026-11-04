@@ -2058,7 +2058,7 @@ pub fn global_config_template() -> &'static str {
 
 # Kits add a language toolchain's cache access to `airlock run`'s agent
 # sandbox, on top of whatever harness profile you use. Built-in kits: rust,
-# node, python, go, elixir. List the ones you want on [agent] below (any
+# node, python, go, elixir, mise. List the ones you want on [agent] below (any
 # config layer; unioned across them), and optionally set a built-in kit's
 # mode here or in airlock.local.toml (never in a project's own airlock.toml):
 # "isolated" (the default) points the toolchain's cache env vars at a
@@ -2109,7 +2109,7 @@ pub fn local_config_template_standalone() -> &'static str {
 # API_KEY = { secret = "API_KEY" }
 
 # [agent]
-# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir
+# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir, mise
 
 # A built-in kit's mode ("isolated", the default, or "shared") may be set
 # here or in your global config, never in a project's own airlock.toml.
