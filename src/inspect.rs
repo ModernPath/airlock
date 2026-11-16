@@ -271,6 +271,9 @@ pub struct KitRow {
     pub write: Vec<String>,
     /// `(VAR, VALUE)` pairs, in a stable order.
     pub env: Vec<(String, String)>,
+    /// Mach services the kit lets the agent register or look up (macOS),
+    /// each as `register <name>` / `lookup <name>`; a regex shows as `/<re>/`.
+    pub mach: Vec<String>,
 }
 
 /// Everything `render_config` needs. Built by [`config_cmd`] from a
@@ -374,7 +377,7 @@ pub fn render_config(report: &ConfigReport) -> String {
                     .map(|(var, val)| format!("{}={}", esc(var), esc(val)))
                     .collect::<Vec<_>>()
                     .join(" ");
-                let paths = format!(
+                let mut paths = format!(
                     "read: {}; write: {}",
                     if k.read.is_empty() {
                         "-".to_string()
@@ -391,6 +394,12 @@ pub fn render_config(report: &ConfigReport) -> String {
                             .join(", ")
                     },
                 );
+                if !k.mach.is_empty() {
+                    paths.push_str(&format!(
+                        "; mach: {}",
+                        k.mach.iter().map(|m| esc(m)).collect::<Vec<_>>().join(", ")
+                    ));
+                }
                 vec![
                     format!("  {}", esc(&k.name)),
                     k.layer_text.clone(),
@@ -907,6 +916,21 @@ fn build_kit_rows(
             .map(|(k, v)| (k.clone(), display_path(Path::new(v), home)))
             .collect();
         env.sort();
+        let mach_display = |op: &str, name: &crate::sandbox::MachName| match name {
+            crate::sandbox::MachName::Global(n) => format!("{op} {n}"),
+            crate::sandbox::MachName::Regex(r) => format!("{op} /{r}/"),
+        };
+        let mach = expanded
+            .mach_register
+            .iter()
+            .map(|m| mach_display("register", m))
+            .chain(
+                expanded
+                    .mach_lookup
+                    .iter()
+                    .map(|m| mach_display("lookup", m)),
+            )
+            .collect();
         rows.push(KitRow {
             name: name.clone(),
             layer_text,
@@ -914,6 +938,7 @@ fn build_kit_rows(
             read,
             write,
             env,
+            mach,
         });
     }
     Ok(rows)

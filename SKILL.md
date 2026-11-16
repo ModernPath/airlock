@@ -265,10 +265,11 @@ your session serves them if the project declares them.
 ### Cache env vars may already point into Airlock's own directory
 
 If you were started with `airlock run` and the project (or your user) enabled
-a kit (`rust`, `node`, `python`, `go`, `elixir`, `mise`, or a custom one),
-variables like `CARGO_HOME`, `GOPATH`, `npm_config_cache`, `PIP_CACHE_DIR`,
-`UV_CACHE_DIR` or `MISE_CACHE_DIR` may already be set in your environment,
-pointing at a directory under `$XDG_CACHE_HOME/airlock/kits` instead of the usual
+a kit (`rust`, `node`, `python`, `go`, `elixir`, `mise`, `playwright`, or a
+custom one), variables like `CARGO_HOME`, `GOPATH`, `npm_config_cache`,
+`PIP_CACHE_DIR`, `UV_CACHE_DIR` or `MISE_CACHE_DIR` may already be set in your
+environment, pointing at a directory under `$XDG_CACHE_HOME/airlock/kits`
+instead of the usual
 `~/.cargo`, `~/go`, etc. This is deliberate — it is how `cargo`, `go`, `npm`,
 `pip` and similar tools keep working for you without ever writing to the
 user's real caches. Run them exactly as you normally would; do not unset or
@@ -279,6 +280,14 @@ you cannot `mise install` new ones or `mise trust` a config: both are
 read-only to you. If mise reports a config as not trusted, ask the user to run
 `mise trust` in that directory. A `tracking config: failed to ln` warning is
 harmless.
+
+With the `playwright` kit you can launch the browsers the user has installed
+with Playwright (headless Chromium included). In the default isolated mode
+the browser cache is read-only to you: if a browser is missing, ask the user
+to run `npx playwright install`. Without the kit, Chromium on macOS stops at
+launch with `bootstrap_check_in ... MachPortRendezvousServer ... Permission
+denied (1100)`; ask the user to enable the kit (`airlock run --kit
+playwright`) rather than working around it.
 
 ## Workflow
 

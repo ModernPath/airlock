@@ -410,7 +410,7 @@ pub enum ConfigError {
     },
     /// A user-defined kit's `[kits.<name>]` table set `mode`, which only a
     /// built-in kit has.
-    #[error("[kits.{kit}] sets mode, which only a built-in kit (rust, node, python, go) has")]
+    #[error("[kits.{kit}] sets mode, which only a built-in kit has")]
     KitUserDefinedHasMode {
         /// The user-defined kit name.
         kit: String,
@@ -2058,16 +2058,19 @@ pub fn global_config_template() -> &'static str {
 
 # Kits add a language toolchain's cache access to `airlock run`'s agent
 # sandbox, on top of whatever harness profile you use. Built-in kits: rust,
-# node, python, go, elixir, mise. List the ones you want on [agent] below (any
-# config layer; unioned across them), and optionally set a built-in kit's
-# mode here or in airlock.local.toml (never in a project's own airlock.toml):
+# node, python, go, elixir, mise, playwright. List the ones you want on
+# [agent] below (any config layer; unioned across them), and optionally set
+# a built-in kit's mode here or in airlock.local.toml (never in a
+# project's own airlock.toml):
 # "isolated" (the default) points the toolchain's cache env vars at a
 # directory private to this project, so the agent never touches your real
 # caches; "shared" instead grants write to the real ones, plus read of your
 # toolchain config and registry credentials (~/.cargo/credentials.toml,
 # ~/.npmrc, ~/.hex/hex.config, ...) so private registries work. Prefer
 # isolated — shared lets the agent poison a cache (e.g.
-# ~/.cargo/registry/src) that an unsandboxed build later trusts.
+# ~/.cargo/registry/src) that an unsandboxed build later trusts. The
+# playwright kit's shared mode lets the agent write the browser builds your
+# own Playwright runs later start outside the sandbox.
 # [kits.rust]
 # mode = "isolated"
 
@@ -2109,7 +2112,7 @@ pub fn local_config_template_standalone() -> &'static str {
 # API_KEY = { secret = "API_KEY" }
 
 # [agent]
-# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir, mise
+# kits = ["rust"]   # built-in kits: rust, node, python, go, elixir, mise, playwright
 
 # A built-in kit's mode ("isolated", the default, or "shared") may be set
 # here or in your global config, never in a project's own airlock.toml.

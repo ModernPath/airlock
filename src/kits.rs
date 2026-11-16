@@ -21,11 +21,20 @@ use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
 
 use crate::config::{self, ConfigError, RawAgentConfig, RawConfig, RawKitConfig};
+use crate::sandbox::MachName;
 
 // ─── Built-in kits ──────────────────────────────────────────────────────────
 
 /// The built-in kit names, in the order they're documented.
-pub const BUILTIN_KITS: &[&str] = &["rust", "node", "python", "go", "elixir", "mise"];
+pub const BUILTIN_KITS: &[&str] = &[
+    "rust",
+    "node",
+    "python",
+    "go",
+    "elixir",
+    "mise",
+    "playwright",
+];
 
 /// Whether `name` is one of [`BUILTIN_KITS`].
 pub fn is_builtin(name: &str) -> bool {
@@ -275,8 +284,9 @@ pub fn check_env_collision(
 /// testable without a real filesystem or process environment.
 pub struct Inputs<'a> {
     pub home: &'a Path,
-    /// The launcher's environment snapshot — consulted only for a shared
-    /// built-in kit's own override variable (`CARGO_HOME`, `GOPATH`, ...).
+    /// The launcher's environment snapshot — consulted only for a built-in
+    /// kit's own override variables (`CARGO_HOME`, `GOPATH`,
+    /// `PLAYWRIGHT_BROWSERS_PATH`, ...).
     pub env: &'a BTreeMap<String, String>,
     pub platform: Platform,
     pub project_id: &'a str,
@@ -306,6 +316,13 @@ pub struct Expanded {
     /// Environment variables to set on the agent (isolated built-ins and
     /// user-defined kits only; empty for a shared built-in).
     pub env: BTreeMap<String, String>,
+    /// Extra Mach services the agent may look up (macOS only). Built-in
+    /// kits only: a user-defined kit's table has no field that can produce
+    /// one, since a Mach service reaches outside the sandbox.
+    pub mach_lookup: Vec<MachName>,
+    /// Mach services the agent may register (macOS only). Built-in kits
+    /// only, as `mach_lookup`.
+    pub mach_register: Vec<MachName>,
     /// `(name, mode)` for display (`airlock run -v`, `airlock config`).
     /// `mode` is `None` for a user-defined kit, which has no mode concept.
     pub active: Vec<(String, Option<Mode>)>,
@@ -333,6 +350,8 @@ pub fn expand_all(
             out.write.extend(one.write);
             out.write_files.extend(one.write_files);
             out.env.extend(one.env);
+            out.mach_lookup.extend(one.mach_lookup);
+            out.mach_register.extend(one.mach_register);
             out.active.push((name.clone(), Some(mode)));
         } else {
             let def = kit_defs
@@ -361,6 +380,7 @@ fn expand_builtin(kit: &str, mode: Mode, inputs: &Inputs<'_>, state: &Path) -> E
         "go" => expand_go(mode, inputs, state),
         "elixir" => expand_elixir(mode, inputs, state),
         "mise" => expand_mise(mode, inputs, state),
+        "playwright" => expand_playwright(mode, inputs),
         _ => Expanded::default(),
     }
 }
@@ -691,6 +711,57 @@ fn expand_mise(mode: Mode, inputs: &Inputs<'_>, state: &Path) -> Expanded {
     out
 }
 
+/// Playwright's browser builds, and on macOS the Mach services headless
+/// Chromium needs to start.
+///
+/// Isolated mode reads the user's browser builds and never writes them:
+/// they are executables, and Playwright runs outside the sandbox (the
+/// user's own test runs, an unsandboxed Playwright MCP server) launch the
+/// same builds. There is no per-project copy to redirect to; every build is
+/// hundreds of MB. Shared mode makes the real cache writable so
+/// `playwright install` works — unlike every other kit, that is write
+/// access to executables run outside the sandbox, which SECURITY.md spells
+/// out.
+///
+/// Every Chromium process checks in a `MachPortRendezvousServer.<pid>`
+/// service at startup, and its child processes look it up to receive their
+/// ports; without both, Chromium aborts before it does anything. The name
+/// ends in a pid, so it needs a regex. The two `SystemConfiguration`
+/// services are how Chromium reads the DNS and proxy settings.
+fn expand_playwright(mode: Mode, inputs: &Inputs<'_>) -> Expanded {
+    let mut out = Expanded::default();
+    // `PLAYWRIGHT_BROWSERS_PATH=0` keeps the browsers inside the project's
+    // `node_modules`, which the sandbox root already covers.
+    let browsers = match inputs
+        .env
+        .get("PLAYWRIGHT_BROWSERS_PATH")
+        .map(String::as_str)
+    {
+        Some("0") => None,
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => Some(inputs.home_path("Library/Caches/ms-playwright", ".cache/ms-playwright")),
+    };
+    match (mode, browsers) {
+        (_, None) => {}
+        (Mode::Isolated, Some(dir)) => out.read.push(dir),
+        (Mode::Shared, Some(dir)) => out.write.push(dir),
+    }
+    if inputs.platform == Platform::MacOs {
+        let rendezvous = MachName::Regex(
+            r"^org\.chromium\.Chromium\.MachPortRendezvousServer\.[0-9]+$".to_string(),
+        );
+        out.mach_register.push(rendezvous.clone());
+        out.mach_lookup.push(rendezvous);
+        for name in [
+            "com.apple.SystemConfiguration.configd",
+            "com.apple.SystemConfiguration.DNSConfiguration",
+        ] {
+            out.mach_lookup.push(MachName::Global(name.to_string()));
+        }
+    }
+    out
+}
+
 fn expand_user(
     kit: &str,
     def: &RawKitConfig,
@@ -709,10 +780,8 @@ fn expand_user(
     Ok(Expanded {
         read,
         write,
-        write_files: Vec::new(),
-        state_dirs: Vec::new(),
         env,
-        active: Vec::new(),
+        ..Default::default()
     })
 }
 
@@ -981,6 +1050,7 @@ mod tests {
                         "go".to_string(),
                         "mise".to_string(),
                         "node".to_string(),
+                        "playwright".to_string(),
                         "python".to_string(),
                         "rust".to_string(),
                     ]
@@ -1612,6 +1682,112 @@ mod tests {
                 assert!(!w.starts_with(home.join(".config")), "{w:?}");
             }
         }
+    }
+
+    // ── expand_all: playwright ────────────────────────────────────────
+
+    fn rendezvous() -> MachName {
+        MachName::Regex(r"^org\.chromium\.Chromium\.MachPortRendezvousServer\.[0-9]+$".to_string())
+    }
+
+    #[test]
+    fn expand_playwright_isolated_reads_the_platform_cache_only() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        for (platform, cache) in [
+            (Platform::MacOs, "Library/Caches/ms-playwright"),
+            (Platform::Linux, ".cache/ms-playwright"),
+        ] {
+            let inp = inputs(&home, &env, platform, &root);
+            let expanded = expand_all(&["playwright".to_string()], &BTreeMap::new(), &inp).unwrap();
+            assert_eq!(expanded.read, vec![home.join(cache)]);
+            assert!(expanded.write.is_empty());
+            assert!(expanded.write_files.is_empty());
+            assert!(expanded.env.is_empty());
+        }
+    }
+
+    #[test]
+    fn expand_playwright_shared_writes_the_cache() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let expanded =
+            expand_all(&["playwright".to_string()], &shared("playwright"), &inp).unwrap();
+        assert!(expanded.read.is_empty());
+        assert_eq!(
+            expanded.write,
+            vec![home.join("Library/Caches/ms-playwright")]
+        );
+        assert!(expanded.env.is_empty());
+    }
+
+    #[test]
+    fn expand_playwright_honors_browsers_path() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let mut env = empty_env();
+        env.insert(
+            "PLAYWRIGHT_BROWSERS_PATH".to_string(),
+            "/opt/browsers".to_string(),
+        );
+        let inp = inputs(&home, &env, Platform::Linux, &root);
+        let expanded = expand_all(&["playwright".to_string()], &BTreeMap::new(), &inp).unwrap();
+        assert_eq!(expanded.read, vec![PathBuf::from("/opt/browsers")]);
+        let expanded =
+            expand_all(&["playwright".to_string()], &shared("playwright"), &inp).unwrap();
+        assert_eq!(expanded.write, vec![PathBuf::from("/opt/browsers")]);
+
+        env.insert("PLAYWRIGHT_BROWSERS_PATH".to_string(), "0".to_string());
+        let inp = inputs(&home, &env, Platform::Linux, &root);
+        for kit_defs in [BTreeMap::new(), shared("playwright")] {
+            let expanded = expand_all(&["playwright".to_string()], &kit_defs, &inp).unwrap();
+            assert!(expanded.read.is_empty());
+            assert!(expanded.write.is_empty());
+        }
+    }
+
+    #[test]
+    fn expand_playwright_grants_chromium_mach_services_on_macos_only() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        for kit_defs in [BTreeMap::new(), shared("playwright")] {
+            let inp = inputs(&home, &env, Platform::MacOs, &root);
+            let expanded = expand_all(&["playwright".to_string()], &kit_defs, &inp).unwrap();
+            assert_eq!(expanded.mach_register, vec![rendezvous()]);
+            assert_eq!(
+                expanded.mach_lookup,
+                vec![
+                    rendezvous(),
+                    MachName::Global("com.apple.SystemConfiguration.configd".to_string()),
+                    MachName::Global("com.apple.SystemConfiguration.DNSConfiguration".to_string()),
+                ]
+            );
+
+            let inp = inputs(&home, &env, Platform::Linux, &root);
+            let expanded = expand_all(&["playwright".to_string()], &kit_defs, &inp).unwrap();
+            assert!(expanded.mach_register.is_empty());
+            assert!(expanded.mach_lookup.is_empty());
+        }
+    }
+
+    #[test]
+    fn only_the_playwright_kit_grants_mach_services() {
+        let home = PathBuf::from("/home/u");
+        let root = PathBuf::from("/proj");
+        let env = empty_env();
+        let inp = inputs(&home, &env, Platform::MacOs, &root);
+        let others: Vec<String> = BUILTIN_KITS
+            .iter()
+            .filter(|k| **k != "playwright")
+            .map(|k| k.to_string())
+            .collect();
+        let expanded = expand_all(&others, &BTreeMap::new(), &inp).unwrap();
+        assert!(expanded.mach_lookup.is_empty());
+        assert!(expanded.mach_register.is_empty());
     }
 
     // ── expand_all: user-defined kit ──────────────────────────────────

@@ -604,12 +604,14 @@ kits = ["rust", "node"]     # any config layer; unioned across them
 mode = "isolated"           # the default; or "shared"
 ```
 
-Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`. Each has two modes:
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`, `playwright`. Each has two modes:
 
 - **isolated** (the default). Airlock creates a directory private to this project (`$XDG_CACHE_HOME/airlock/kits/<id>/<kit>`) and points the toolchain's cache env vars (`CARGO_HOME`, `GOPATH`, ...) at it. The agent can read/write that directory and nothing else of the toolchain's; your real `~/.cargo`, `~/go`, etc. are untouched.
 - **shared**. No env override — the agent gets write access to your real cache locations instead (honoring `CARGO_HOME`/`GOPATH`/etc. if you've already set them). **This lets the agent poison a cache an unsandboxed build later trusts without re-verifying** — e.g. `~/.cargo/registry/src` is extracted once and not re-checked per build. Prefer isolated; reach for shared only when you understand that tradeoff. See [SECURITY.md](SECURITY.md#kits).
 
 The `mise` kit lets the agent use the tool versions you've already installed with [mise](https://mise.jdx.dev): it reads mise's data dir (installs, shims, plugins), its global config dir and its state dir, honoring `MISE_*_DIR` and `XDG_*_HOME`. Its two modes differ only in the cache (`MISE_CACHE_DIR`). The agent can never write installs, shims or state, so it can't `mise install` a new version or `mise trust` a config: a project's `mise.toml` works for the agent only once you've trusted it yourself. Until you've run mise in a project once, mise warns that it can't record the config there; the warning is harmless.
+
+The `playwright` kit lets the agent run the browsers [Playwright](https://playwright.dev) installed: it reads `PLAYWRIGHT_BROWSERS_PATH` (or `~/Library/Caches/ms-playwright` on macOS, `~/.cache/ms-playwright` on Linux). On macOS it also lets the agent register and look up the Mach services Chromium needs to start (`org.chromium.Chromium.MachPortRendezvousServer.<pid>`) and to read the DNS and proxy settings (`com.apple.SystemConfiguration.configd` and `.DNSConfiguration`). Without them, Chromium stops at launch with `bootstrap_check_in ... Permission denied (1100)`. Isolated mode only reads the browsers, so run `npx playwright install` yourself. Shared mode makes the browser cache writable so the agent can install browsers too — **but the agent can then replace the browser binaries that your own Playwright runs start outside the sandbox**. See [SECURITY.md](SECURITY.md#kits).
 
 `--kit <name>` on `airlock run` adds a kit for that invocation, additive to `agent.kits`. `airlock run -v` lists the active kits and their mode; `airlock config` shows the exact paths and env each configured kit resolves to.
 

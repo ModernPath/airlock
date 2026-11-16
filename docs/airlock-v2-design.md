@@ -1116,7 +1116,7 @@ write = ["~/.cache/bazel"]
 env   = { BAZEL_OUTPUT_USER_ROOT = "{kit_state}/out" }
 ```
 
-Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`. Their `[kits.<name>]`
+Built-in kits: `rust`, `node`, `python`, `go`, `elixir`, `mise`, `playwright`. Their `[kits.<name>]`
 table accepts only `mode`. A user-defined kit's table accepts `read`,
 `write` and `env` instead (no `mode` — it has no isolated/shared concept of
 its own). `[kits.*]` sits in the same restricted slot as `allow_home_root`:
@@ -1162,7 +1162,8 @@ so a `CARGO_HOME` the user passes through cannot defeat isolation.
 
 A kit never grants write to binaries or config files — writing to
 `~/.cargo/bin`, `~/.cargo/config.toml` or `~/.npmrc` would hand the agent
-a way to run code the user later runs unsandboxed. In shared mode a kit
+a way to run code the user later runs unsandboxed. The one exception is the
+`playwright` kit's shared mode (below), an explicit opt-in. In shared mode a kit
 does grant *read* of the toolchain's user config and registry credentials,
 so the user's settings, private registries and publishing work for the
 agent; package-registry tokens are accepted as readable by the agent.
@@ -1176,6 +1177,22 @@ Isolated mode grants none of these.
 | `go` | `~/go/bin`, `~/sdk` | `GOMODCACHE`, `GOCACHE`, and `GOPATH` (not just the two caches — `go install`'s output and the sumdb cache live under `GOPATH` with no env var of their own) | `$GOPATH/pkg/{mod,sumdb}`, `GOCACHE`'s platform default |
 | `elixir` | `~/.asdf`, `~/.kiex` | `MIX_HOME`, `HEX_HOME`, `REBAR_CACHE_DIR` (plus `MIX_ARCHIVES` pointed read-only at the real `~/.mix/archives`, and `~/.mix/elixir` read-only for the already-installed rebar3 escript, so the agent does not need to `mix local.hex`/`local.rebar` again) | reads real `~/.mix` (never writes it — archives and escripts are code and binaries, like `~/.cargo/bin`); writes `~/.hex/packages` and the rebar3 cache only; reads `~/.hex/hex.config` (repo settings and the Hex API key) but never writes it. |
 | `mise` | `MISE_DATA_DIR` (installs, shims, plugins), `MISE_CONFIG_DIR` and `MISE_STATE_DIR`, each falling back to its `XDG_*_HOME` and then mise's default — in both modes, since mise can't resolve the user's global tool versions without its config. Never written: installs and shims are executables the user's shell runs, and the state dir holds `mise trust` decisions, so a writable one would let the agent trust a hostile `mise.toml` the user's shell then applies on `cd`. mise runs with a read-only state dir; it only warns that it can't track a config it hasn't seen before. | `MISE_CACHE_DIR` | the real cache (`MISE_CACHE_DIR`, `$XDG_CACHE_HOME/mise`, or the platform default) |
+| `playwright` | isolated mode reads the browser cache: `PLAYWRIGHT_BROWSERS_PATH`, else `~/Library/Caches/ms-playwright` (macOS) or `~/.cache/ms-playwright` (Linux); nothing when it is `0` (browsers inside the project's `node_modules`). On macOS, in both modes, also the Mach services below. | none — no per-project copy of browser builds hundreds of MB each | the browser cache, so `playwright install` works. **The only kit that writes executables**: the browsers it installs are the ones the user's own Playwright runs launch outside the sandbox; see SECURITY.md. |
+
+A built-in kit can also widen the agent's Mach access on macOS, as typed
+`sandbox::MachName` values (an exact `global-name` or an anchored
+`global-name-regex`) on `Expanded::mach_lookup`/`mach_register`. No
+`[kits.*]` table can produce one — a Mach service is a way out of the
+sandbox into whatever process serves it, so each one is a reviewed code
+change. The profile builder refuses a name with a control character, a `"`
+or (in a plain name) a `\`, and emits the rules after the harness profile
+rules and before the final denies. The `playwright` kit adds `mach-register`
+and `mach-lookup` on
+`^org\.chromium\.Chromium\.MachPortRendezvousServer\.[0-9]+$` (every
+Chromium process checks one in at startup and aborts without it) and
+`mach-lookup` on `com.apple.SystemConfiguration.configd` and
+`com.apple.SystemConfiguration.DNSConfiguration` (DNS and proxy settings).
+Not `com.apple.sysmond`, which would list every process the user runs.
 
 Missing read paths are skipped; isolated-mode subdirectories are created up
 front. See [`src/kits.rs`](../src/kits.rs) for the exact expansion
