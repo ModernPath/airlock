@@ -423,6 +423,12 @@ pub fn run_agent(
     policy
         .read_write_paths
         .extend(prepared.kits.write_files.iter().cloned());
+    policy
+        .mach_lookup
+        .extend(prepared.kits.mach_lookup.iter().cloned());
+    policy
+        .mach_register
+        .extend(prepared.kits.mach_register.iter().cloned());
 
     // A shim's `airlock exec` needs a session to reach.
     let shimmed = prepared.config.shimmed_tools();

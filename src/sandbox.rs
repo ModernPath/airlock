@@ -30,6 +30,11 @@ pub enum SandboxError {
     /// end it early and let the rest of the path inject SBPL.
     #[error("path contains a double quote and cannot be used in an SBPL regex rule: {0:?}")]
     QuoteInRegexPath(PathBuf),
+    /// A Mach service name a kit asks for contains a character that can't be
+    /// embedded safely in its SBPL string or regex literal: a control
+    /// character, a double quote, or (in a plain name) a backslash.
+    #[error("Mach service name cannot be safely embedded in an SBPL profile: {0:?}")]
+    InvalidMachName(String),
     /// Profile generation failed for a reason not tied to a specific path.
     #[error("failed to build sandbox profile: {0}")]
     ProfileBuildError(String),
@@ -144,6 +149,21 @@ pub struct ToolPolicy {
     pub git_hooks_deny: Option<PathBuf>,
 }
 
+/// A Mach bootstrap service name, or family of names, that an agent may look
+/// up or register. Only built-in kits produce these ([`crate::kits`]); no
+/// user config can name one, since a Mach service is a way out of the
+/// sandbox into whichever process serves it.
+///
+/// Seatbelt-only: Landlock has no Mach ports, so Linux ignores them.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MachName {
+    /// An exact name: `(global-name "<name>")`.
+    Global(String),
+    /// An anchored ERE over the name: `(global-name-regex #"<regex>")`. For
+    /// names with a runtime suffix, such as a pid.
+    Regex(String),
+}
+
 /// Describes what an agent process is allowed to access.
 ///
 /// Used as input to `SandboxBackend::build_agent` to produce a `SandboxProfile`.
@@ -204,6 +224,12 @@ pub struct AgentPolicy {
     pub home: Option<PathBuf>,
     /// `<root>/.git/hooks`, when known. See [`ToolPolicy::git_hooks_deny`].
     pub git_hooks_deny: Option<PathBuf>,
+    /// Extra Mach services the agent may look up, beyond the fixed common
+    /// allowlist. From built-in kits only (see [`MachName`]).
+    pub mach_lookup: Vec<MachName>,
+    /// Mach services the agent may register (`bootstrap_check_in`). The
+    /// baseline registers none. From built-in kits only.
+    pub mach_register: Vec<MachName>,
 }
 
 /// An opaque, pre-built sandbox configuration produced by a `SandboxBackend`.
@@ -414,7 +440,7 @@ pub mod macos {
     use std::path::{Path, PathBuf};
 
     use super::{
-        AgentPolicy, AgentProfileKind, NetworkAccess, SandboxError, SandboxProfile,
+        AgentPolicy, AgentProfileKind, MachName, NetworkAccess, SandboxError, SandboxProfile,
         TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
     };
 
@@ -1086,6 +1112,33 @@ pub mod macos {
         out
     }
 
+    /// Push `(allow <op> <filter>...)` for a kit's Mach names, nothing when
+    /// `names` is empty. A plain name goes into an SBPL string, which
+    /// treats `\` as an escape, so both `"` and `\` are refused there; a
+    /// regex goes into a raw `#"..."` literal, which has no escape for `"`.
+    fn emit_mach_rules(op: &str, names: &[MachName], out: &mut String) -> Result<(), SandboxError> {
+        if names.is_empty() {
+            return Ok(());
+        }
+        out.push_str(&format!("(allow {op}\n"));
+        for name in names {
+            let (filter, value, forbidden): (&str, &str, &[char]) = match name {
+                MachName::Global(n) => ("global-name \"", n.as_str(), &['"', '\\'][..]),
+                MachName::Regex(r) => ("global-name-regex #\"", r.as_str(), &['"'][..]),
+            };
+            if value.is_empty()
+                || value
+                    .chars()
+                    .any(|ch| ch <= '\u{1F}' || ch == '\u{7F}' || forbidden.contains(&ch))
+            {
+                return Err(SandboxError::InvalidMachName(value.to_string()));
+            }
+            out.push_str(&format!("  ({filter}{value}\")\n"));
+        }
+        out.push_str(")\n");
+        Ok(())
+    }
+
     fn generate_agent_profile(
         policy: &AgentPolicy,
         profile: Option<AgentProfileKind>,
@@ -1249,6 +1302,11 @@ pub mod macos {
         if let Some(kind) = profile {
             emit_profile_rules(kind, policy.home.as_deref(), &mut out)?;
         }
+
+        // ── Kit Mach services ─────────────────────────────────────────────────
+        // Built-in kits only (e.g. `playwright`): see `AgentPolicy::mach_lookup`.
+        emit_mach_rules("mach-register", &policy.mach_register, &mut out)?;
+        emit_mach_rules("mach-lookup", &policy.mach_lookup, &mut out)?;
 
         // The daemon connection is not part of the agent's general network
         // policy — grant it unconditionally so it cannot be switched off by
@@ -1488,7 +1546,7 @@ pub mod macos {
         use std::path::PathBuf;
 
         use super::super::{
-            NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
+            MachName, NetworkAccess, SandboxBackend, TOOLCHAIN_ROOTS, ToolAccess, ToolPolicy,
         };
         use super::MacOSSeatbelt;
 
@@ -2763,6 +2821,98 @@ pub mod macos {
             }
         }
 
+        // ── Kit Mach services ─────────────────────────────────────────────────
+
+        fn rendezvous() -> MachName {
+            MachName::Regex(
+                r"^org\.chromium\.Chromium\.MachPortRendezvousServer\.[0-9]+$".to_string(),
+            )
+        }
+
+        #[test]
+        fn agent_profile_without_kit_mach_names_registers_nothing() {
+            for kind in [
+                None,
+                Some(super::super::AgentProfileKind::Claude),
+                Some(super::super::AgentProfileKind::ClaudeRelaxed),
+            ] {
+                let sbpl = sbpl_from_agent_profile_with_kind(&agent_policy_with_home(), kind);
+                for needle in [
+                    "mach-register",
+                    "global-name-regex",
+                    "MachPortRendezvousServer",
+                    "com.apple.SystemConfiguration",
+                ] {
+                    assert!(
+                        !sbpl.contains(needle),
+                        "{kind:?}: SBPL must not contain {needle} without a kit, got:\n{sbpl}"
+                    );
+                }
+            }
+        }
+
+        #[test]
+        fn agent_profile_emits_kit_mach_register_and_lookup_rules() {
+            let policy = super::super::AgentPolicy {
+                mach_register: vec![rendezvous()],
+                mach_lookup: vec![
+                    rendezvous(),
+                    MachName::Global("com.apple.SystemConfiguration.configd".to_string()),
+                ],
+                ..agent_policy_with_home()
+            };
+            let sbpl = sbpl_from_agent_profile_with_kind(
+                &policy,
+                Some(super::super::AgentProfileKind::Claude),
+            );
+            let regex = r#"(global-name-regex #"^org\.chromium\.Chromium\.MachPortRendezvousServer\.[0-9]+$")"#;
+            let register = format!("(allow mach-register\n  {regex}\n)\n");
+            let lookup = format!(
+                "(allow mach-lookup\n  {regex}\n  (global-name \"com.apple.SystemConfiguration.configd\")\n)\n"
+            );
+            assert!(
+                sbpl.contains(&register),
+                "expected:\n{register}got:\n{sbpl}"
+            );
+            assert!(sbpl.contains(&lookup), "expected:\n{lookup}got:\n{sbpl}");
+            // After the profile rules, so a profile can't be read as the
+            // source of these grants.
+            let claude_rule = sbpl.find(".claude.lock").expect("claude rules present");
+            assert!(sbpl.find(&register).unwrap() > claude_rule, "got:\n{sbpl}");
+        }
+
+        #[test]
+        fn kit_mach_names_that_could_inject_sbpl_are_refused() {
+            use super::super::SandboxError;
+
+            for (register, lookup) in [
+                (
+                    vec![],
+                    vec![MachName::Global("a\")) (allow default".to_string())],
+                ),
+                (vec![], vec![MachName::Global(r"a\b".to_string())]),
+                (vec![], vec![MachName::Global("a\nb".to_string())]),
+                (vec![], vec![MachName::Global(String::new())]),
+                (
+                    vec![MachName::Regex("^a\")) (allow default".to_string())],
+                    vec![],
+                ),
+                (vec![MachName::Regex("^a\u{0}".to_string())], vec![]),
+            ] {
+                let policy = super::super::AgentPolicy {
+                    mach_register: register,
+                    mach_lookup: lookup,
+                    ..agent_policy_empty()
+                };
+                let result = MacOSSeatbelt.build_agent(&policy, None);
+                assert!(
+                    matches!(result, Err(SandboxError::InvalidMachName(_))),
+                    "expected InvalidMachName, got: {:?}",
+                    result.map(|_| ())
+                );
+            }
+        }
+
         #[test]
         fn agent_profile_emits_relaxed_bundle_for_claude_relaxed_kind() {
             let sbpl = sbpl_from_agent_profile_with_kind(
@@ -3168,8 +3318,11 @@ pub mod macos {
                     tmpdir: Some(base.clone()),
                     home: Some(PathBuf::from(TEST_HOME)),
                     git_hooks_deny: Some(git_hooks.clone()),
+                    mach_lookup: vec![MachName::Global("com.example.lookup".to_string())],
+                    mach_register: vec![MachName::Regex(r"^com\.example\.[0-9]+$".to_string())],
                 };
                 let sbpl = sbpl_from_agent_profile_with_kind(&policy, Some(kind));
+                assert!(sbpl.contains("com.example.lookup"), "got:\n{sbpl}");
                 assert_ends_with_final_denies(&sbpl, &git_hooks, &base);
             }
         }
@@ -3265,6 +3418,8 @@ pub mod macos {
                 tmpdir: Some(tmp_path.clone()),
                 home: None,
                 git_hooks_deny: None,
+                mach_lookup: vec![],
+                mach_register: vec![],
             };
 
             let profile = MacOSSeatbelt
